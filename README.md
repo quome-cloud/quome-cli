@@ -5,7 +5,7 @@
 
 ## Overview
 
-This is the command line interface for [Quome](https://quome.io). Use it to manage your Quome infrastructure, applications, and deployments directly from the terminal.
+This is the command line interface for [Quome](https://quome.com). Use it to manage your Quome infrastructure, applications, and deployments directly from the terminal.
 
 The Quome CLI allows you to:
 
@@ -474,7 +474,9 @@ Options:
 
 ## Configuration
 
-Configuration is stored in `~/.quome/config.json`:
+### User Configuration
+
+User credentials and linked directories are stored in `~/.quome/config.json`:
 
 ```json
 {
@@ -494,6 +496,35 @@ Configuration is stored in `~/.quome/config.json`:
 }
 ```
 
+### Settings File
+
+You can customize API endpoints and URLs using a `settings.json` file. The CLI looks for settings in this order:
+
+1. `./settings.json` (local, in current directory)
+2. `~/.quome/settings.json` (global)
+3. Built-in defaults
+
+Example `settings.json`:
+
+```json
+{
+  "api_url": "https://demo.quome.cloud",
+  "docs_url": "https://docs.quome.com",
+  "website_url": "https://quome.com"
+}
+```
+
+| Setting | Description | Default |
+|---------|-------------|---------|
+| `api_url` | API base URL | `https://demo.quome.cloud` |
+| `docs_url` | Documentation URL | `https://docs.quome.com` |
+| `website_url` | Main website URL | `https://quome.com` |
+
+This is useful for:
+- Pointing to different environments (staging, production)
+- Self-hosted Quome installations
+- Local development
+
 ## Environment Variables
 
 | Variable | Description |
@@ -501,7 +532,7 @@ Configuration is stored in `~/.quome/config.json`:
 | `QUOME_TOKEN` | API token (overrides stored session) |
 | `QUOME_ORG` | Organization ID (overrides linked org) |
 | `QUOME_APP` | Application ID (overrides linked app) |
-| `QUOME_API_URL` | API base URL (default: `https://api.quome.io`) |
+| `QUOME_API_URL` | API base URL (default: `https://demo.quome.cloud`) |
 
 ## JSON Output
 
@@ -567,5 +598,5 @@ This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENS
 
 ## Support
 
-- [Documentation](https://docs.quome.io)
+- [Documentation](https://docs.quome.com)
 - [Issue Tracker](https://github.com/quome-cloud/quome-cli/issues)

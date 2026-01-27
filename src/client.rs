@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use crate::api::models::ApiErrorResponse;
 use crate::errors::{QuomeError, Result};
+use crate::settings::Settings;
 
-const DEFAULT_BASE_URL: &str = "https://api.quome.io";
 const USER_AGENT: &str = concat!("quome-cli/", env!("CARGO_PKG_VERSION"));
 
 pub struct QuomeClient {
@@ -34,10 +34,11 @@ impl QuomeClient {
             .timeout(Duration::from_secs(30))
             .build()?;
 
+        // Load settings and determine base URL
+        let settings = Settings::load().unwrap_or_default();
         let base_url = base_url
             .map(String::from)
-            .or_else(|| std::env::var("QUOME_API_URL").ok())
-            .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
+            .unwrap_or_else(|| settings.get_api_url());
 
         Ok(Self { http, base_url })
     }

@@ -3,6 +3,7 @@ mod client;
 mod commands;
 mod config;
 mod errors;
+mod settings;
 
 use clap::Parser;
 use colored::Colorize;
