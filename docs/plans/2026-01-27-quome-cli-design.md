@@ -40,7 +40,6 @@ quome-cli/
 │   │
 │   └── api/                 # Typed API client layer
 │       ├── mod.rs
-│       ├── auth.rs          # Session endpoints
 │       ├── users.rs         # User endpoints
 │       ├── orgs.rs          # Organization endpoints
 │       ├── apps.rs          # App & deployment endpoints

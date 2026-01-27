@@ -8,7 +8,14 @@
       "Bash(cargo run:*)",
       "Bash(cargo clippy:*)",
       "Bash(cargo fmt:*)",
-      "Bash(./target/release/quome:*)"
+      "Bash(./target/release/quome:*)",
+      "Bash(./target/release/quome login:*)",
+      "Bash(curl:*)",
+      "Bash(QUOME_DEBUG=1 ./target/release/quome logs:*)",
+      "Bash(git push)",
+      "Bash(git push:*)",
+      "Bash(grep:*)",
+      "Bash(git reset:*)"
     ]
   }
 }

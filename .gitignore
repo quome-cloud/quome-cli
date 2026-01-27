@@ -11,9 +11,12 @@
 .DS_Store
 Thumbs.db
 
-# Local config
+# Local config and credentials
 .env
 .env.local
+*.credentials
+*.token
+config.json
 
 # Ignore reference projects
 railway-cli-example/

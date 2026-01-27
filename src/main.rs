@@ -9,10 +9,20 @@ mod ui;
 use clap::Parser;
 use colored::Colorize;
 
+const BANNER: &str = r#"
+   ██████╗ ██╗   ██╗ ██████╗ ███╗   ███╗███████╗
+  ██╔═══██╗██║   ██║██╔═══██╗████╗ ████║██╔════╝
+  ██║   ██║██║   ██║██║   ██║██╔████╔██║█████╗
+  ██║▄▄ ██║██║   ██║██║   ██║██║╚██╔╝██║██╔══╝
+  ╚██████╔╝╚██████╔╝╚██████╔╝██║ ╚═╝ ██║███████╗
+   ╚══▀▀═╝  ╚═════╝  ╚═════╝ ╚═╝     ╚═╝╚══════╝
+"#;
+
 #[derive(Parser)]
 #[command(name = "quome")]
 #[command(about = "CLI for the Quome platform")]
 #[command(version)]
+#[command(before_help = BANNER)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

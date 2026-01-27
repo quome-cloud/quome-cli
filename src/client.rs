@@ -51,7 +51,11 @@ impl QuomeClient {
         let status = response.status();
 
         if status.is_success() {
-            let body = response.json::<T>().await?;
+            let text = response.text().await?;
+            if std::env::var("QUOME_DEBUG").is_ok() {
+                eprintln!("DEBUG response: {}", text);
+            }
+            let body: T = serde_json::from_str(&text)?;
             Ok(body)
         } else {
             match status {

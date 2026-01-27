@@ -15,10 +15,18 @@ pub struct CreateUserRequest {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct User {
     pub id: Uuid,
-    pub username: String,
     pub email: String,
+    pub name: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub default_org: Option<Uuid>,
+    #[serde(default)]
+    pub avatar: Option<String>,
+    #[serde(default)]
+    pub last_login_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub two_factor: Option<bool>,
 }
 
 // ============ Auth/Sessions ============
@@ -239,10 +247,13 @@ pub struct DeploymentList {
 pub struct Secret {
     pub id: Uuid,
     pub name: String,
-    pub value: String,
+    /// Value is only returned when fetching a single secret, not when listing
+    #[serde(default)]
+    pub value: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
-    pub organization_id: Uuid,
+    #[serde(default)]
+    pub organization_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
