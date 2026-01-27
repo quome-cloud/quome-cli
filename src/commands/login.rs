@@ -20,9 +20,9 @@ pub struct Args {
 pub async fn execute(args: Args) -> Result<()> {
     let email = match args.email {
         Some(e) => e,
-        None => inquire::Text::new("Email:").prompt().map_err(|e| {
-            crate::errors::QuomeError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-        })?,
+        None => inquire::Text::new("Email:")
+            .prompt()
+            .map_err(|e| crate::errors::QuomeError::Io(std::io::Error::other(e.to_string())))?,
     };
 
     let password = match args.password {
@@ -30,9 +30,7 @@ pub async fn execute(args: Args) -> Result<()> {
         None => inquire::Password::new("Password:")
             .without_confirmation()
             .prompt()
-            .map_err(|e| {
-                crate::errors::QuomeError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-            })?,
+            .map_err(|e| crate::errors::QuomeError::Io(std::io::Error::other(e.to_string())))?,
     };
 
     println!("Logging in...");

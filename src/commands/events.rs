@@ -43,15 +43,15 @@ pub async fn execute(args: Args) -> Result<()> {
 
         for event in response.events {
             let id_string = event.resource.id.to_string();
-            let resource_name = event
-                .resource
-                .name
-                .as_deref()
-                .unwrap_or(&id_string);
+            let resource_name = event.resource.name.as_deref().unwrap_or(&id_string);
 
             println!(
                 "{} {} {} {} on {} {}",
-                event.created_at.format("%Y-%m-%d %H:%M:%S").to_string().dimmed(),
+                event
+                    .created_at
+                    .format("%Y-%m-%d %H:%M:%S")
+                    .to_string()
+                    .dimmed(),
                 event.actor.email.cyan(),
                 event.event_type.yellow(),
                 event.resource.resource_type.dimmed(),

@@ -1,8 +1,8 @@
 mod api;
 mod client;
+mod commands;
 mod config;
 mod errors;
-mod commands;
 
 use clap::Parser;
 use colored::Colorize;

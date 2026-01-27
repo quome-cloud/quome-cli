@@ -21,19 +21,30 @@ impl QuomeClient {
         self.get(&format!("/api/v1/orgs/{}/members", org_id)).await
     }
 
-    pub async fn add_org_member(&self, org_id: Uuid, req: &AddOrgMemberRequest) -> Result<OrgMember> {
-        self.post(&format!("/api/v1/orgs/{}/members", org_id), req).await
+    pub async fn add_org_member(
+        &self,
+        org_id: Uuid,
+        req: &AddOrgMemberRequest,
+    ) -> Result<OrgMember> {
+        self.post(&format!("/api/v1/orgs/{}/members", org_id), req)
+            .await
     }
 
     pub async fn list_org_keys(&self, org_id: Uuid) -> Result<ListOrgKeysResponse> {
         self.get(&format!("/api/v1/orgs/{}/keys", org_id)).await
     }
 
-    pub async fn create_org_key(&self, org_id: Uuid, req: &CreateOrgKeyRequest) -> Result<CreatedOrgKey> {
-        self.post(&format!("/api/v1/orgs/{}/keys", org_id), req).await
+    pub async fn create_org_key(
+        &self,
+        org_id: Uuid,
+        req: &CreateOrgKeyRequest,
+    ) -> Result<CreatedOrgKey> {
+        self.post(&format!("/api/v1/orgs/{}/keys", org_id), req)
+            .await
     }
 
     pub async fn delete_org_key(&self, org_id: Uuid, key_id: Uuid) -> Result<()> {
-        self.delete(&format!("/api/v1/orgs/{}/apikeys/{}", org_id, key_id)).await
+        self.delete(&format!("/api/v1/orgs/{}/apikeys/{}", org_id, key_id))
+            .await
     }
 }

@@ -58,16 +58,16 @@ impl QuomeClient {
                 StatusCode::NOT_FOUND => {
                     let err = response.json::<ApiErrorResponse>().await.ok();
                     Err(QuomeError::NotFound(
-                        err.map(|e| e.message).unwrap_or_else(|| "Resource not found".into()),
+                        err.map(|e| e.message)
+                            .unwrap_or_else(|| "Resource not found".into()),
                     ))
                 }
                 StatusCode::TOO_MANY_REQUESTS => Err(QuomeError::RateLimited),
                 _ => {
                     let err = response.json::<ApiErrorResponse>().await.ok();
-                    Err(QuomeError::ApiError(
-                        err.map(|e| e.message)
-                            .unwrap_or_else(|| format!("Request failed with status {}", status)),
-                    ))
+                    Err(QuomeError::ApiError(err.map(|e| e.message).unwrap_or_else(
+                        || format!("Request failed with status {}", status),
+                    )))
                 }
             }
         }
@@ -84,16 +84,16 @@ impl QuomeClient {
                 StatusCode::NOT_FOUND => {
                     let err = response.json::<ApiErrorResponse>().await.ok();
                     Err(QuomeError::NotFound(
-                        err.map(|e| e.message).unwrap_or_else(|| "Resource not found".into()),
+                        err.map(|e| e.message)
+                            .unwrap_or_else(|| "Resource not found".into()),
                     ))
                 }
                 StatusCode::TOO_MANY_REQUESTS => Err(QuomeError::RateLimited),
                 _ => {
                     let err = response.json::<ApiErrorResponse>().await.ok();
-                    Err(QuomeError::ApiError(
-                        err.map(|e| e.message)
-                            .unwrap_or_else(|| format!("Request failed with status {}", status)),
-                    ))
+                    Err(QuomeError::ApiError(err.map(|e| e.message).unwrap_or_else(
+                        || format!("Request failed with status {}", status),
+                    )))
                 }
             }
         }

@@ -132,7 +132,11 @@ async fn get(args: GetArgs) -> Result<()> {
     } else {
         println!("{}", "Deployment".bold());
         println!("  {} {}", "ID:".dimmed(), deployment.id);
-        println!("  {} {}", "Status:".dimmed(), status_color(&deployment.status));
+        println!(
+            "  {} {}",
+            "Status:".dimmed(),
+            status_color(&deployment.status)
+        );
         println!(
             "  {} {}",
             "Created:".dimmed(),

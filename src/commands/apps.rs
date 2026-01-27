@@ -304,12 +304,7 @@ async fn delete(args: DeleteArgs) -> Result<()> {
         ))
         .with_default(false)
         .prompt()
-        .map_err(|e| {
-            crate::errors::QuomeError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                e.to_string(),
-            ))
-        })?;
+        .map_err(|e| crate::errors::QuomeError::Io(std::io::Error::other(e.to_string())))?;
 
         if !confirm {
             println!("Cancelled.");

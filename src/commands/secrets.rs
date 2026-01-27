@@ -174,7 +174,11 @@ async fn set(args: SetArgs) -> Result<()> {
     if args.json {
         println!("{}", serde_json::to_string_pretty(&secret)?);
     } else {
-        let action = if existing.is_some() { "Updated" } else { "Created" };
+        let action = if existing.is_some() {
+            "Updated"
+        } else {
+            "Created"
+        };
         println!("{} {} secret:", "Success!".green().bold(), action);
         println!("  {} {}", "Name:".dimmed(), secret.name);
         println!("  {} {}", "ID:".dimmed(), secret.id);
@@ -229,12 +233,7 @@ async fn delete(args: DeleteArgs) -> Result<()> {
         ))
         .with_default(false)
         .prompt()
-        .map_err(|e| {
-            crate::errors::QuomeError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                e.to_string(),
-            ))
-        })?;
+        .map_err(|e| crate::errors::QuomeError::Io(std::io::Error::other(e.to_string())))?;
 
         if !confirm {
             println!("Cancelled.");

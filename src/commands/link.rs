@@ -25,9 +25,9 @@ pub async fn execute(args: Args) -> Result<()> {
 
     // Get or select organization
     let (org_id, org_name) = if let Some(ref org_str) = args.org {
-        let org_id = org_str.parse().map_err(|_| {
-            crate::errors::QuomeError::ApiError("Invalid organization ID".into())
-        })?;
+        let org_id = org_str
+            .parse()
+            .map_err(|_| crate::errors::QuomeError::ApiError("Invalid organization ID".into()))?;
         let org = client.get_org(org_id).await?;
         (org.id, org.name)
     } else {
@@ -46,12 +46,7 @@ pub async fn execute(args: Args) -> Result<()> {
 
         let selection = Select::new("Select organization:", options)
             .prompt()
-            .map_err(|e| {
-                crate::errors::QuomeError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            })?;
+            .map_err(|e| crate::errors::QuomeError::Io(std::io::Error::other(e.to_string())))?;
 
         let idx = orgs_resp
             .organizations
@@ -65,9 +60,9 @@ pub async fn execute(args: Args) -> Result<()> {
 
     // Get or select application (optional)
     let (app_id, app_name) = if let Some(ref app_str) = args.app {
-        let app_id = app_str.parse().map_err(|_| {
-            crate::errors::QuomeError::ApiError("Invalid application ID".into())
-        })?;
+        let app_id = app_str
+            .parse()
+            .map_err(|_| crate::errors::QuomeError::ApiError("Invalid application ID".into()))?;
         let app = client.get_app(org_id, app_id).await?;
         (Some(app.id), Some(app.name))
     } else {
@@ -86,12 +81,7 @@ pub async fn execute(args: Args) -> Result<()> {
 
             let selection = Select::new("Select application:", options)
                 .prompt()
-                .map_err(|e| {
-                    crate::errors::QuomeError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        e.to_string(),
-                    ))
-                })?;
+                .map_err(|e| crate::errors::QuomeError::Io(std::io::Error::other(e.to_string())))?;
 
             if selection == "(Skip - don't link an app)" {
                 (None, None)

@@ -1,7 +1,7 @@
-pub mod models;
-mod auth;
-mod users;
-mod orgs;
 mod apps;
-mod secrets;
+mod auth;
 mod events;
+pub mod models;
+mod orgs;
+mod secrets;
+mod users;

@@ -10,18 +10,30 @@ impl QuomeClient {
     }
 
     pub async fn create_secret(&self, org_id: Uuid, req: &CreateSecretRequest) -> Result<Secret> {
-        self.post(&format!("/api/v1/orgs/{}/secrets", org_id), req).await
+        self.post(&format!("/api/v1/orgs/{}/secrets", org_id), req)
+            .await
     }
 
     pub async fn get_secret(&self, org_id: Uuid, secret_id: Uuid) -> Result<Secret> {
-        self.get(&format!("/api/v1/orgs/{}/secrets/{}", org_id, secret_id)).await
+        self.get(&format!("/api/v1/orgs/{}/secrets/{}", org_id, secret_id))
+            .await
     }
 
-    pub async fn update_secret(&self, org_id: Uuid, secret_id: Uuid, req: &UpdateSecretRequest) -> Result<Secret> {
-        self.put(&format!("/api/v1/orgs/{}/secrets/{}", org_id, secret_id), req).await
+    pub async fn update_secret(
+        &self,
+        org_id: Uuid,
+        secret_id: Uuid,
+        req: &UpdateSecretRequest,
+    ) -> Result<Secret> {
+        self.put(
+            &format!("/api/v1/orgs/{}/secrets/{}", org_id, secret_id),
+            req,
+        )
+        .await
     }
 
     pub async fn delete_secret(&self, org_id: Uuid, secret_id: Uuid) -> Result<()> {
-        self.delete(&format!("/api/v1/orgs/{}/secrets/{}", org_id, secret_id)).await
+        self.delete(&format!("/api/v1/orgs/{}/secrets/{}", org_id, secret_id))
+            .await
     }
 }

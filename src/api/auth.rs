@@ -16,6 +16,7 @@ impl QuomeClient {
     }
 
     pub async fn delete_session(&self, session_id: &str) -> Result<()> {
-        self.delete(&format!("/api/v1/auth/sessions/{}", session_id)).await
+        self.delete(&format!("/api/v1/auth/sessions/{}", session_id))
+            .await
     }
 }

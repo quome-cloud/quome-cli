@@ -63,7 +63,11 @@ pub async fn execute(args: Args) -> Result<()> {
         for entry in response.logs {
             println!(
                 "{} {} {}",
-                entry.timestamp.format("%Y-%m-%d %H:%M:%S").to_string().dimmed(),
+                entry
+                    .timestamp
+                    .format("%Y-%m-%d %H:%M:%S")
+                    .to_string()
+                    .dimmed(),
                 level_color(&entry.level),
                 entry.message
             );

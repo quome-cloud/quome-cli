@@ -99,7 +99,12 @@ async fn add(args: AddArgs) -> Result<()> {
 
     let client = QuomeClient::new(Some(&token), None)?;
     let member = client
-        .add_org_member(org_id, &AddOrgMemberRequest { user_id: args.user_id })
+        .add_org_member(
+            org_id,
+            &AddOrgMemberRequest {
+                user_id: args.user_id,
+            },
+        )
         .await?;
 
     if args.json {

@@ -86,11 +86,7 @@ async fn list(args: ListArgs) -> Result<()> {
             return Ok(());
         }
 
-        println!(
-            "{:<36}  {:<20}",
-            "ID".bold(),
-            "CREATED".bold()
-        );
+        println!("{:<36}  {:<20}", "ID".bold(), "CREATED".bold());
         println!("{}", "-".repeat(58));
 
         for key in response.keys {
@@ -131,16 +127,9 @@ async fn create(args: CreateArgs) -> Result<()> {
         println!("{} Created API key:", "Success!".green().bold());
         println!("  {} {}", "ID:".dimmed(), key.id);
         println!();
-        println!(
-            "  {} {}",
-            "Key:".yellow().bold(),
-            key.key.cyan()
-        );
+        println!("  {} {}", "Key:".yellow().bold(), key.key.cyan());
         println!();
-        println!(
-            "  {}",
-            "Save this key - it won't be shown again!".yellow()
-        );
+        println!("  {}", "Save this key - it won't be shown again!".yellow());
     }
 
     Ok(())
@@ -162,12 +151,7 @@ async fn delete(args: DeleteArgs) -> Result<()> {
         ))
         .with_default(false)
         .prompt()
-        .map_err(|e| {
-            crate::errors::QuomeError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                e.to_string(),
-            ))
-        })?;
+        .map_err(|e| crate::errors::QuomeError::Io(std::io::Error::other(e.to_string())))?;
 
         if !confirm {
             println!("Cancelled.");
@@ -178,11 +162,7 @@ async fn delete(args: DeleteArgs) -> Result<()> {
     let client = QuomeClient::new(Some(&token), None)?;
     client.delete_org_key(org_id, args.id).await?;
 
-    println!(
-        "{} Deleted API key {}",
-        "Success!".green().bold(),
-        args.id
-    );
+    println!("{} Deleted API key {}", "Success!".green().bold(), args.id);
 
     Ok(())
 }

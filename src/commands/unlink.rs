@@ -18,10 +18,7 @@ pub async fn execute(_args: Args) -> Result<()> {
     config.clear_linked()?;
     config.save()?;
 
-    println!(
-        "{} Unlinked current directory.",
-        "Success!".green().bold()
-    );
+    println!("{} Unlinked current directory.", "Success!".green().bold());
 
     Ok(())
 }
