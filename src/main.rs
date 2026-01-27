@@ -1,5 +1,6 @@
 mod api;
 mod client;
+mod config;
 mod errors;
 
 use clap::Parser;
