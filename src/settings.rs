@@ -26,7 +26,7 @@ fn default_api_url() -> String {
 }
 
 fn default_docs_url() -> String {
-    "https://docs.quome.com".to_string()
+    "https://documentation.demo.quome.cloud".to_string()
 }
 
 fn default_website_url() -> String {

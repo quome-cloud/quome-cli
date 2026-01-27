@@ -509,7 +509,7 @@ Example `settings.json`:
 ```json
 {
   "api_url": "https://demo.quome.cloud",
-  "docs_url": "https://docs.quome.com",
+  "docs_url": "https://documentation.demo.quome.cloud",
   "website_url": "https://quome.com"
 }
 ```
@@ -517,7 +517,7 @@ Example `settings.json`:
 | Setting | Description | Default |
 |---------|-------------|---------|
 | `api_url` | API base URL | `https://demo.quome.cloud` |
-| `docs_url` | Documentation URL | `https://docs.quome.com` |
+| `docs_url` | Documentation URL | `https://documentation.demo.quome.cloud` |
 | `website_url` | Main website URL | `https://quome.com` |
 
 This is useful for:
@@ -598,5 +598,5 @@ This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENS
 
 ## Support
 
-- [Documentation](https://docs.quome.com)
+- [Documentation](https://documentation.demo.quome.cloud)
 - [Issue Tracker](https://github.com/quome-cloud/quome-cli/issues)
