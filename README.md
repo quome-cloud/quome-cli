@@ -9,7 +9,7 @@ This is the command line interface for [Quome](https://quome.com). Use it to man
 
 The Quome CLI allows you to:
 
-- Authenticate and manage sessions
+- Authenticate using API keys from the Quome dashboard
 - Create and manage organizations
 - Deploy and monitor applications
 - Manage secrets and environment variables
@@ -60,18 +60,28 @@ quome whoami
 
 ## Authentication
 
+The Quome CLI uses API keys for authentication. You'll need to generate an API key from the Quome web interface before using the CLI.
+
+### Getting Your API Key
+
+1. Log in to the [Quome Dashboard](https://quome.com)
+2. Navigate to your organization settings
+3. Go to **API Keys** section
+4. Click **Create API Key**
+5. Copy the generated key (it's only shown once!)
+
 ### Interactive Login
 
 ```bash
 quome login
 ```
 
-You'll be prompted for your email and password. The session token is stored securely in `~/.quome/config.json`.
+You'll be prompted to enter your API key. The key is stored securely in `~/.quome/config.json`.
 
 ### Non-Interactive Login
 
 ```bash
-quome login --email you@example.com --password your-password
+quome login --token your-api-key
 ```
 
 ### Using Environment Variables
@@ -79,7 +89,7 @@ quome login --email you@example.com --password your-password
 For CI/CD pipelines, you can use environment variables instead of logging in:
 
 ```bash
-export QUOME_TOKEN=your-api-token
+export QUOME_TOKEN=your-api-key
 export QUOME_ORG=your-org-id
 export QUOME_APP=your-app-id
 
@@ -111,18 +121,17 @@ Linking is stored per-directory in `~/.quome/config.json`.
 
 ## Commands Reference
 
-### Session Management
+### Authentication
 
 #### `quome login`
 
-Authenticate with Quome.
+Authenticate with Quome using an API key generated from the [Quome Dashboard](https://quome.com).
 
 ```bash
 quome login [OPTIONS]
 
 Options:
-  -e, --email <EMAIL>        Email address
-  -p, --password <PASSWORD>  Password (will prompt if not provided)
+  -t, --token <TOKEN>  API key (will prompt if not provided)
 ```
 
 #### `quome logout`
@@ -481,7 +490,7 @@ User credentials and linked directories are stored in `~/.quome/config.json`:
 ```json
 {
   "user": {
-    "token": "your-session-token",
+    "token": "your-api-key",
     "id": "user-uuid",
     "email": "you@example.com"
   },
@@ -529,7 +538,7 @@ This is useful for:
 
 | Variable | Description |
 |----------|-------------|
-| `QUOME_TOKEN` | API token (overrides stored session) |
+| `QUOME_TOKEN` | API key (overrides stored key) |
 | `QUOME_ORG` | Organization ID (overrides linked org) |
 | `QUOME_APP` | Application ID (overrides linked app) |
 | `QUOME_API_URL` | API base URL (default: `https://demo.quome.cloud`) |
