@@ -1,3 +1,4 @@
+mod api;
 mod errors;
 
 use clap::Parser;
