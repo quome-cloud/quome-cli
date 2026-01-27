@@ -2,12 +2,15 @@ mod api;
 mod client;
 mod config;
 mod errors;
+mod commands;
 
 use clap::Parser;
+use colored::Colorize;
 
 #[derive(Parser)]
 #[command(name = "quome")]
 #[command(about = "CLI for the Quome platform")]
+#[command(version)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -15,19 +18,74 @@ struct Cli {
 
 #[derive(clap::Subcommand)]
 enum Commands {
-    /// Show version information
-    Version,
+    /// Login to Quome
+    Login(commands::login::Args),
+    /// Logout from Quome
+    Logout(commands::logout::Args),
+    /// Show current user info
+    Whoami(commands::whoami::Args),
+    /// Link current directory to an org and app
+    Link(commands::link::Args),
+    /// Unlink current directory
+    Unlink(commands::unlink::Args),
+    /// Manage organizations
+    Orgs {
+        #[command(subcommand)]
+        command: commands::orgs::OrgsCommands,
+    },
+    /// Manage organization members
+    Members {
+        #[command(subcommand)]
+        command: commands::members::MembersCommands,
+    },
+    /// Manage applications
+    Apps {
+        #[command(subcommand)]
+        command: commands::apps::AppsCommands,
+    },
+    /// Manage deployments
+    Deployments {
+        #[command(subcommand)]
+        command: commands::deployments::DeploymentsCommands,
+    },
+    /// View application logs
+    Logs(commands::logs::Args),
+    /// Manage secrets
+    Secrets {
+        #[command(subcommand)]
+        command: commands::secrets::SecretsCommands,
+    },
+    /// Manage API keys
+    Keys {
+        #[command(subcommand)]
+        command: commands::keys::KeysCommands,
+    },
+    /// View organization events
+    Events(commands::events::Args),
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() {
     let cli = Cli::parse();
 
-    match cli.command {
-        Commands::Version => {
-            println!("quome {}", env!("CARGO_PKG_VERSION"));
-        }
-    }
+    let result = match cli.command {
+        Commands::Login(args) => commands::login::execute(args).await,
+        Commands::Logout(args) => commands::logout::execute(args).await,
+        Commands::Whoami(args) => commands::whoami::execute(args).await,
+        Commands::Link(args) => commands::link::execute(args).await,
+        Commands::Unlink(args) => commands::unlink::execute(args).await,
+        Commands::Orgs { command } => commands::orgs::execute(command).await,
+        Commands::Members { command } => commands::members::execute(command).await,
+        Commands::Apps { command } => commands::apps::execute(command).await,
+        Commands::Deployments { command } => commands::deployments::execute(command).await,
+        Commands::Logs(args) => commands::logs::execute(args).await,
+        Commands::Secrets { command } => commands::secrets::execute(command).await,
+        Commands::Keys { command } => commands::keys::execute(command).await,
+        Commands::Events(args) => commands::events::execute(args).await,
+    };
 
-    Ok(())
+    if let Err(e) = result {
+        eprintln!("{} {}", "error:".red().bold(), e);
+        std::process::exit(1);
+    }
 }

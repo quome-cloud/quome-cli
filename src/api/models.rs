@@ -126,7 +126,7 @@ pub struct CreateOrgKeyRequest {
     pub expiration: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct CreatedOrgKey {
     pub id: Uuid,
     pub key: String,
