@@ -1,11 +1,11 @@
 use clap::{Parser, Subcommand};
-use colored::Colorize;
 use uuid::Uuid;
 
 use crate::api::models::{CreateSecretRequest, UpdateSecretRequest};
 use crate::client::QuomeClient;
 use crate::config::Config;
 use crate::errors::Result;
+use crate::ui::{self, SecretRow};
 
 #[derive(Subcommand)]
 pub enum SecretsCommands {
@@ -98,7 +98,10 @@ async fn list(args: ListArgs) -> Result<()> {
     };
 
     let client = QuomeClient::new(Some(&token), None)?;
+
+    let sp = ui::spinner("Fetching secrets...");
     let response = client.list_secrets(org_id).await?;
+    sp.finish_and_clear();
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&response.secrets)?);
@@ -108,22 +111,17 @@ async fn list(args: ListArgs) -> Result<()> {
             return Ok(());
         }
 
-        println!(
-            "{:<20}  {:<36}  {:<20}",
-            "NAME".bold(),
-            "ID".bold(),
-            "UPDATED".bold()
-        );
-        println!("{}", "-".repeat(78));
+        let rows: Vec<SecretRow> = response
+            .secrets
+            .iter()
+            .map(|secret| SecretRow {
+                name: secret.name.clone(),
+                id: secret.id.to_string(),
+                updated: secret.updated_at.format("%Y-%m-%d %H:%M").to_string(),
+            })
+            .collect();
 
-        for secret in response.secrets {
-            println!(
-                "{:<20}  {:<36}  {:<20}",
-                secret.name,
-                secret.id,
-                secret.updated_at.format("%Y-%m-%d %H:%M")
-            );
-        }
+        ui::print_table(rows);
     }
 
     Ok(())
@@ -141,12 +139,15 @@ async fn set(args: SetArgs) -> Result<()> {
     let client = QuomeClient::new(Some(&token), None)?;
 
     // Check if secret exists
+    let sp = ui::spinner("Checking for existing secret...");
     let response = client.list_secrets(org_id).await?;
     let existing = response.secrets.iter().find(|s| s.name == args.name);
+    sp.finish_and_clear();
 
-    let secret = if let Some(existing_secret) = existing {
+    let (secret, action) = if let Some(existing_secret) = existing {
         // Update existing secret
-        client
+        let sp = ui::spinner("Updating secret...");
+        let secret = client
             .update_secret(
                 org_id,
                 existing_secret.id,
@@ -156,10 +157,13 @@ async fn set(args: SetArgs) -> Result<()> {
                     description: args.description,
                 },
             )
-            .await?
+            .await?;
+        sp.finish_and_clear();
+        (secret, "Updated")
     } else {
         // Create new secret
-        client
+        let sp = ui::spinner("Creating secret...");
+        let secret = client
             .create_secret(
                 org_id,
                 &CreateSecretRequest {
@@ -168,20 +172,18 @@ async fn set(args: SetArgs) -> Result<()> {
                     description: args.description,
                 },
             )
-            .await?
+            .await?;
+        sp.finish_and_clear();
+        (secret, "Created")
     };
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&secret)?);
     } else {
-        let action = if existing.is_some() {
-            "Updated"
-        } else {
-            "Created"
-        };
-        println!("{} {} secret:", "Success!".green().bold(), action);
-        println!("  {} {}", "Name:".dimmed(), secret.name);
-        println!("  {} {}", "ID:".dimmed(), secret.id);
+        ui::print_success(&format!("{} secret", action), &[
+            ("Name", &secret.name),
+            ("ID", &secret.id.to_string()),
+        ]);
     }
 
     Ok(())
@@ -199,6 +201,7 @@ async fn get(args: GetArgs) -> Result<()> {
     let client = QuomeClient::new(Some(&token), None)?;
 
     // Find secret by name
+    let sp = ui::spinner("Fetching secret...");
     let response = client.list_secrets(org_id).await?;
     let secret_meta = response
         .secrets
@@ -207,11 +210,15 @@ async fn get(args: GetArgs) -> Result<()> {
         .ok_or_else(|| crate::errors::QuomeError::NotFound(format!("Secret '{}'", args.name)))?;
 
     let secret = client.get_secret(org_id, secret_meta.id).await?;
+    sp.finish_and_clear();
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&secret)?);
     } else {
-        println!("{}", secret.value);
+        match secret.value {
+            Some(value) => println!("{}", value),
+            None => println!("(no value returned)"),
+        }
     }
 
     Ok(())
@@ -244,20 +251,22 @@ async fn delete(args: DeleteArgs) -> Result<()> {
     let client = QuomeClient::new(Some(&token), None)?;
 
     // Find secret by name
+    let sp = ui::spinner("Fetching secret...");
     let response = client.list_secrets(org_id).await?;
     let secret = response
         .secrets
         .iter()
         .find(|s| s.name == args.name)
         .ok_or_else(|| crate::errors::QuomeError::NotFound(format!("Secret '{}'", args.name)))?;
+    sp.finish_and_clear();
 
+    let sp = ui::spinner("Deleting secret...");
     client.delete_secret(org_id, secret.id).await?;
+    sp.finish_and_clear();
 
-    println!(
-        "{} Deleted secret '{}'",
-        "Success!".green().bold(),
-        args.name
-    );
+    ui::print_success("Deleted secret", &[
+        ("Name", &args.name),
+    ]);
 
     Ok(())
 }

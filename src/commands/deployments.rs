@@ -6,6 +6,7 @@ use crate::api::models::DeploymentStatus;
 use crate::client::QuomeClient;
 use crate::config::Config;
 use crate::errors::Result;
+use crate::ui::{self, DeploymentRow};
 
 #[derive(Subcommand)]
 pub enum DeploymentsCommands {
@@ -79,7 +80,10 @@ async fn list(args: ListArgs) -> Result<()> {
     };
 
     let client = QuomeClient::new(Some(&token), None)?;
+
+    let sp = ui::spinner("Fetching deployments...");
     let response = client.list_deployments(org_id, app_id).await?;
+    sp.finish_and_clear();
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&response.deployments)?);
@@ -89,22 +93,17 @@ async fn list(args: ListArgs) -> Result<()> {
             return Ok(());
         }
 
-        println!(
-            "{:<36}  {:<12}  {:<20}",
-            "ID".bold(),
-            "STATUS".bold(),
-            "CREATED".bold()
-        );
-        println!("{}", "-".repeat(70));
+        let rows: Vec<DeploymentRow> = response
+            .deployments
+            .iter()
+            .map(|d| DeploymentRow {
+                id: d.id.to_string(),
+                status: status_color(&d.status).to_string(),
+                created: d.created_at.format("%Y-%m-%d %H:%M").to_string(),
+            })
+            .collect();
 
-        for deployment in response.deployments {
-            println!(
-                "{:<36}  {:<12}  {:<20}",
-                deployment.id,
-                status_color(&deployment.status),
-                deployment.created_at.format("%Y-%m-%d %H:%M")
-            );
-        }
+        ui::print_table(rows);
     }
 
     Ok(())
@@ -125,36 +124,40 @@ async fn get(args: GetArgs) -> Result<()> {
     };
 
     let client = QuomeClient::new(Some(&token), None)?;
+
+    let sp = ui::spinner("Fetching deployment...");
     let deployment = client.get_deployment(org_id, app_id, args.id).await?;
+    sp.finish_and_clear();
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&deployment)?);
     } else {
-        println!("{}", "Deployment".bold());
-        println!("  {} {}", "ID:".dimmed(), deployment.id);
-        println!(
-            "  {} {}",
-            "Status:".dimmed(),
-            status_color(&deployment.status)
-        );
-        println!(
-            "  {} {}",
-            "Created:".dimmed(),
-            deployment.created_at.format("%Y-%m-%d %H:%M:%S")
-        );
+        let status_str = status_color(&deployment.status).to_string();
+        let mut details = vec![
+            ("ID", deployment.id.to_string()),
+            ("Status", status_str),
+            ("Created", deployment.created_at.format("%Y-%m-%d %H:%M:%S").to_string()),
+        ];
 
         if let Some(ref msg) = deployment.failure_message {
-            println!("  {} {}", "Failure:".red(), msg);
+            details.push(("Failure", msg.clone()));
         }
+
+        let details_ref: Vec<(&str, &str)> = details
+            .iter()
+            .map(|(k, v)| (*k, v.as_str()))
+            .collect();
+
+        ui::print_detail("Deployment", &details_ref);
 
         if !deployment.events.is_empty() {
             println!();
-            println!("  {}", "Events:".bold());
+            println!("{}", "Events".bold());
             for event in &deployment.events {
                 println!(
-                    "    {} {} - {}",
+                    "  {} {} {}",
                     event.created_at.format("%H:%M:%S").to_string().dimmed(),
-                    "-".dimmed(),
+                    "•".cyan(),
                     event.message
                 );
             }

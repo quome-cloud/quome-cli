@@ -6,6 +6,7 @@ use crate::api::models::{AppSpec, ContainerSpec, CreateAppRequest, UpdateAppRequ
 use crate::client::QuomeClient;
 use crate::config::Config;
 use crate::errors::Result;
+use crate::ui::{self, AppRow};
 
 #[derive(Subcommand)]
 pub enum AppsCommands {
@@ -130,7 +131,10 @@ async fn list(args: ListArgs) -> Result<()> {
     };
 
     let client = QuomeClient::new(Some(&token), None)?;
+
+    let sp = ui::spinner("Fetching applications...");
     let response = client.list_apps(org_id).await?;
+    sp.finish_and_clear();
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&response.apps)?);
@@ -140,22 +144,17 @@ async fn list(args: ListArgs) -> Result<()> {
             return Ok(());
         }
 
-        println!(
-            "{:<36}  {:<20}  {:<20}",
-            "ID".bold(),
-            "NAME".bold(),
-            "CREATED".bold()
-        );
-        println!("{}", "-".repeat(78));
+        let rows: Vec<AppRow> = response
+            .apps
+            .iter()
+            .map(|app| AppRow {
+                id: app.id.to_string(),
+                name: app.name.clone(),
+                created: app.created_at.format("%Y-%m-%d %H:%M").to_string(),
+            })
+            .collect();
 
-        for app in response.apps {
-            println!(
-                "{:<36}  {:<20}  {:<20}",
-                app.id,
-                app.name,
-                app.created_at.format("%Y-%m-%d %H:%M")
-            );
-        }
+        ui::print_table(rows);
     }
 
     Ok(())
@@ -180,6 +179,7 @@ async fn create(args: CreateArgs) -> Result<()> {
         }],
     };
 
+    let sp = ui::spinner("Creating application...");
     let app = client
         .create_app(
             org_id,
@@ -190,13 +190,15 @@ async fn create(args: CreateArgs) -> Result<()> {
             },
         )
         .await?;
+    sp.finish_and_clear();
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&app)?);
     } else {
-        println!("{} Created application:", "Success!".green().bold());
-        println!("  {} {}", "ID:".dimmed(), app.id);
-        println!("  {} {}", "Name:".dimmed(), app.name);
+        ui::print_success("Created application", &[
+            ("ID", &app.id.to_string()),
+            ("Name", &app.name),
+        ]);
     }
 
     Ok(())
@@ -217,31 +219,46 @@ async fn get(args: GetArgs) -> Result<()> {
     };
 
     let client = QuomeClient::new(Some(&token), None)?;
+
+    let sp = ui::spinner("Fetching application...");
     let app = client.get_app(org_id, app_id).await?;
+    sp.finish_and_clear();
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&app)?);
     } else {
-        println!("{}", "Application".bold());
-        println!("  {} {}", "ID:".dimmed(), app.id);
-        println!("  {} {}", "Name:".dimmed(), app.name);
-        if let Some(ref desc) = app.description {
-            println!("  {} {}", "Description:".dimmed(), desc);
-        }
-        println!(
-            "  {} {}",
-            "Created:".dimmed(),
-            app.created_at.format("%Y-%m-%d %H:%M:%S")
-        );
+        let mut details = vec![
+            ("ID", app.id.to_string()),
+            ("Name", app.name.clone()),
+        ];
 
+        if let Some(ref desc) = app.description {
+            details.push(("Description", desc.clone()));
+        }
+
+        details.push(("Created", app.created_at.format("%Y-%m-%d %H:%M:%S").to_string()));
+        details.push(("Updated", app.updated_at.format("%Y-%m-%d %H:%M:%S").to_string()));
+
+        let details_ref: Vec<(&str, &str)> = details
+            .iter()
+            .map(|(k, v)| (*k, v.as_str()))
+            .collect();
+
+        ui::print_detail(&app.name, &details_ref);
+
+        // Show containers if any
         if let Some(ref spec) = app.spec {
             if !spec.containers.is_empty() {
                 println!();
-                println!("  {}", "Containers:".bold());
+                println!("{}", "Containers".bold());
                 for container in &spec.containers {
-                    println!("    {} {}", "-".dimmed(), container.name);
-                    println!("      {} {}", "Image:".dimmed(), container.image);
-                    println!("      {} {}", "Port:".dimmed(), container.port);
+                    println!(
+                        "  {} {} ({}, port {})",
+                        "•".cyan(),
+                        container.name.bold(),
+                        container.image.dimmed(),
+                        container.port
+                    );
                 }
             }
         }
@@ -265,6 +282,8 @@ async fn update(args: UpdateArgs) -> Result<()> {
     };
 
     let client = QuomeClient::new(Some(&token), None)?;
+
+    let sp = ui::spinner("Updating application...");
     let app = client
         .update_app(
             org_id,
@@ -276,13 +295,15 @@ async fn update(args: UpdateArgs) -> Result<()> {
             },
         )
         .await?;
+    sp.finish_and_clear();
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&app)?);
     } else {
-        println!("{} Updated application:", "Success!".green().bold());
-        println!("  {} {}", "ID:".dimmed(), app.id);
-        println!("  {} {}", "Name:".dimmed(), app.name);
+        ui::print_success("Updated application", &[
+            ("ID", &app.id.to_string()),
+            ("Name", &app.name),
+        ]);
     }
 
     Ok(())
@@ -313,13 +334,14 @@ async fn delete(args: DeleteArgs) -> Result<()> {
     }
 
     let client = QuomeClient::new(Some(&token), None)?;
-    client.delete_app(org_id, args.id).await?;
 
-    println!(
-        "{} Deleted application {}",
-        "Success!".green().bold(),
-        args.id
-    );
+    let sp = ui::spinner("Deleting application...");
+    client.delete_app(org_id, args.id).await?;
+    sp.finish_and_clear();
+
+    ui::print_success("Deleted application", &[
+        ("ID", &args.id.to_string()),
+    ]);
 
     Ok(())
 }

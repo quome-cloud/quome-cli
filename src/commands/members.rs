@@ -1,11 +1,11 @@
 use clap::{Parser, Subcommand};
-use colored::Colorize;
 use uuid::Uuid;
 
 use crate::api::models::AddOrgMemberRequest;
 use crate::client::QuomeClient;
 use crate::config::Config;
 use crate::errors::Result;
+use crate::ui::{self, MemberRow};
 
 #[derive(Subcommand)]
 pub enum MembersCommands {
@@ -57,7 +57,10 @@ async fn list(args: ListArgs) -> Result<()> {
     };
 
     let client = QuomeClient::new(Some(&token), None)?;
+
+    let sp = ui::spinner("Fetching members...");
     let response = client.list_org_members(org_id).await?;
+    sp.finish_and_clear();
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&response.members)?);
@@ -67,22 +70,17 @@ async fn list(args: ListArgs) -> Result<()> {
             return Ok(());
         }
 
-        println!(
-            "{:<36}  {:<36}  {:<20}",
-            "ID".bold(),
-            "USER ID".bold(),
-            "JOINED".bold()
-        );
-        println!("{}", "-".repeat(94));
+        let rows: Vec<MemberRow> = response
+            .members
+            .iter()
+            .map(|member| MemberRow {
+                user_id: member.user_id.to_string(),
+                member_id: member.id.to_string(),
+                joined: member.created_at.format("%Y-%m-%d %H:%M").to_string(),
+            })
+            .collect();
 
-        for member in response.members {
-            println!(
-                "{:<36}  {:<36}  {:<20}",
-                member.id,
-                member.user_id,
-                member.created_at.format("%Y-%m-%d %H:%M")
-            );
-        }
+        ui::print_table(rows);
     }
 
     Ok(())
@@ -98,6 +96,8 @@ async fn add(args: AddArgs) -> Result<()> {
     };
 
     let client = QuomeClient::new(Some(&token), None)?;
+
+    let sp = ui::spinner("Adding member...");
     let member = client
         .add_org_member(
             org_id,
@@ -106,13 +106,15 @@ async fn add(args: AddArgs) -> Result<()> {
             },
         )
         .await?;
+    sp.finish_and_clear();
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&member)?);
     } else {
-        println!("{} Added member:", "Success!".green().bold());
-        println!("  {} {}", "Member ID:".dimmed(), member.id);
-        println!("  {} {}", "User ID:".dimmed(), member.user_id);
+        ui::print_success("Added member", &[
+            ("Member ID", &member.id.to_string()),
+            ("User ID", &member.user_id.to_string()),
+        ]);
     }
 
     Ok(())

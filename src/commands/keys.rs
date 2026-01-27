@@ -7,6 +7,7 @@ use crate::api::models::CreateOrgKeyRequest;
 use crate::client::QuomeClient;
 use crate::config::Config;
 use crate::errors::Result;
+use crate::ui::{self, KeyRow};
 
 #[derive(Subcommand)]
 pub enum KeysCommands {
@@ -76,7 +77,10 @@ async fn list(args: ListArgs) -> Result<()> {
     };
 
     let client = QuomeClient::new(Some(&token), None)?;
+
+    let sp = ui::spinner("Fetching API keys...");
     let response = client.list_org_keys(org_id).await?;
+    sp.finish_and_clear();
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&response.keys)?);
@@ -86,16 +90,16 @@ async fn list(args: ListArgs) -> Result<()> {
             return Ok(());
         }
 
-        println!("{:<36}  {:<20}", "ID".bold(), "CREATED".bold());
-        println!("{}", "-".repeat(58));
+        let rows: Vec<KeyRow> = response
+            .keys
+            .iter()
+            .map(|key| KeyRow {
+                id: key.id.to_string(),
+                created: key.created_at.format("%Y-%m-%d %H:%M").to_string(),
+            })
+            .collect();
 
-        for key in response.keys {
-            println!(
-                "{:<36}  {:<20}",
-                key.id,
-                key.created_at.format("%Y-%m-%d %H:%M")
-            );
-        }
+        ui::print_table(rows);
     }
 
     Ok(())
@@ -117,17 +121,20 @@ async fn create(args: CreateArgs) -> Result<()> {
     };
 
     let client = QuomeClient::new(Some(&token), None)?;
+
+    let sp = ui::spinner("Creating API key...");
     let key = client
         .create_org_key(org_id, &CreateOrgKeyRequest { expiration })
         .await?;
+    sp.finish_and_clear();
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&key)?);
     } else {
-        println!("{} Created API key:", "Success!".green().bold());
-        println!("  {} {}", "ID:".dimmed(), key.id);
-        println!();
-        println!("  {} {}", "Key:".yellow().bold(), key.key.cyan());
+        ui::print_success("Created API key", &[
+            ("ID", &key.id.to_string()),
+            ("Key", &key.key),
+        ]);
         println!();
         println!("  {}", "Save this key - it won't be shown again!".yellow());
     }
@@ -160,9 +167,14 @@ async fn delete(args: DeleteArgs) -> Result<()> {
     }
 
     let client = QuomeClient::new(Some(&token), None)?;
-    client.delete_org_key(org_id, args.id).await?;
 
-    println!("{} Deleted API key {}", "Success!".green().bold(), args.id);
+    let sp = ui::spinner("Deleting API key...");
+    client.delete_org_key(org_id, args.id).await?;
+    sp.finish_and_clear();
+
+    ui::print_success("Deleted API key", &[
+        ("ID", &args.id.to_string()),
+    ]);
 
     Ok(())
 }

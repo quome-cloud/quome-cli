@@ -1,10 +1,10 @@
 use clap::Parser;
-use colored::Colorize;
 use inquire::Select;
 
 use crate::client::QuomeClient;
 use crate::config::{Config, LinkedContext};
 use crate::errors::Result;
+use crate::ui;
 
 #[derive(Parser)]
 pub struct Args {
@@ -28,10 +28,16 @@ pub async fn execute(args: Args) -> Result<()> {
         let org_id = org_str
             .parse()
             .map_err(|_| crate::errors::QuomeError::ApiError("Invalid organization ID".into()))?;
+
+        let sp = ui::spinner("Fetching organization...");
         let org = client.get_org(org_id).await?;
+        sp.finish_and_clear();
+
         (org.id, org.name)
     } else {
+        let sp = ui::spinner("Fetching organizations...");
         let orgs_resp = client.list_orgs().await?;
+        sp.finish_and_clear();
 
         if orgs_resp.organizations.is_empty() {
             println!("No organizations found. Create one with `quome orgs create <name>`");
@@ -63,10 +69,16 @@ pub async fn execute(args: Args) -> Result<()> {
         let app_id = app_str
             .parse()
             .map_err(|_| crate::errors::QuomeError::ApiError("Invalid application ID".into()))?;
+
+        let sp = ui::spinner("Fetching application...");
         let app = client.get_app(org_id, app_id).await?;
+        sp.finish_and_clear();
+
         (Some(app.id), Some(app.name))
     } else {
+        let sp = ui::spinner("Fetching applications...");
         let apps_resp = client.list_apps(org_id).await?;
+        sp.finish_and_clear();
 
         if apps_resp.apps.is_empty() {
             println!("No applications found in this organization.");
@@ -107,11 +119,17 @@ pub async fn execute(args: Args) -> Result<()> {
     })?;
     config.save()?;
 
-    println!("{} Linked to:", "Success!".green().bold());
-    println!("  {} {}", "Organization:".dimmed(), org_name.cyan());
-    if let Some(name) = app_name {
-        println!("  {} {}", "Application:".dimmed(), name.cyan());
+    let mut details = vec![("Organization", org_name.clone())];
+    if let Some(ref name) = app_name {
+        details.push(("Application", name.clone()));
     }
+
+    let details_ref: Vec<(&str, &str)> = details
+        .iter()
+        .map(|(k, v)| (*k, v.as_str()))
+        .collect();
+
+    ui::print_success("Linked", &details_ref);
 
     Ok(())
 }

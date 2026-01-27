@@ -4,6 +4,7 @@ mod commands;
 mod config;
 mod errors;
 mod settings;
+mod ui;
 
 use clap::Parser;
 use colored::Colorize;

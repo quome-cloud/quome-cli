@@ -6,6 +6,7 @@ use crate::api::models::LogLevel;
 use crate::client::QuomeClient;
 use crate::config::Config;
 use crate::errors::Result;
+use crate::ui;
 
 #[derive(Parser)]
 pub struct Args {
@@ -50,7 +51,10 @@ pub async fn execute(args: Args) -> Result<()> {
     };
 
     let client = QuomeClient::new(Some(&token), None)?;
+
+    let sp = ui::spinner("Fetching logs...");
     let logs = client.get_logs(org_id, app_id, Some(args.limit)).await?;
+    sp.finish_and_clear();
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&logs)?);
@@ -60,6 +64,7 @@ pub async fn execute(args: Args) -> Result<()> {
             return Ok(());
         }
 
+        // Logs are better displayed as a stream rather than a table
         for entry in logs {
             println!(
                 "{} {} {}",

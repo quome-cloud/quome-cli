@@ -1,10 +1,10 @@
 use clap::Parser;
-use colored::Colorize;
 use uuid::Uuid;
 
 use crate::client::QuomeClient;
 use crate::config::Config;
 use crate::errors::Result;
+use crate::ui::{self, EventRow};
 
 #[derive(Parser)]
 pub struct Args {
@@ -31,7 +31,10 @@ pub async fn execute(args: Args) -> Result<()> {
     };
 
     let client = QuomeClient::new(Some(&token), None)?;
+
+    let sp = ui::spinner("Fetching events...");
     let response = client.list_events(org_id, Some(args.limit)).await?;
+    sp.finish_and_clear();
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&response.events)?);
@@ -41,24 +44,22 @@ pub async fn execute(args: Args) -> Result<()> {
             return Ok(());
         }
 
-        for event in response.events {
-            let id_string = event.resource.id.to_string();
-            let resource_name = event.resource.name.as_deref().unwrap_or(&id_string);
+        let rows: Vec<EventRow> = response
+            .events
+            .iter()
+            .map(|event| {
+                let id_string = event.resource.id.to_string();
+                let resource_name = event.resource.name.as_deref().unwrap_or(&id_string);
+                EventRow {
+                    time: event.created_at.format("%Y-%m-%d %H:%M").to_string(),
+                    event_type: event.event_type.clone(),
+                    actor: event.actor.email.clone(),
+                    resource: format!("{} ({})", resource_name, event.resource.resource_type),
+                }
+            })
+            .collect();
 
-            println!(
-                "{} {} {} {} on {} {}",
-                event
-                    .created_at
-                    .format("%Y-%m-%d %H:%M:%S")
-                    .to_string()
-                    .dimmed(),
-                event.actor.email.cyan(),
-                event.event_type.yellow(),
-                event.resource.resource_type.dimmed(),
-                resource_name.bold(),
-                format!("({})", event.resource.id).dimmed()
-            );
-        }
+        ui::print_table(rows);
     }
 
     Ok(())

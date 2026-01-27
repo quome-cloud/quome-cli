@@ -1,11 +1,11 @@
 use clap::{Parser, Subcommand};
-use colored::Colorize;
 use uuid::Uuid;
 
 use crate::api::models::CreateOrgRequest;
 use crate::client::QuomeClient;
 use crate::config::Config;
 use crate::errors::Result;
+use crate::ui::{self, OrgRow};
 
 #[derive(Subcommand)]
 pub enum OrgsCommands {
@@ -58,7 +58,10 @@ async fn list(args: ListArgs) -> Result<()> {
     let token = config.require_token()?;
 
     let client = QuomeClient::new(Some(&token), None)?;
+
+    let sp = ui::spinner("Fetching organizations...");
     let response = client.list_orgs().await?;
+    sp.finish_and_clear();
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&response.organizations)?);
@@ -68,22 +71,17 @@ async fn list(args: ListArgs) -> Result<()> {
             return Ok(());
         }
 
-        println!(
-            "{:<36}  {:<20}  {:<20}",
-            "ID".bold(),
-            "NAME".bold(),
-            "CREATED".bold()
-        );
-        println!("{}", "-".repeat(78));
+        let rows: Vec<OrgRow> = response
+            .organizations
+            .iter()
+            .map(|org| OrgRow {
+                id: org.id.to_string(),
+                name: org.name.clone(),
+                created: org.created_at.format("%Y-%m-%d %H:%M").to_string(),
+            })
+            .collect();
 
-        for org in response.organizations {
-            println!(
-                "{:<36}  {:<20}  {:<20}",
-                org.id,
-                org.name,
-                org.created_at.format("%Y-%m-%d %H:%M")
-            );
-        }
+        ui::print_table(rows);
     }
 
     Ok(())
@@ -94,16 +92,20 @@ async fn create(args: CreateArgs) -> Result<()> {
     let token = config.require_token()?;
 
     let client = QuomeClient::new(Some(&token), None)?;
+
+    let sp = ui::spinner("Creating organization...");
     let org = client
         .create_org(&CreateOrgRequest { name: args.name })
         .await?;
+    sp.finish_and_clear();
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&org)?);
     } else {
-        println!("{} Created organization:", "Success!".green().bold());
-        println!("  {} {}", "ID:".dimmed(), org.id);
-        println!("  {} {}", "Name:".dimmed(), org.name);
+        ui::print_success("Created organization", &[
+            ("ID", &org.id.to_string()),
+            ("Name", &org.name),
+        ]);
     }
 
     Ok(())
@@ -119,24 +121,20 @@ async fn get(args: GetArgs) -> Result<()> {
     };
 
     let client = QuomeClient::new(Some(&token), None)?;
+
+    let sp = ui::spinner("Fetching organization...");
     let org = client.get_org(org_id).await?;
+    sp.finish_and_clear();
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&org)?);
     } else {
-        println!("{}", "Organization".bold());
-        println!("  {} {}", "ID:".dimmed(), org.id);
-        println!("  {} {}", "Name:".dimmed(), org.name);
-        println!(
-            "  {} {}",
-            "Created:".dimmed(),
-            org.created_at.format("%Y-%m-%d %H:%M:%S")
-        );
-        println!(
-            "  {} {}",
-            "Updated:".dimmed(),
-            org.updated_at.format("%Y-%m-%d %H:%M:%S")
-        );
+        ui::print_detail(&org.name, &[
+            ("ID", &org.id.to_string()),
+            ("Name", &org.name),
+            ("Created", &org.created_at.format("%Y-%m-%d %H:%M:%S").to_string()),
+            ("Updated", &org.updated_at.format("%Y-%m-%d %H:%M:%S").to_string()),
+        ]);
     }
 
     Ok(())

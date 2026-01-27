@@ -1,65 +1,44 @@
 use clap::Parser;
-use colored::Colorize;
 
-use crate::api::models::CreateSessionRequest;
 use crate::client::QuomeClient;
 use crate::config::Config;
 use crate::errors::Result;
+use crate::ui;
 
 #[derive(Parser)]
 pub struct Args {
-    /// Email address
+    /// API key (will prompt if not provided)
     #[arg(short, long)]
-    email: Option<String>,
-
-    /// Password (will prompt if not provided)
-    #[arg(short, long)]
-    password: Option<String>,
+    token: Option<String>,
 }
 
 pub async fn execute(args: Args) -> Result<()> {
-    let email = match args.email {
-        Some(e) => e,
-        None => inquire::Text::new("Email:")
-            .prompt()
-            .map_err(|e| crate::errors::QuomeError::Io(std::io::Error::other(e.to_string())))?,
-    };
-
-    let password = match args.password {
-        Some(p) => p,
-        None => inquire::Password::new("Password:")
+    let token = match args.token {
+        Some(t) => t,
+        None => inquire::Password::new("API Key:")
             .without_confirmation()
+            .with_help_message("Generate an API key from the Quome dashboard")
             .prompt()
             .map_err(|e| crate::errors::QuomeError::Io(std::io::Error::other(e.to_string())))?,
     };
 
-    println!("Logging in...");
+    let sp = ui::spinner("Validating token...");
 
-    let client = QuomeClient::new(None, None)?;
-
-    let session = client
-        .create_session(&CreateSessionRequest {
-            email: Some(email.clone()),
-            password: Some(password),
-            session: None,
-            organization_id: None,
-        })
-        .await?;
-
-    // Now get user info with the new token
-    let authed_client = QuomeClient::new(Some(&session.session), None)?;
-    let user = authed_client.get_current_user().await?;
+    // Validate the token by fetching user info
+    let client = QuomeClient::new(Some(&token), None)?;
+    let user = client.get_current_user().await?;
 
     // Save to config
     let mut config = Config::load()?;
-    config.set_user(session.session, user.id, user.email.clone());
+    config.set_user(token, user.id, user.email.clone());
     config.save()?;
 
-    println!(
-        "{} Logged in as {}",
-        "Success!".green().bold(),
-        user.email.cyan()
-    );
+    sp.finish_and_clear();
+
+    ui::print_success("Logged in", &[
+        ("Email", &user.email),
+        ("User ID", &user.id.to_string()),
+    ]);
 
     Ok(())
 }

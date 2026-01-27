@@ -32,6 +32,8 @@ inquire = "0.7"
 
 # Terminal output
 colored = "2.0"
+indicatif = "0.17"
+tabled = { version = "0.17", features = ["ansi"] }
 
 # Utilities
 dirs = "5.0"
