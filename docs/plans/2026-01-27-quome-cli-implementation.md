@@ -225,50 +225,9 @@ pub struct User {
     pub updated_at: DateTime<Utc>,
 }
 
-// ============ Auth/Sessions ============
-
-#[derive(Debug, Serialize)]
-pub struct CreateSessionRequest {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub email: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub password: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub session: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub organization_id: Option<Uuid>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct CreatedSession {
-    pub session: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct RenewedSession {
-    pub session: String,
-    pub revoked_id: Uuid,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct Session {
-    pub id: Uuid,
-    pub user_id: Uuid,
-    pub created_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
-    pub source_ip: String,
-    #[serde(default)]
-    pub revoked_at: Option<DateTime<Utc>>,
-    #[serde(default)]
-    pub org_scope: Option<Uuid>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ListSessionsResponse {
-    pub sessions: Vec<Session>,
-}
-
 // ============ Organizations ============
+// Note: Authentication uses API keys from the Quome dashboard.
+// No session-based auth models needed.
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Organization {
@@ -932,7 +891,6 @@ git commit -m "feat: add configuration management with linking support"
 ## Task 6: Add API Client Methods
 
 **Files:**
-- Create: `src/api/auth.rs`
 - Create: `src/api/users.rs`
 - Create: `src/api/orgs.rs`
 - Create: `src/api/apps.rs`
@@ -940,33 +898,9 @@ git commit -m "feat: add configuration management with linking support"
 - Create: `src/api/events.rs`
 - Modify: `src/api/mod.rs`
 
-**Step 1: Create src/api/auth.rs**
+Note: Auth uses API keys from the Quome dashboard - no session endpoints needed.
 
-```rust
-use crate::api::models::*;
-use crate::client::QuomeClient;
-use crate::errors::Result;
-
-impl QuomeClient {
-    pub async fn create_session(&self, req: &CreateSessionRequest) -> Result<CreatedSession> {
-        self.post("/api/v1/auth/sessions", req).await
-    }
-
-    pub async fn list_sessions(&self) -> Result<ListSessionsResponse> {
-        self.get("/api/v1/auth/sessions").await
-    }
-
-    pub async fn renew_session(&self) -> Result<RenewedSession> {
-        self.post("/api/v1/auth/sessions/renew", &()).await
-    }
-
-    pub async fn delete_session(&self, session_id: &str) -> Result<()> {
-        self.delete(&format!("/api/v1/auth/sessions/{}", session_id)).await
-    }
-}
-```
-
-**Step 2: Create src/api/users.rs**
+**Step 1: Create src/api/users.rs**
 
 ```rust
 use uuid::Uuid;
@@ -1138,7 +1072,6 @@ impl QuomeClient {
 
 ```rust
 pub mod models;
-mod auth;
 mod users;
 mod orgs;
 mod apps;
@@ -1297,60 +1230,38 @@ Continue to next tasks to create each command module.
 use clap::Parser;
 use colored::Colorize;
 
-use crate::api::models::CreateSessionRequest;
 use crate::client::QuomeClient;
 use crate::config::Config;
 use crate::errors::Result;
 
 #[derive(Parser)]
 pub struct Args {
-    /// Email address
+    /// API token (will prompt if not provided)
     #[arg(short, long)]
-    email: Option<String>,
-
-    /// Password (will prompt if not provided)
-    #[arg(short, long)]
-    password: Option<String>,
+    token: Option<String>,
 }
 
 pub async fn execute(args: Args) -> Result<()> {
-    let email = match args.email {
-        Some(e) => e,
-        None => inquire::Text::new("Email:").prompt().map_err(|e| {
-            crate::errors::QuomeError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-        })?,
-    };
-
-    let password = match args.password {
-        Some(p) => p,
-        None => inquire::Password::new("Password:")
+    let token = match args.token {
+        Some(t) => t,
+        None => inquire::Password::new("API Token:")
             .without_confirmation()
+            .with_help_message("Get your token from the Quome dashboard")
             .prompt()
             .map_err(|e| {
                 crate::errors::QuomeError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
             })?,
     };
 
-    println!("Logging in...");
+    println!("Validating token...");
 
-    let client = QuomeClient::new(None, None)?;
-
-    let session = client
-        .create_session(&CreateSessionRequest {
-            email: Some(email.clone()),
-            password: Some(password),
-            session: None,
-            organization_id: None,
-        })
-        .await?;
-
-    // Now get user info with the new token
-    let authed_client = QuomeClient::new(Some(&session.session), None)?;
-    let user = authed_client.get_current_user().await?;
+    // Validate the token by fetching user info
+    let client = QuomeClient::new(Some(&token), None)?;
+    let user = client.get_current_user().await?;
 
     // Save to config
     let mut config = Config::load()?;
-    config.set_user(session.session, user.id, user.email.clone());
+    config.set_user(token, user.id, user.email.clone());
     config.save()?;
 
     println!(
