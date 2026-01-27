@@ -60,7 +60,7 @@ impl QuomeClient {
         org_id: Uuid,
         app_id: Uuid,
         limit: Option<u32>,
-    ) -> Result<ListLogsResponse> {
+    ) -> Result<Vec<LogEntry>> {
         let mut path = format!("/api/v1/orgs/{}/apps/{}/logs", org_id, app_id);
         if let Some(l) = limit {
             path = format!("{}?limit={}", path, l);

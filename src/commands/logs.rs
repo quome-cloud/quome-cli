@@ -50,17 +50,17 @@ pub async fn execute(args: Args) -> Result<()> {
     };
 
     let client = QuomeClient::new(Some(&token), None)?;
-    let response = client.get_logs(org_id, app_id, Some(args.limit)).await?;
+    let logs = client.get_logs(org_id, app_id, Some(args.limit)).await?;
 
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&response.logs)?);
+        println!("{}", serde_json::to_string_pretty(&logs)?);
     } else {
-        if response.logs.is_empty() {
+        if logs.is_empty() {
             println!("No logs found.");
             return Ok(());
         }
 
-        for entry in response.logs {
+        for entry in logs {
             println!(
                 "{} {} {}",
                 entry
