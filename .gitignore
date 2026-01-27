@@ -1,0 +1,21 @@
+# Build artifacts
+/target/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local config
+.env
+.env.local
+
+# Ignore reference projects
+railway-cli-example/
+quome_service/
+quome_service.zip
