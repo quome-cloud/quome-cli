@@ -1,3 +1,5 @@
+mod errors;
+
 use clap::Parser;
 
 #[derive(Parser)]
