@@ -542,6 +542,7 @@ This is useful for:
 | `QUOME_ORG` | Organization ID (overrides linked org) |
 | `QUOME_APP` | Application ID (overrides linked app) |
 | `QUOME_API_URL` | API base URL (default: `https://demo.quome.cloud`) |
+| `QUOME_DEBUG` | Set to any value to print raw API responses to stderr |
 
 ## JSON Output
 
