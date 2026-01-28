@@ -13,6 +13,24 @@ pub struct Args {
 }
 
 pub async fn execute(args: Args) -> Result<()> {
+    // Check if already logged in
+    let config = Config::load()?;
+    if let Some(user) = &config.user {
+        ui::print_detail(
+            "Already logged in",
+            &[("Email", &user.email), ("User ID", &user.id.to_string())],
+        );
+
+        let confirm = inquire::Confirm::new("Do you want to login with a different token?")
+            .with_default(false)
+            .prompt()
+            .map_err(|e| crate::errors::QuomeError::Io(std::io::Error::other(e.to_string())))?;
+
+        if !confirm {
+            return Ok(());
+        }
+    }
+
     let token = match args.token {
         Some(t) => t,
         None => inquire::Password::new("API Key:")
@@ -35,10 +53,10 @@ pub async fn execute(args: Args) -> Result<()> {
 
     sp.finish_and_clear();
 
-    ui::print_success("Logged in", &[
-        ("Email", &user.email),
-        ("User ID", &user.id.to_string()),
-    ]);
+    ui::print_success(
+        "Logged in",
+        &[("Email", &user.email), ("User ID", &user.id.to_string())],
+    );
 
     Ok(())
 }

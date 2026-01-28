@@ -1,7 +1,16 @@
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
+
+/// Deserialize null or missing as empty Vec
+fn null_to_empty_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::deserialize(deserializer)?.unwrap_or_default())
+}
 
 // ============ Users ============
 
@@ -166,7 +175,7 @@ pub struct App {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct AppSpec {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_empty_vec")]
     pub containers: Vec<ContainerSpec>,
 }
 
@@ -211,7 +220,7 @@ pub struct Deployment {
     pub status: DeploymentStatus,
     #[serde(default)]
     pub failure_message: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_empty_vec")]
     pub events: Vec<DeploymentEvent>,
 }
 
@@ -563,7 +572,7 @@ pub struct AgentState {
     pub app_domain_name: Option<String>,
     #[serde(default)]
     pub app_context: Option<AppContext>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_empty_vec")]
     pub messages: Vec<AgentMessage>,
     #[serde(default)]
     pub files: HashMap<String, String>,
@@ -661,7 +670,7 @@ pub struct ProgressInfo {
 pub struct AgentPlan {
     #[serde(default)]
     pub context: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_empty_vec")]
     pub stages: Vec<AgentPlanStage>,
     #[serde(default)]
     pub current_stage: Option<i32>,
@@ -671,7 +680,7 @@ pub struct AgentPlan {
 pub struct AgentPlanStage {
     #[serde(default)]
     pub description: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_empty_vec")]
     pub lanes: Vec<AgentPlanWorkLane>,
 }
 
@@ -679,9 +688,9 @@ pub struct AgentPlanStage {
 pub struct AgentPlanWorkLane {
     #[serde(default)]
     pub description: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_empty_vec")]
     pub parts: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_empty_vec")]
     pub target_files: Vec<String>,
     #[serde(default)]
     pub is_complete: Option<bool>,
@@ -703,9 +712,9 @@ pub struct BrandKit {
     pub font_family: Option<String>,
     #[serde(default)]
     pub company_name: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_empty_vec")]
     pub logo_public_urls: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_empty_vec")]
     pub hero_public_urls: Vec<String>,
     #[serde(default)]
     pub primary_logo_index: Option<i32>,
