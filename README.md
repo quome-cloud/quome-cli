@@ -18,6 +18,13 @@ The Quome CLI allows you to:
 
 ## Installation
 
+### Homebrew (Recommended)
+
+```bash
+brew tap quome-cloud/quome
+brew install quome
+```
+
 ### From Source (Cargo)
 
 ```bash
@@ -31,12 +38,6 @@ git clone https://github.com/quome-cloud/quome-cli.git
 cd quome-cli
 cargo build --release
 # Binary will be at ./target/release/quome
-```
-
-### Homebrew (coming soon)
-
-```bash
-brew install quome
 ```
 
 ## Quick Start
