@@ -36,7 +36,7 @@ pub struct User {
     #[serde(default)]
     pub last_login_at: Option<DateTime<Utc>>,
     #[serde(default)]
-    pub two_factor: Option<bool>,
+    pub two_factor: Option<serde_json::Value>,
 }
 
 // ============ Auth/Sessions ============
