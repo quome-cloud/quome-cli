@@ -208,7 +208,7 @@ async fn start(args: StartArgs) -> Result<()> {
     let sp = ui::spinner("Starting AI workflow...");
     let response = client
         .post::<crate::api::models::StartAgentResponse, _>(
-            "/api/v1/agents/quome-coder/start",
+            "/quome-coder-v2/agents/start",
             &request,
         )
         .await?;
@@ -254,7 +254,7 @@ async fn prompt(args: PromptArgs) -> Result<()> {
     let sp = ui::spinner("Sending prompt...");
     let response = client
         .post::<crate::api::models::SendPromptResponse, _>(
-            &format!("/api/v1/agents/quome-coder/{}/prompt", args.thread_id),
+            &format!("/quome-coder-v2/agents/thread/{}/send-prompt", args.thread_id),
             &request,
         )
         .await?;
@@ -290,7 +290,7 @@ async fn state(args: StateArgs) -> Result<()> {
         // Get initial state for app name
         let state = client
             .get::<AgentState>(&format!(
-                "/api/v1/agents/quome-coder/{}/state",
+                "/quome-coder-v2/state/{}",
                 args.thread_id
             ))
             .await?;
@@ -305,7 +305,7 @@ async fn state(args: StateArgs) -> Result<()> {
     let sp = ui::spinner("Fetching workflow state...");
     let state = client
         .get::<AgentState>(&format!(
-            "/api/v1/agents/quome-coder/{}/state",
+            "/quome-coder-v2/state/{}",
             args.thread_id
         ))
         .await?;
@@ -344,7 +344,7 @@ async fn stop(args: StopArgs) -> Result<()> {
     let sp = ui::spinner("Stopping workflow...");
     let response = client
         .post::<crate::api::models::StopWorkflowResponse, _>(
-            &format!("/api/v1/agents/quome-coder/{}/stop", args.thread_id),
+            &format!("/quome-coder-v2/agents/thread/{}/stop", args.thread_id),
             &serde_json::json!({}),
         )
         .await?;
@@ -368,10 +368,10 @@ async fn pull(args: PullArgs) -> Result<()> {
 
     let sp = ui::spinner("Pulling latest changes...");
     let response = client
-        .get::<crate::api::models::PullLatestResponse>(&format!(
-            "/api/v1/agents/quome-coder/{}/pull",
-            args.thread_id
-        ))
+        .post::<crate::api::models::PullLatestResponse, _>(
+            &format!("/quome-coder-v2/agents/thread/{}/pull-latest", args.thread_id),
+            &serde_json::json!({}),
+        )
         .await?;
     sp.finish_and_clear();
 
@@ -453,7 +453,7 @@ async fn watch_progress(
     let final_state: AgentState = loop {
         // Fetch current state
         let state = match client
-            .get::<AgentState>(&format!("/api/v1/agents/quome-coder/{}/state", thread_id))
+            .get::<AgentState>(&format!("/quome-coder-v2/state/{}", thread_id))
             .await
         {
             Ok(s) => s,
