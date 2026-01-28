@@ -338,6 +338,92 @@ Options:
 
 ---
 
+### Databases
+
+#### `quome db list`
+
+List all databases in an organization.
+
+```bash
+quome db list [OPTIONS]
+
+Options:
+      --org <ORG>  Organization ID (uses linked org if not provided)
+      --json       Output as JSON
+```
+
+#### `quome db create`
+
+Create a new database.
+
+```bash
+quome db create <NAME> [OPTIONS]
+
+Arguments:
+  <NAME>  Database name
+
+Options:
+      --version <VERSION>    PostgreSQL major version (15, 16, or 17) [default: 17]
+      --vcpu <VCPU>          Number of vCPUs [default: 1]
+      --memory <MEMORY>      Memory allocation (e.g., 2Gi) [default: 2Gi]
+      --disk <DISK>          Disk space (e.g., 1024Mi) [default: 1024Mi]
+      --replicas <REPLICAS>  Number of replicas [default: 1]
+      --org <ORG>            Organization ID (uses linked org if not provided)
+      --json                 Output as JSON
+```
+
+#### `quome db get`
+
+Get database details.
+
+```bash
+quome db get <ID> [OPTIONS]
+
+Arguments:
+  <ID>  Database ID
+
+Options:
+      --org <ORG>  Organization ID (uses linked org if not provided)
+      --json       Output as JSON
+```
+
+#### `quome db update`
+
+Update a database.
+
+```bash
+quome db update <ID> [OPTIONS]
+
+Arguments:
+  <ID>  Database ID
+
+Options:
+      --name <NAME>          New name
+      --vcpu <VCPU>          Number of vCPUs
+      --memory <MEMORY>      Memory allocation (e.g., 2Gi)
+      --disk <DISK>          Disk space (e.g., 1024Mi)
+      --replicas <REPLICAS>  Number of replicas
+      --org <ORG>            Organization ID (uses linked org if not provided)
+      --json                 Output as JSON
+```
+
+#### `quome db delete`
+
+Delete a database.
+
+```bash
+quome db delete <ID> [OPTIONS]
+
+Arguments:
+  <ID>  Database ID
+
+Options:
+      --org <ORG>  Organization ID (uses linked org if not provided)
+  -f, --force      Skip confirmation prompt
+```
+
+---
+
 ### Logs
 
 #### `quome logs`
