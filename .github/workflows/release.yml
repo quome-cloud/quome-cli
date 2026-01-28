@@ -2,15 +2,106 @@ name: Release
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      version_bump:
+        description: 'Version bump type'
+        required: false
+        default: 'patch'
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  version:
+    name: Create Version Tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      new_tag: ${{ steps.increment.outputs.new_tag }}
+      should_release: ${{ steps.check.outputs.should_release }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get latest tag
+        id: get_tag
+        run: |
+          LATEST_TAG=$(git tag -l 'v*' --sort=-v:refname | head -n1)
+          if [ -z "$LATEST_TAG" ]; then
+            LATEST_TAG="v0.0.0"
+          fi
+          echo "latest=$LATEST_TAG" >> $GITHUB_OUTPUT
+
+      - name: Check if release needed
+        id: check
+        run: |
+          LATEST_TAG="${{ steps.get_tag.outputs.latest }}"
+          # Get the commit that the latest tag points to
+          if [ "$LATEST_TAG" = "v0.0.0" ]; then
+            TAG_COMMIT=""
+          else
+            TAG_COMMIT=$(git rev-list -n 1 "$LATEST_TAG" 2>/dev/null || echo "")
+          fi
+          HEAD_COMMIT=$(git rev-parse HEAD)
+
+          if [ "$TAG_COMMIT" = "$HEAD_COMMIT" ]; then
+            echo "No new commits since last tag"
+            echo "should_release=false" >> $GITHUB_OUTPUT
+          else
+            echo "New commits found, will create release"
+            echo "should_release=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Increment version
+        id: increment
+        if: steps.check.outputs.should_release == 'true'
+        run: |
+          LATEST="${{ steps.get_tag.outputs.latest }}"
+          VERSION="${LATEST#v}"
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
+
+          BUMP_TYPE="${{ inputs.version_bump || 'patch' }}"
+          case "$BUMP_TYPE" in
+            major)
+              MAJOR=$((MAJOR + 1))
+              MINOR=0
+              PATCH=0
+              ;;
+            minor)
+              MINOR=$((MINOR + 1))
+              PATCH=0
+              ;;
+            patch)
+              PATCH=$((PATCH + 1))
+              ;;
+          esac
+
+          NEW_TAG="v${MAJOR}.${MINOR}.${PATCH}"
+          echo "new_tag=$NEW_TAG" >> $GITHUB_OUTPUT
+
+      - name: Create and push tag
+        if: steps.check.outputs.should_release == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag ${{ steps.increment.outputs.new_tag }}
+          git push origin ${{ steps.increment.outputs.new_tag }}
+
   build:
     name: Build ${{ matrix.target }}
+    needs: version
+    if: needs.version.outputs.should_release == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -24,6 +115,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.new_tag }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -49,7 +142,8 @@ jobs:
 
   release:
     name: Create Release
-    needs: build
+    needs: [version, build]
+    if: needs.version.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -63,18 +157,16 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.version.outputs.new_tag }}
           files: |
             artifacts/**/*.tar.gz
             artifacts/**/*.sha256
 
   update-homebrew:
     name: Update Homebrew Formula
-    needs: release
+    needs: [version, release]
+    if: needs.version.outputs.should_release == 'true'
     runs-on: ubuntu-latest
-    env:
-      VERSION: ""
-      ARM64_SHA: ""
-      X64_SHA: ""
 
     steps:
       - name: Download artifacts
@@ -82,15 +174,16 @@ jobs:
         with:
           path: artifacts
 
-      - name: Get version
-        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_ENV
-
-      - name: Get SHA256 sums
+      - name: Get version and checksums
+        id: info
         run: |
+          VERSION="${{ needs.version.outputs.new_tag }}"
+          VERSION="${VERSION#v}"
           ARM64_SHA=$(cat artifacts/quome-darwin-arm64/quome-darwin-arm64.tar.gz.sha256 | awk '{print $1}')
           X64_SHA=$(cat artifacts/quome-darwin-x64/quome-darwin-x64.tar.gz.sha256 | awk '{print $1}')
-          echo "ARM64_SHA=$ARM64_SHA" >> $GITHUB_ENV
-          echo "X64_SHA=$X64_SHA" >> $GITHUB_ENV
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "arm64_sha=$ARM64_SHA" >> $GITHUB_OUTPUT
+          echo "x64_sha=$X64_SHA" >> $GITHUB_OUTPUT
 
       - name: Checkout homebrew-quome
         uses: actions/checkout@v4
@@ -100,22 +193,26 @@ jobs:
           path: homebrew-quome
 
       - name: Update formula
+        env:
+          VERSION: ${{ steps.info.outputs.version }}
+          ARM64_SHA: ${{ steps.info.outputs.arm64_sha }}
+          X64_SHA: ${{ steps.info.outputs.x64_sha }}
         run: |
-          cat > homebrew-quome/Formula/quome.rb << EOF
+          cat > homebrew-quome/Formula/quome.rb << 'FORMULA'
           class Quome < Formula
             desc "CLI for the Quome platform"
             homepage "https://github.com/quome-cloud/quome-cli"
-            version "${VERSION}"
+            version "VERSION_PLACEHOLDER"
             license "MIT"
 
             on_macos do
               on_arm do
-                url "https://github.com/quome-cloud/quome-cli/releases/download/v${VERSION}/quome-darwin-arm64.tar.gz"
-                sha256 "${ARM64_SHA}"
+                url "https://github.com/quome-cloud/quome-cli/releases/download/vVERSION_PLACEHOLDER/quome-darwin-arm64.tar.gz"
+                sha256 "ARM64_SHA_PLACEHOLDER"
               end
               on_intel do
-                url "https://github.com/quome-cloud/quome-cli/releases/download/v${VERSION}/quome-darwin-x64.tar.gz"
-                sha256 "${X64_SHA}"
+                url "https://github.com/quome-cloud/quome-cli/releases/download/vVERSION_PLACEHOLDER/quome-darwin-x64.tar.gz"
+                sha256 "X64_SHA_PLACEHOLDER"
               end
             end
 
@@ -127,7 +224,12 @@ jobs:
               assert_match "quome", shell_output("#{bin}/quome --version")
             end
           end
-          EOF
+          FORMULA
+
+          # Replace placeholders
+          sed -i "s/VERSION_PLACEHOLDER/$VERSION/g" homebrew-quome/Formula/quome.rb
+          sed -i "s/ARM64_SHA_PLACEHOLDER/$ARM64_SHA/g" homebrew-quome/Formula/quome.rb
+          sed -i "s/X64_SHA_PLACEHOLDER/$X64_SHA/g" homebrew-quome/Formula/quome.rb
 
       - name: Commit and push
         run: |
@@ -135,5 +237,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Formula/quome.rb
-          git commit -m "Update quome to v${VERSION}"
+          git commit -m "Update quome to v${{ steps.info.outputs.version }}"
           git push
