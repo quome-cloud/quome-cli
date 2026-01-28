@@ -1,0 +1,139 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            artifact: quome-darwin-arm64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            artifact: quome-darwin-x64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-action@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package binary
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar -czf ${{ matrix.artifact }}.tar.gz quome
+          shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            target/${{ matrix.target }}/release/${{ matrix.artifact }}.tar.gz
+            target/${{ matrix.target }}/release/${{ matrix.artifact }}.tar.gz.sha256
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/**/*.sha256
+
+  update-homebrew:
+    name: Update Homebrew Formula
+    needs: release
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ""
+      ARM64_SHA: ""
+      X64_SHA: ""
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Get version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_ENV
+
+      - name: Get SHA256 sums
+        run: |
+          ARM64_SHA=$(cat artifacts/quome-darwin-arm64/quome-darwin-arm64.tar.gz.sha256 | awk '{print $1}')
+          X64_SHA=$(cat artifacts/quome-darwin-x64/quome-darwin-x64.tar.gz.sha256 | awk '{print $1}')
+          echo "ARM64_SHA=$ARM64_SHA" >> $GITHUB_ENV
+          echo "X64_SHA=$X64_SHA" >> $GITHUB_ENV
+
+      - name: Checkout homebrew-quome
+        uses: actions/checkout@v4
+        with:
+          repository: quome-cloud/homebrew-quome
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-quome
+
+      - name: Update formula
+        run: |
+          cat > homebrew-quome/Formula/quome.rb << EOF
+          class Quome < Formula
+            desc "CLI for the Quome platform"
+            homepage "https://github.com/quome-cloud/quome-cli"
+            version "${VERSION}"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/quome-cloud/quome-cli/releases/download/v${VERSION}/quome-darwin-arm64.tar.gz"
+                sha256 "${ARM64_SHA}"
+              end
+              on_intel do
+                url "https://github.com/quome-cloud/quome-cli/releases/download/v${VERSION}/quome-darwin-x64.tar.gz"
+                sha256 "${X64_SHA}"
+              end
+            end
+
+            def install
+              bin.install "quome"
+            end
+
+            test do
+              assert_match "quome", shell_output("#{bin}/quome --version")
+            end
+          end
+          EOF
+
+      - name: Commit and push
+        run: |
+          cd homebrew-quome
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/quome.rb
+          git commit -m "Update quome to v${VERSION}"
+          git push

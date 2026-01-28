@@ -1,0 +1,51 @@
+#!/bin/bash
+# Pre-commit hook for version validation
+
+set -e
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# Get current version from Cargo.toml
+CARGO_VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+
+# Validate semver format (X.Y.Z)
+if ! echo "$CARGO_VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$'; then
+    echo -e "${RED}Error: Invalid version format in Cargo.toml: $CARGO_VERSION${NC}"
+    echo "Version must be in semver format (e.g., 1.0.0 or 1.0.0-beta.1)"
+    exit 1
+fi
+
+# Check if Cargo.toml version was modified
+if git diff --cached --name-only | grep -q "Cargo.toml"; then
+    # Get the staged version
+    STAGED_VERSION=$(git show :Cargo.toml | grep '^version = ' | head -1 | sed 's/version = "\(.*\)"/\1/')
+
+    # Get the current HEAD version (if exists)
+    if git rev-parse HEAD >/dev/null 2>&1; then
+        HEAD_VERSION=$(git show HEAD:Cargo.toml 2>/dev/null | grep '^version = ' | head -1 | sed 's/version = "\(.*\)"/\1/' || echo "")
+
+        if [ -n "$HEAD_VERSION" ] && [ "$STAGED_VERSION" != "$HEAD_VERSION" ]; then
+            echo -e "${GREEN}Version bump detected: $HEAD_VERSION -> $STAGED_VERSION${NC}"
+        fi
+    fi
+fi
+
+# Run cargo check to ensure the project compiles
+echo -e "${YELLOW}Running cargo check...${NC}"
+if ! cargo check --quiet 2>/dev/null; then
+    echo -e "${RED}Error: cargo check failed${NC}"
+    exit 1
+fi
+
+# Run cargo fmt check
+echo -e "${YELLOW}Checking formatting...${NC}"
+if ! cargo fmt --check --quiet 2>/dev/null; then
+    echo -e "${RED}Error: Code is not formatted. Run 'cargo fmt' to fix.${NC}"
+    exit 1
+fi
+
+echo -e "${GREEN}Pre-commit checks passed!${NC}"
