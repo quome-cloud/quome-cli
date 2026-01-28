@@ -90,13 +90,23 @@ jobs:
           NEW_TAG="v${MAJOR}.${MINOR}.${PATCH}"
           echo "new_tag=$NEW_TAG" >> $GITHUB_OUTPUT
 
-      - name: Create and push tag
+      - name: Update Cargo.toml version
+        if: steps.check.outputs.should_release == 'true'
+        env:
+          NEW_VERSION: ${{ steps.increment.outputs.new_tag }}
+        run: |
+          VERSION="${NEW_VERSION#v}"
+          sed -i "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
+
+      - name: Commit version bump and create tag
         if: steps.check.outputs.should_release == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml
+          git commit -m "chore: bump version to ${{ steps.increment.outputs.new_tag }}"
           git tag ${{ steps.increment.outputs.new_tag }}
-          git push origin ${{ steps.increment.outputs.new_tag }}
+          git push origin main --tags
 
   build:
     name: Build ${{ matrix.target }}
