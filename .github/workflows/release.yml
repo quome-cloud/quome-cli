@@ -159,6 +159,42 @@ jobs:
       contents: write
 
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate release notes
+        id: notes
+        env:
+          NEW_TAG: ${{ needs.version.outputs.new_tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Get the previous tag
+          PREV_TAG=$(git tag -l 'v*' --sort=-v:refname | grep -v "^${NEW_TAG}$" | head -n1)
+
+          if [ -z "$PREV_TAG" ]; then
+            # First release - get all commits
+            COMMITS=$(git log --pretty=format:"- %s (%h)" --no-merges)
+          else
+            # Get commits between tags, excluding version bump commits
+            COMMITS=$(git log ${PREV_TAG}..${NEW_TAG} --pretty=format:"- %s (%h)" --no-merges | grep -v "^- chore: bump version" || true)
+          fi
+
+          # Build release notes
+          {
+            echo "notes<<EOF"
+            echo "## What's Changed"
+            echo ""
+            if [ -n "$COMMITS" ]; then
+              echo "$COMMITS"
+            else
+              echo "- Maintenance release"
+            fi
+            echo ""
+            echo "**Full Changelog**: https://github.com/${REPO}/compare/${PREV_TAG}...${NEW_TAG}"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
@@ -168,6 +204,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.version.outputs.new_tag }}
+          body: ${{ steps.notes.outputs.notes }}
           files: |
             artifacts/**/*.tar.gz
             artifacts/**/*.sha256
