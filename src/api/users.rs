@@ -9,10 +9,12 @@ impl QuomeClient {
         self.get("/api/v1/users").await
     }
 
+    #[allow(dead_code)]
     pub async fn create_user(&self, req: &CreateUserRequest) -> Result<User> {
         self.post("/api/v1/users", req).await
     }
 
+    #[allow(dead_code)]
     pub async fn get_user(&self, id: Uuid) -> Result<User> {
         self.get(&format!("/api/v1/users/{}", id)).await
     }

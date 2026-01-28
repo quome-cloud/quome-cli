@@ -17,7 +17,7 @@ impl QuomeClient {
         self.get(&format!("/api/v1/orgs/{}", id)).await
     }
 
-    pub async fn list_org_members(&self, org_id: Uuid) -> Result<ListOrgMembersResponse> {
+    pub async fn list_org_members(&self, org_id: Uuid) -> Result<Vec<OrgMember>> {
         self.get(&format!("/api/v1/orgs/{}/members", org_id)).await
     }
 

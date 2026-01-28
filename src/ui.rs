@@ -135,3 +135,17 @@ pub struct EventRow {
     #[tabled(rename = "RESOURCE")]
     pub resource: String,
 }
+
+#[derive(Tabled)]
+pub struct DatabaseRow {
+    #[tabled(rename = "ID")]
+    pub id: String,
+    #[tabled(rename = "NAME")]
+    pub name: String,
+    #[tabled(rename = "VERSION")]
+    pub version: String,
+    #[tabled(rename = "STATUS")]
+    pub status: String,
+    #[tabled(rename = "CREATED")]
+    pub created: String,
+}

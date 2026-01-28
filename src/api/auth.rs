@@ -2,6 +2,7 @@ use crate::api::models::*;
 use crate::client::QuomeClient;
 use crate::errors::Result;
 
+#[allow(dead_code)]
 impl QuomeClient {
     pub async fn create_session(&self, req: &CreateSessionRequest) -> Result<CreatedSession> {
         self.post("/api/v1/auth/sessions", req).await

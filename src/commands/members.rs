@@ -59,23 +59,22 @@ async fn list(args: ListArgs) -> Result<()> {
     let client = QuomeClient::new(Some(&token), None)?;
 
     let sp = ui::spinner("Fetching members...");
-    let response = client.list_org_members(org_id).await?;
+    let members = client.list_org_members(org_id).await?;
     sp.finish_and_clear();
 
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&response.members)?);
+        println!("{}", serde_json::to_string_pretty(&members)?);
     } else {
-        if response.members.is_empty() {
+        if members.is_empty() {
             println!("No members found.");
             return Ok(());
         }
 
-        let rows: Vec<MemberRow> = response
-            .members
+        let rows: Vec<MemberRow> = members
             .iter()
             .map(|member| MemberRow {
                 user_id: member.user_id.to_string(),
-                member_id: member.id.to_string(),
+                member_id: member.id.map(|id| id.to_string()).unwrap_or_else(|| "-".to_string()),
                 joined: member.created_at.format("%Y-%m-%d %H:%M").to_string(),
             })
             .collect();
@@ -111,8 +110,9 @@ async fn add(args: AddArgs) -> Result<()> {
     if args.json {
         println!("{}", serde_json::to_string_pretty(&member)?);
     } else {
+        let member_id = member.id.map(|id| id.to_string()).unwrap_or_else(|| "-".to_string());
         ui::print_success("Added member", &[
-            ("Member ID", &member.id.to_string()),
+            ("Member ID", &member_id),
             ("User ID", &member.user_id.to_string()),
         ]);
     }

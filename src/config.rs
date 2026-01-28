@@ -75,6 +75,7 @@ impl Config {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn get_token(&self) -> Option<&str> {
         // Environment variable takes precedence
         if std::env::var("QUOME_TOKEN").is_ok() {

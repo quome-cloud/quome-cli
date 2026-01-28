@@ -61,6 +61,7 @@ fn status_color(status: &DeploymentStatus) -> colored::ColoredString {
         DeploymentStatus::Created => "created".yellow(),
         DeploymentStatus::InProgress => "in_progress".blue(),
         DeploymentStatus::Deployed => "deployed".green(),
+        DeploymentStatus::Success => "success".green(),
         DeploymentStatus::Failed => "failed".red(),
     }
 }

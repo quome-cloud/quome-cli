@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 // ============ Users ============
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize)]
 pub struct CreateUserRequest {
     pub username: String,
@@ -31,6 +32,7 @@ pub struct User {
 
 // ============ Auth/Sessions ============
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize)]
 pub struct CreateSessionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -43,17 +45,20 @@ pub struct CreateSessionRequest {
     pub organization_id: Option<Uuid>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct CreatedSession {
     pub session: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct RenewedSession {
     pub session: String,
     pub revoked_id: Uuid,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct Session {
     pub id: Uuid,
@@ -67,6 +72,7 @@ pub struct Session {
     pub org_scope: Option<Uuid>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct ListSessionsResponse {
     pub sessions: Vec<Session>,
@@ -96,13 +102,15 @@ pub struct CreateOrgRequest {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct OrgMember {
-    pub id: Uuid,
+    #[serde(default)]
+    pub id: Option<Uuid>,
     pub user_id: Uuid,
     pub org_id: Uuid,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct ListOrgMembersResponse {
     pub members: Vec<OrgMember>,
@@ -213,6 +221,7 @@ pub enum DeploymentStatus {
     Created,
     InProgress,
     Deployed,
+    Success,
     Failed,
 }
 
@@ -222,6 +231,7 @@ impl std::fmt::Display for DeploymentStatus {
             DeploymentStatus::Created => write!(f, "created"),
             DeploymentStatus::InProgress => write!(f, "in_progress"),
             DeploymentStatus::Deployed => write!(f, "deployed"),
+            DeploymentStatus::Success => write!(f, "success"),
             DeploymentStatus::Failed => write!(f, "failed"),
         }
     }
@@ -315,6 +325,7 @@ pub struct EventResource {
 pub struct ListEventsResponse {
     pub events: Vec<Event>,
     #[serde(default)]
+    #[allow(dead_code)]
     pub next_before: Option<DateTime<Utc>>,
 }
 
@@ -349,11 +360,113 @@ impl std::fmt::Display for LogLevel {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct ListLogsResponse {
     pub logs: Vec<LogEntry>,
     #[serde(default)]
     pub next_before: Option<DateTime<Utc>>,
+}
+
+// ============ Databases ============
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct Database {
+    pub id: Uuid,
+    pub name: String,
+    pub organization_id: Uuid,
+    pub compute: DatabaseCompute,
+    pub storage: DatabaseStorage,
+    pub replicas: DatabaseReplicas,
+    pub postgres: DatabasePostgres,
+    #[serde(default)]
+    pub status: Option<DatabaseStatus>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct DatabaseCompute {
+    pub requested: ComputeRequested,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ComputeRequested {
+    pub vcpu: String,
+    pub memory: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct DatabaseStorage {
+    pub requested: StorageRequested,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct StorageRequested {
+    pub disk_space: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct DatabaseReplicas {
+    pub requested: i32,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct DatabasePostgres {
+    pub major_version: i32,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct DatabaseStatus {
+    pub state: DatabaseState,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+pub enum DatabaseState {
+    Initializing,
+    Ready,
+    Paused,
+    Stopping,
+    Error,
+}
+
+impl std::fmt::Display for DatabaseState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DatabaseState::Initializing => write!(f, "Initializing"),
+            DatabaseState::Ready => write!(f, "Ready"),
+            DatabaseState::Paused => write!(f, "Paused"),
+            DatabaseState::Stopping => write!(f, "Stopping"),
+            DatabaseState::Error => write!(f, "Error"),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListDatabasesResponse {
+    #[serde(default)]
+    pub databases: Vec<Database>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateDatabaseRequest {
+    pub name: String,
+    pub compute: DatabaseCompute,
+    pub storage: DatabaseStorage,
+    pub replicas: DatabaseReplicas,
+    pub postgres: DatabasePostgres,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UpdateDatabaseRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compute: Option<DatabaseCompute>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage: Option<DatabaseStorage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replicas: Option<DatabaseReplicas>,
 }
 
 // ============ Shared Error Types ============

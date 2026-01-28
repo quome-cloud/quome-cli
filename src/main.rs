@@ -60,6 +60,11 @@ enum Commands {
         #[command(subcommand)]
         command: commands::deployments::DeploymentsCommands,
     },
+    /// Manage databases
+    Databases {
+        #[command(subcommand)]
+        command: commands::databases::DatabasesCommands,
+    },
     /// View application logs
     Logs(commands::logs::Args),
     /// Manage secrets
@@ -90,6 +95,7 @@ async fn main() {
         Commands::Members { command } => commands::members::execute(command).await,
         Commands::Apps { command } => commands::apps::execute(command).await,
         Commands::Deployments { command } => commands::deployments::execute(command).await,
+        Commands::Databases { command } => commands::databases::execute(command).await,
         Commands::Logs(args) => commands::logs::execute(args).await,
         Commands::Secrets { command } => commands::secrets::execute(command).await,
         Commands::Keys { command } => commands::keys::execute(command).await,
