@@ -1,3 +1,4 @@
+pub mod agent;
 pub mod apps;
 pub mod databases;
 pub mod deployments;

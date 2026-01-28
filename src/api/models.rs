@@ -469,6 +469,250 @@ pub struct UpdateDatabaseRequest {
     pub replicas: Option<DatabaseReplicas>,
 }
 
+// ============ Quome Coder V2 Agent ============
+
+#[derive(Debug, Serialize)]
+pub struct StartAgentRequest {
+    pub prompt: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_github: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_mode: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accessibility_target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tech_stack: Option<TechStack>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color_preferences: Option<ColorPreferences>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TechStack {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<StackConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frontend: Option<StackConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub database: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct StackConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stack: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ColorPreferences {
+    #[serde(rename = "type")]
+    pub color_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary_color: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secondary_color: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct StartAgentResponse {
+    pub thread_id: Uuid,
+    pub status: String,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SendPromptRequest {
+    pub prompt: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct SendPromptResponse {
+    pub success: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct StopWorkflowResponse {
+    pub success: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct PullLatestResponse {
+    pub success: bool,
+    pub message: String,
+    #[serde(default)]
+    pub state: Option<AgentState>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct AgentState {
+    pub thread_id: Uuid,
+    #[serde(default)]
+    pub is_working: bool,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub phase: Option<String>,
+    #[serde(default)]
+    pub app_uuid: Option<Uuid>,
+    #[serde(default)]
+    pub app_domain_name: Option<String>,
+    #[serde(default)]
+    pub app_context: Option<AppContext>,
+    #[serde(default)]
+    pub messages: Vec<AgentMessage>,
+    #[serde(default)]
+    pub files: HashMap<String, String>,
+    #[serde(default)]
+    pub container_info: Option<ContainerInfo>,
+    #[serde(default)]
+    pub deployment: Option<AgentDeploymentInfo>,
+    #[serde(default)]
+    pub progress: Option<ProgressInfo>,
+    #[serde(default)]
+    pub plan: Option<AgentPlan>,
+    #[serde(default)]
+    pub brand_kit: Option<BrandKit>,
+    #[serde(default)]
+    pub github_repo_url: Option<String>,
+    #[serde(default)]
+    pub github_repo_name: Option<String>,
+    #[serde(default)]
+    pub github_repo_created: Option<bool>,
+    #[serde(default)]
+    pub tests_passed: Option<i32>,
+    #[serde(default)]
+    pub tests_failed: Option<i32>,
+    #[serde(default)]
+    pub tests_ran: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct AppContext {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub goal: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct AgentMessage {
+    #[serde(rename = "type")]
+    pub message_type: String,
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub timestamp: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ContainerInfo {
+    #[serde(default)]
+    pub container_id: Option<String>,
+    #[serde(default)]
+    pub sandbox_id: Option<String>,
+    #[serde(default)]
+    pub app_relative_dir: Option<String>,
+    #[serde(default)]
+    pub frontend_port: Option<i32>,
+    #[serde(default)]
+    pub backend_port: Option<i32>,
+    #[serde(default)]
+    pub testing_port: Option<i32>,
+    #[serde(default)]
+    pub frontend_url: Option<String>,
+    #[serde(default)]
+    pub backend_url: Option<String>,
+    #[serde(default)]
+    pub testing_url: Option<String>,
+    #[serde(default)]
+    pub is_healthy: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct AgentDeploymentInfo {
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub files_path: Option<String>,
+    #[serde(default)]
+    pub port: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ProgressInfo {
+    #[serde(default)]
+    pub percentage: Option<f64>,
+    #[serde(default)]
+    pub current_stage: Option<i32>,
+    #[serde(default)]
+    pub total_stages: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct AgentPlan {
+    #[serde(default)]
+    pub context: Option<String>,
+    #[serde(default)]
+    pub stages: Vec<AgentPlanStage>,
+    #[serde(default)]
+    pub current_stage: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct AgentPlanStage {
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub lanes: Vec<AgentPlanWorkLane>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct AgentPlanWorkLane {
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub parts: Vec<String>,
+    #[serde(default)]
+    pub target_files: Vec<String>,
+    #[serde(default)]
+    pub is_complete: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct BrandKit {
+    #[serde(default)]
+    pub primary_color: Option<String>,
+    #[serde(default)]
+    pub secondary_color: Option<String>,
+    #[serde(default)]
+    pub accent_color: Option<String>,
+    #[serde(default)]
+    pub background_color: Option<String>,
+    #[serde(default)]
+    pub text_color: Option<String>,
+    #[serde(default)]
+    pub font_family: Option<String>,
+    #[serde(default)]
+    pub company_name: Option<String>,
+    #[serde(default)]
+    pub logo_public_urls: Vec<String>,
+    #[serde(default)]
+    pub hero_public_urls: Vec<String>,
+    #[serde(default)]
+    pub primary_logo_index: Option<i32>,
+    #[serde(default)]
+    pub primary_logo_url: Option<String>,
+}
+
 // ============ Shared Error Types ============
 
 #[derive(Debug, Deserialize)]

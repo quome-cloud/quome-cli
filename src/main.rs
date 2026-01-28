@@ -80,6 +80,11 @@ enum Commands {
     },
     /// View organization events
     Events(commands::events::Args),
+    /// AI-powered app building agent
+    Agent {
+        #[command(subcommand)]
+        command: commands::agent::AgentCommands,
+    },
 }
 
 #[tokio::main]
@@ -101,6 +106,7 @@ async fn main() {
         Commands::Secrets { command } => commands::secrets::execute(command).await,
         Commands::Keys { command } => commands::keys::execute(command).await,
         Commands::Events(args) => commands::events::execute(args).await,
+        Commands::Agent { command } => commands::agent::execute(command).await,
     };
 
     if let Err(e) = result {

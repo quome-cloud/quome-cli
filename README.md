@@ -15,6 +15,7 @@ The Quome CLI allows you to:
 - Manage secrets and environment variables
 - View logs and audit events
 - Generate and manage API keys
+- Build full-stack applications with AI using natural language prompts
 
 ## Installation
 
@@ -564,6 +565,142 @@ Options:
       --org <ORG>      Organization ID (uses linked org if not provided)
   -n, --limit <LIMIT>  Number of events [default: 50]
       --json           Output as JSON
+```
+
+---
+
+### AI Agent
+
+The Quome Agent uses AI to build full-stack applications from natural language prompts. Describe what you want to build, and the agent will analyze your requirements, generate a plan, write the code, and deploy it.
+
+#### `quome agent start`
+
+Start a new AI app building workflow. By default, this command watches progress in real-time with a beautiful progress display until the app is deployed.
+
+```bash
+quome agent start <PROMPT> [OPTIONS]
+
+Arguments:
+  <PROMPT>  Description of the application to build
+
+Options:
+      --name <NAME>              Project name (auto-generated if not provided)
+      --github                   Create a GitHub repository for the app
+      --parallel                 Run build stages in parallel for faster completion
+      --accessibility <LEVEL>    WCAG compliance target: A, AA, or AAA [default: AA]
+      --backend <STACK>          Backend framework (e.g., fastapi, express, django)
+      --backend-lang <LANG>      Backend language (e.g., python, javascript, typescript)
+      --frontend <STACK>         Frontend framework (e.g., react, vue, nextjs)
+      --frontend-lang <LANG>     Frontend language (e.g., javascript, typescript)
+      --database <TYPE>          Database type (e.g., postgresql, sqlite, mongodb)
+      --primary-color <HEX>      Primary color hex code (e.g., #3B82F6)
+      --secondary-color <HEX>    Secondary color hex code
+      --no-watch                 Don't watch progress (just start and return thread ID)
+      --json                     Output as JSON
+```
+
+**Example:**
+
+```bash
+# Build and watch until deployed (default)
+quome agent start "Build a task management app with user authentication"
+
+# With tech stack preferences
+quome agent start "Build an e-commerce store" \
+  --backend fastapi --backend-lang python \
+  --frontend react --frontend-lang typescript \
+  --database postgresql \
+  --github --parallel
+
+# Start without watching (returns thread ID immediately)
+quome agent start "Build a blog" --no-watch
+```
+
+The progress display shows:
+- Real-time progress bar with percentage and stage
+- Current phase (planning, building, testing, deploying)
+- Live preview URLs when available
+- AI assistant messages as they come in
+- Final deployment URL when complete
+
+#### `quome agent prompt`
+
+Send a follow-up prompt to an active workflow. Use this to request changes, additions, or refinements to the app being built.
+
+```bash
+quome agent prompt <THREAD_ID> <PROMPT> [OPTIONS]
+
+Arguments:
+  <THREAD_ID>  The workflow thread ID
+  <PROMPT>     The follow-up instruction
+
+Options:
+  -w, --watch  Watch progress after sending prompt
+      --json   Output as JSON
+```
+
+**Example:**
+
+```bash
+# Send prompt and return immediately
+quome agent prompt 123e4567-e89b-12d3-a456-426614174000 "Add a dark mode toggle to the header"
+
+# Send prompt and watch until changes are deployed
+quome agent prompt 123e4567-e89b-12d3-a456-426614174000 "Add user profiles" --watch
+```
+
+#### `quome agent state`
+
+Get the current state of a workflow, including progress, generated files, deployment status, and conversation history.
+
+```bash
+quome agent state <THREAD_ID> [OPTIONS]
+
+Arguments:
+  <THREAD_ID>  The workflow thread ID
+
+Options:
+  -w, --watch  Watch progress continuously until complete
+      --json   Output as JSON
+```
+
+**Example:**
+
+```bash
+# Get current state snapshot
+quome agent state 123e4567-e89b-12d3-a456-426614174000
+
+# Watch progress in real-time
+quome agent state 123e4567-e89b-12d3-a456-426614174000 --watch
+```
+
+#### `quome agent stop`
+
+Stop an active workflow. The workflow state will be preserved.
+
+```bash
+quome agent stop <THREAD_ID> [OPTIONS]
+
+Arguments:
+  <THREAD_ID>  The workflow thread ID
+
+Options:
+  -f, --force  Skip confirmation prompt
+      --json   Output as JSON
+```
+
+#### `quome agent pull`
+
+Pull the latest state and changes from a workflow. Use this to synchronize with the latest workflow state after the agent has made changes.
+
+```bash
+quome agent pull <THREAD_ID> [OPTIONS]
+
+Arguments:
+  <THREAD_ID>  The workflow thread ID
+
+Options:
+      --json  Output as JSON
 ```
 
 ---
