@@ -61,6 +61,7 @@ enum Commands {
         command: commands::deployments::DeploymentsCommands,
     },
     /// Manage databases
+    #[command(name = "db")]
     Databases {
         #[command(subcommand)]
         command: commands::databases::DatabasesCommands,
