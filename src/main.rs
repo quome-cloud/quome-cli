@@ -80,6 +80,8 @@ enum Commands {
     },
     /// View organization audit events
     Events(commands::events::Args),
+    /// Upgrade quome to the latest version
+    Upgrade,
 }
 
 #[tokio::main]
@@ -101,6 +103,7 @@ async fn main() {
         Commands::Secrets { command } => commands::secrets::execute(command).await,
         Commands::Keys { command } => commands::keys::execute(command).await,
         Commands::Events(args) => commands::events::execute(args).await,
+        Commands::Upgrade => commands::upgrade::execute().await,
     };
 
     if let Err(e) = result {

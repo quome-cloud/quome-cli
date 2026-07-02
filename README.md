@@ -1,8 +1,6 @@
 # Quome CLI
 
-Command line interface for the [Quome](https://quome.studio) platform (quome-fastapi control plane).
-
-This is a private fork of [quome-cloud/quome-cli](https://github.com/quome-cloud/quome-cli), repointed at the new platform API. It keeps the same command UX but targets the quome-fastapi REST surface with `X-API-Key` authentication.
+Command line interface for the [Quome](https://quome.studio) platform.
 
 ## What you can do
 
@@ -11,24 +9,31 @@ This is a private fork of [quome-cloud/quome-cli](https://github.com/quome-cloud
 - Create, inspect, and delete applications (image- or git-sourced)
 - Trigger and inspect deployments
 - View application logs (grouped by Cloud Run revision)
-- Manage secrets (values read via the by-name endpoint) and databases (DBaaS)
+- Manage secrets and databases (DBaaS)
 - View organization audit events
 
 ## Installation
 
-### Build from source
+### Homebrew (Recommended)
 
 ```bash
-git clone https://github.com/quome-cloud/cli.git
-cd cli
-cargo build --release
-# Binary at ./target/release/quome
+brew tap quome-cloud/quome
+brew install quome
 ```
 
-### Cargo install
+### From Source (Cargo)
 
 ```bash
-cargo install --git https://github.com/quome-cloud/cli.git
+cargo install --git https://github.com/quome-cloud/quome-cli.git
+```
+
+### Build from Source
+
+```bash
+git clone https://github.com/quome-cloud/quome-cli.git
+cd quome-cli
+cargo build --release
+# Binary at ./target/release/quome
 ```
 
 ## Quick start
@@ -78,6 +83,7 @@ The token is stored in `~/.quome/config.json`. `QUOME_TOKEN` overrides it for CI
 | `quome secrets list\|set\|get\|delete` | Secrets |
 | `quome db list\|create\|get\|update\|delete` | Managed Postgres (DBaaS) |
 | `quome events` | Organization audit events |
+| `quome upgrade` | Upgrade to the latest version via Homebrew |
 
 Every command accepts `--json` for machine-readable output, and `--org` / `--app` to override the linked context. `QUOME_ORG` / `QUOME_APP` env vars work too.
 
@@ -98,4 +104,4 @@ cargo fmt --check
 cargo test
 ```
 
-CI runs fmt, clippy, build, and tests on every push and PR.
+CI runs fmt, clippy, build, and tests on every push and PR. Every push to `main` also auto-bumps the version, builds macOS binaries, publishes a GitHub release, and updates the Homebrew formula.
