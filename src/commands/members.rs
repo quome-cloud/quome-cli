@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use uuid::Uuid;
 
-use crate::api::models::AddOrgMemberRequest;
+use crate::api::models::CreateOrgInviteRequest;
 use crate::client::QuomeClient;
 use crate::config::Config;
 use crate::errors::Result;
@@ -11,8 +11,8 @@ use crate::ui::{self, MemberRow};
 pub enum MembersCommands {
     /// List organization members
     List(ListArgs),
-    /// Add a member to the organization
-    Add(AddArgs),
+    /// Invite a member to the organization by email
+    Invite(InviteArgs),
 }
 
 #[derive(Parser)]
@@ -27,9 +27,13 @@ pub struct ListArgs {
 }
 
 #[derive(Parser)]
-pub struct AddArgs {
-    /// User ID to add
-    user_id: Uuid,
+pub struct InviteArgs {
+    /// Email address to invite
+    email: String,
+
+    /// Role for the invited member (member or admin)
+    #[arg(long, default_value = "member")]
+    role: String,
 
     /// Organization ID (uses linked org if not provided)
     #[arg(long)]
@@ -43,7 +47,7 @@ pub struct AddArgs {
 pub async fn execute(command: MembersCommands) -> Result<()> {
     match command {
         MembersCommands::List(args) => list(args).await,
-        MembersCommands::Add(args) => add(args).await,
+        MembersCommands::Invite(args) => invite(args).await,
     }
 }
 
@@ -73,8 +77,9 @@ async fn list(args: ListArgs) -> Result<()> {
         let rows: Vec<MemberRow> = members
             .iter()
             .map(|member| MemberRow {
-                user_id: member.user_id.to_string(),
-                member_id: member.id.map(|id| id.to_string()).unwrap_or_else(|| "-".to_string()),
+                name: member.user_name.clone(),
+                email: member.user_email.clone(),
+                role: member.role.clone(),
                 joined: member.created_at.format("%Y-%m-%d %H:%M").to_string(),
             })
             .collect();
@@ -85,7 +90,7 @@ async fn list(args: ListArgs) -> Result<()> {
     Ok(())
 }
 
-async fn add(args: AddArgs) -> Result<()> {
+async fn invite(args: InviteArgs) -> Result<()> {
     let config = Config::load()?;
     let token = config.require_token()?;
 
@@ -96,25 +101,33 @@ async fn add(args: AddArgs) -> Result<()> {
 
     let client = QuomeClient::new(Some(&token), None)?;
 
-    let sp = ui::spinner("Adding member...");
-    let member = client
-        .add_org_member(
+    let sp = ui::spinner("Sending invite...");
+    let invite = client
+        .create_org_invite(
             org_id,
-            &AddOrgMemberRequest {
-                user_id: args.user_id,
+            &CreateOrgInviteRequest {
+                email: args.email,
+                role: args.role,
             },
         )
         .await?;
     sp.finish_and_clear();
 
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&member)?);
+        println!("{}", serde_json::to_string_pretty(&invite)?);
     } else {
-        let member_id = member.id.map(|id| id.to_string()).unwrap_or_else(|| "-".to_string());
-        ui::print_success("Added member", &[
-            ("Member ID", &member_id),
-            ("User ID", &member.user_id.to_string()),
-        ]);
+        let expires = invite
+            .expires_at
+            .map(|e| e.format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or_else(|| "-".to_string());
+        ui::print_success(
+            "Invited member",
+            &[
+                ("Email", &invite.email),
+                ("Role", &invite.role),
+                ("Expires", &expires),
+            ],
+        );
     }
 
     Ok(())

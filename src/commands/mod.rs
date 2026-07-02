@@ -1,4 +1,3 @@
-pub mod agent;
 pub mod apps;
 pub mod databases;
 pub mod deployments;
@@ -12,5 +11,4 @@ pub mod members;
 pub mod orgs;
 pub mod secrets;
 pub mod unlink;
-pub mod upgrade;
 pub mod whoami;

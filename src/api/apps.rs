@@ -5,8 +5,9 @@ use crate::client::QuomeClient;
 use crate::errors::Result;
 
 impl QuomeClient {
-    pub async fn list_apps(&self, org_id: Uuid) -> Result<AppList> {
-        self.get(&format!("/api/v1/orgs/{}/apps", org_id)).await
+    pub async fn list_apps(&self, org_id: Uuid) -> Result<PaginatedResponse<App>> {
+        self.get(&format!("/api/v1/orgs/{}/apps?limit=100", org_id))
+            .await
     }
 
     pub async fn create_app(&self, org_id: Uuid, req: &CreateAppRequest) -> Result<App> {
@@ -34,9 +35,13 @@ impl QuomeClient {
             .await
     }
 
-    pub async fn list_deployments(&self, org_id: Uuid, app_id: Uuid) -> Result<DeploymentList> {
+    pub async fn list_deployments(
+        &self,
+        org_id: Uuid,
+        app_id: Uuid,
+    ) -> Result<PaginatedResponse<Deployment>> {
         self.get(&format!(
-            "/api/v1/orgs/{}/apps/{}/deployments",
+            "/api/v1/orgs/{}/apps/{}/deployments?limit=50",
             org_id, app_id
         ))
         .await
@@ -55,12 +60,25 @@ impl QuomeClient {
         .await
     }
 
+    pub async fn create_deployment(
+        &self,
+        org_id: Uuid,
+        app_id: Uuid,
+        req: &CreateDeploymentRequest,
+    ) -> Result<Deployment> {
+        self.post(
+            &format!("/api/v1/orgs/{}/apps/{}/deployments", org_id, app_id),
+            req,
+        )
+        .await
+    }
+
     pub async fn get_logs(
         &self,
         org_id: Uuid,
         app_id: Uuid,
         limit: Option<u32>,
-    ) -> Result<Vec<LogEntry>> {
+    ) -> Result<AppLogs> {
         let mut path = format!("/api/v1/orgs/{}/apps/{}/logs", org_id, app_id);
         if let Some(l) = limit {
             path = format!("{}?limit={}", path, l);

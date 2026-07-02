@@ -5,8 +5,9 @@ use crate::client::QuomeClient;
 use crate::errors::Result;
 
 impl QuomeClient {
-    pub async fn list_secrets(&self, org_id: Uuid) -> Result<ListSecretsResponse> {
-        self.get(&format!("/api/v1/orgs/{}/secrets", org_id)).await
+    pub async fn list_secrets(&self, org_id: Uuid) -> Result<PaginatedResponse<Secret>> {
+        self.get(&format!("/api/v1/orgs/{}/secrets?limit=100", org_id))
+            .await
     }
 
     pub async fn create_secret(&self, org_id: Uuid, req: &CreateSecretRequest) -> Result<Secret> {
@@ -14,10 +15,11 @@ impl QuomeClient {
             .await
     }
 
-    pub async fn get_secret(&self, org_id: Uuid, secret_id: Uuid) -> Result<Secret> {
+    /// Fetch the decrypted value of a secret by name.
+    pub async fn get_secret_value(&self, org_id: Uuid, name: &str) -> Result<SecretValue> {
         self.get(&format!(
-            "/api/v1/orgs/{}/secrets/{}?reveal=true",
-            org_id, secret_id
+            "/api/v1/orgs/{}/secrets/by-name/{}/value",
+            org_id, name
         ))
         .await
     }

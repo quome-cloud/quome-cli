@@ -39,10 +39,8 @@ pub async fn execute(args: Args) -> Result<()> {
             }
         }
 
-        let details_ref: Vec<(&str, &str)> = details
-            .iter()
-            .map(|(k, v)| (*k, v.as_str()))
-            .collect();
+        let details_ref: Vec<(&str, &str)> =
+            details.iter().map(|(k, v)| (*k, v.as_str())).collect();
 
         ui::print_detail(&user.name, &details_ref);
     }

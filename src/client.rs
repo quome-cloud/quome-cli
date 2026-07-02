@@ -1,10 +1,9 @@
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::time::Duration;
 
-use crate::api::models::ApiErrorResponse;
 use crate::errors::{QuomeError, Result};
 use crate::settings::Settings;
 
@@ -15,17 +14,30 @@ pub struct QuomeClient {
     base_url: String,
 }
 
+/// FastAPI error bodies are `{"detail": "..."}` where detail may also be a
+/// structured object (validation errors). Extract something readable either way.
+fn extract_detail(text: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    match value.get("detail") {
+        Some(serde_json::Value::String(s)) => Some(s.clone()),
+        Some(other) => Some(other.to_string()),
+        None => value
+            .get("message")
+            .and_then(|m| m.as_str())
+            .map(String::from),
+    }
+}
+
 impl QuomeClient {
     pub fn new(token: Option<&str>, base_url: Option<&str>) -> Result<Self> {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
         if let Some(t) = token {
-            let auth_value = format!("Bearer {}", t);
-            headers.insert(
-                AUTHORIZATION,
-                HeaderValue::from_str(&auth_value).map_err(|_| QuomeError::InvalidResponse)?,
-            );
+            let mut key_value =
+                HeaderValue::from_str(t).map_err(|_| QuomeError::InvalidResponse)?;
+            key_value.set_sensitive(true);
+            headers.insert("X-API-Key", key_value);
         }
 
         let http = reqwest::Client::builder()
@@ -47,10 +59,29 @@ impl QuomeClient {
         format!("{}{}", self.base_url, path)
     }
 
-    async fn handle_response<T: DeserializeOwned>(&self, response: reqwest::Response) -> Result<T> {
+    async fn error_from_response(&self, response: reqwest::Response) -> QuomeError {
         let status = response.status();
+        match status {
+            StatusCode::UNAUTHORIZED => QuomeError::Unauthorized,
+            StatusCode::NOT_FOUND => {
+                let text = response.text().await.unwrap_or_default();
+                QuomeError::NotFound(
+                    extract_detail(&text).unwrap_or_else(|| "Resource not found".into()),
+                )
+            }
+            StatusCode::TOO_MANY_REQUESTS => QuomeError::RateLimited,
+            _ => {
+                let text = response.text().await.unwrap_or_default();
+                QuomeError::ApiError(
+                    extract_detail(&text)
+                        .unwrap_or_else(|| format!("Request failed with status {}", status)),
+                )
+            }
+        }
+    }
 
-        if status.is_success() {
+    async fn handle_response<T: DeserializeOwned>(&self, response: reqwest::Response) -> Result<T> {
+        if response.status().is_success() {
             let text = response.text().await?;
             if std::env::var("QUOME_DEBUG").is_ok() {
                 eprintln!("DEBUG response: {}", text);
@@ -58,49 +89,15 @@ impl QuomeClient {
             let body: T = serde_json::from_str(&text)?;
             Ok(body)
         } else {
-            match status {
-                StatusCode::UNAUTHORIZED => Err(QuomeError::Unauthorized),
-                StatusCode::NOT_FOUND => {
-                    let err = response.json::<ApiErrorResponse>().await.ok();
-                    Err(QuomeError::NotFound(
-                        err.map(|e| e.message)
-                            .unwrap_or_else(|| "Resource not found".into()),
-                    ))
-                }
-                StatusCode::TOO_MANY_REQUESTS => Err(QuomeError::RateLimited),
-                _ => {
-                    let err = response.json::<ApiErrorResponse>().await.ok();
-                    Err(QuomeError::ApiError(err.map(|e| e.message).unwrap_or_else(
-                        || format!("Request failed with status {}", status),
-                    )))
-                }
-            }
+            Err(self.error_from_response(response).await)
         }
     }
 
     async fn handle_empty_response(&self, response: reqwest::Response) -> Result<()> {
-        let status = response.status();
-
-        if status.is_success() {
+        if response.status().is_success() {
             Ok(())
         } else {
-            match status {
-                StatusCode::UNAUTHORIZED => Err(QuomeError::Unauthorized),
-                StatusCode::NOT_FOUND => {
-                    let err = response.json::<ApiErrorResponse>().await.ok();
-                    Err(QuomeError::NotFound(
-                        err.map(|e| e.message)
-                            .unwrap_or_else(|| "Resource not found".into()),
-                    ))
-                }
-                StatusCode::TOO_MANY_REQUESTS => Err(QuomeError::RateLimited),
-                _ => {
-                    let err = response.json::<ApiErrorResponse>().await.ok();
-                    Err(QuomeError::ApiError(err.map(|e| e.message).unwrap_or_else(
-                        || format!("Request failed with status {}", status),
-                    )))
-                }
-            }
+            Err(self.error_from_response(response).await)
         }
     }
 

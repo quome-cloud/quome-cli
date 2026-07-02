@@ -1,8 +1,8 @@
 [package]
 name = "quome-cli"
-version = "0.1.10"
+version = "0.2.0"
 edition = "2021"
-description = "CLI for the Quome platform"
+description = "CLI for the Quome platform (quome-fastapi control plane)"
 license = "MIT"
 
 [[bin]]
@@ -24,7 +24,6 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # Error handling
-anyhow = "1.0"
 thiserror = "2.0"
 
 # Interactive prompts
@@ -37,7 +36,6 @@ tabled = { version = "0.17", features = ["ansi"] }
 
 # Utilities
 dirs = "5.0"
-open = "5.0"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.0", features = ["serde"] }
 

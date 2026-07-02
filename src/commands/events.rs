@@ -12,7 +12,7 @@ pub struct Args {
     #[arg(long)]
     org: Option<Uuid>,
 
-    /// Number of events to fetch
+    /// Number of events to fetch (max 100)
     #[arg(short = 'n', long, default_value = "50")]
     limit: u32,
 
@@ -32,29 +32,31 @@ pub async fn execute(args: Args) -> Result<()> {
 
     let client = QuomeClient::new(Some(&token), None)?;
 
-    let sp = ui::spinner("Fetching events...");
-    let response = client.list_events(org_id, Some(args.limit)).await?;
+    let sp = ui::spinner("Fetching audit events...");
+    let response = client.list_audit_logs(org_id, Some(args.limit)).await?;
     sp.finish_and_clear();
 
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&response.events)?);
+        println!("{}", serde_json::to_string_pretty(&response.items)?);
     } else {
-        if response.events.is_empty() {
+        if response.items.is_empty() {
             println!("No events found.");
             return Ok(());
         }
 
         let rows: Vec<EventRow> = response
-            .events
+            .items
             .iter()
             .map(|event| {
-                let id_string = event.resource.id.to_string();
-                let resource_name = event.resource.name.as_deref().unwrap_or(&id_string);
+                let resource = match (&event.resource_type, &event.resource_id) {
+                    (Some(rt), Some(rid)) => format!("{} ({})", rid, rt),
+                    (Some(rt), None) => rt.clone(),
+                    _ => "-".to_string(),
+                };
                 EventRow {
                     time: event.created_at.format("%Y-%m-%d %H:%M").to_string(),
-                    event_type: event.event_type.clone(),
-                    actor: event.actor.email.clone(),
-                    resource: format!("{} ({})", resource_name, event.resource.resource_type),
+                    action: event.action.clone(),
+                    resource,
                 }
             })
             .collect();

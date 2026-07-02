@@ -36,16 +36,15 @@ pub async fn execute(args: Args) -> Result<()> {
         (org.id, org.name)
     } else {
         let sp = ui::spinner("Fetching organizations...");
-        let orgs_resp = client.list_orgs().await?;
+        let orgs = client.list_orgs().await?;
         sp.finish_and_clear();
 
-        if orgs_resp.organizations.is_empty() {
+        if orgs.is_empty() {
             println!("No organizations found. Create one with `quome orgs create <name>`");
             return Ok(());
         }
 
-        let options: Vec<String> = orgs_resp
-            .organizations
+        let options: Vec<String> = orgs
             .iter()
             .map(|o| format!("{} ({})", o.name, o.id))
             .collect();
@@ -54,13 +53,12 @@ pub async fn execute(args: Args) -> Result<()> {
             .prompt()
             .map_err(|e| crate::errors::QuomeError::Io(std::io::Error::other(e.to_string())))?;
 
-        let idx = orgs_resp
-            .organizations
+        let idx = orgs
             .iter()
             .position(|o| format!("{} ({})", o.name, o.id) == selection)
             .unwrap();
 
-        let org = &orgs_resp.organizations[idx];
+        let org = &orgs[idx];
         (org.id, org.name.clone())
     };
 
@@ -80,12 +78,12 @@ pub async fn execute(args: Args) -> Result<()> {
         let apps_resp = client.list_apps(org_id).await?;
         sp.finish_and_clear();
 
-        if apps_resp.apps.is_empty() {
+        if apps_resp.data.is_empty() {
             println!("No applications found in this organization.");
             (None, None)
         } else {
             let mut options: Vec<String> = apps_resp
-                .apps
+                .data
                 .iter()
                 .map(|a| format!("{} ({})", a.name, a.id))
                 .collect();
@@ -99,12 +97,12 @@ pub async fn execute(args: Args) -> Result<()> {
                 (None, None)
             } else {
                 let idx = apps_resp
-                    .apps
+                    .data
                     .iter()
                     .position(|a| format!("{} ({})", a.name, a.id) == selection)
                     .unwrap();
 
-                let app = &apps_resp.apps[idx];
+                let app = &apps_resp.data[idx];
                 (Some(app.id), Some(app.name.clone()))
             }
         }
@@ -124,10 +122,7 @@ pub async fn execute(args: Args) -> Result<()> {
         details.push(("Application", name.clone()));
     }
 
-    let details_ref: Vec<(&str, &str)> = details
-        .iter()
-        .map(|(k, v)| (*k, v.as_str()))
-        .collect();
+    let details_ref: Vec<(&str, &str)> = details.iter().map(|(k, v)| (*k, v.as_str())).collect();
 
     ui::print_success("Linked", &details_ref);
 

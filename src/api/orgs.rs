@@ -5,7 +5,7 @@ use crate::client::QuomeClient;
 use crate::errors::Result;
 
 impl QuomeClient {
-    pub async fn list_orgs(&self) -> Result<ListOrgsResponse> {
+    pub async fn list_orgs(&self) -> Result<Vec<Organization>> {
         self.get("/api/v1/orgs").await
     }
 
@@ -21,25 +21,25 @@ impl QuomeClient {
         self.get(&format!("/api/v1/orgs/{}/members", org_id)).await
     }
 
-    pub async fn add_org_member(
+    pub async fn create_org_invite(
         &self,
         org_id: Uuid,
-        req: &AddOrgMemberRequest,
-    ) -> Result<OrgMember> {
-        self.post(&format!("/api/v1/orgs/{}/members", org_id), req)
+        req: &CreateOrgInviteRequest,
+    ) -> Result<OrgInvite> {
+        self.post(&format!("/api/v1/orgs/{}/invites", org_id), req)
             .await
     }
 
-    pub async fn list_org_keys(&self, org_id: Uuid) -> Result<ListOrgKeysResponse> {
-        self.get(&format!("/api/v1/orgs/{}/keys", org_id)).await
+    pub async fn list_org_keys(&self, org_id: Uuid) -> Result<Vec<ApiKey>> {
+        self.get(&format!("/api/v1/orgs/{}/apikeys", org_id)).await
     }
 
     pub async fn create_org_key(
         &self,
         org_id: Uuid,
-        req: &CreateOrgKeyRequest,
-    ) -> Result<CreatedOrgKey> {
-        self.post(&format!("/api/v1/orgs/{}/keys", org_id), req)
+        req: &CreateApiKeyRequest,
+    ) -> Result<CreatedApiKey> {
+        self.post(&format!("/api/v1/orgs/{}/apikeys", org_id), req)
             .await
     }
 

@@ -2,10 +2,7 @@ use clap::{Parser, Subcommand};
 use colored::Colorize;
 use uuid::Uuid;
 
-use crate::api::models::{
-    ComputeRequested, CreateDatabaseRequest, DatabaseCompute, DatabasePostgres, DatabaseReplicas,
-    DatabaseState, DatabaseStorage, StorageRequested, UpdateDatabaseRequest,
-};
+use crate::api::models::{CreateDatabaseRequest, UpdateDatabaseRequest};
 use crate::client::QuomeClient;
 use crate::config::Config;
 use crate::errors::Result;
@@ -41,25 +38,25 @@ pub struct CreateArgs {
     /// Database name
     name: String,
 
-    /// PostgreSQL major version (15, 16, or 17)
+    /// Database description
+    #[arg(long)]
+    description: Option<String>,
+
+    /// PostgreSQL major version
     #[arg(long, default_value = "17")]
-    version: i32,
+    version: String,
 
-    /// Number of vCPUs
-    #[arg(long, default_value = "1")]
-    vcpu: String,
+    /// Instance tier (e.g., db-f1-micro)
+    #[arg(long, default_value = "db-f1-micro")]
+    tier: String,
 
-    /// Memory allocation (e.g., 2Gi)
-    #[arg(long, default_value = "2Gi")]
-    memory: String,
+    /// Storage in GB
+    #[arg(long, default_value = "10")]
+    storage_gb: i32,
 
-    /// Disk space (e.g., 1024Mi)
-    #[arg(long, default_value = "1024Mi")]
-    disk: String,
-
-    /// Number of replicas
-    #[arg(long, default_value = "1")]
-    replicas: i32,
+    /// Enable high availability
+    #[arg(long)]
+    ha: bool,
 
     /// Organization ID (uses linked org if not provided)
     #[arg(long)]
@@ -89,25 +86,21 @@ pub struct UpdateArgs {
     /// Database ID
     id: Uuid,
 
-    /// New name
+    /// New description
     #[arg(long)]
-    name: Option<String>,
+    description: Option<String>,
 
-    /// Number of vCPUs
+    /// New instance tier
     #[arg(long)]
-    vcpu: Option<String>,
+    tier: Option<String>,
 
-    /// Memory allocation (e.g., 2Gi)
+    /// New storage in GB
     #[arg(long)]
-    memory: Option<String>,
+    storage_gb: Option<i32>,
 
-    /// Disk space (e.g., 1024Mi)
+    /// Enable or disable high availability
     #[arg(long)]
-    disk: Option<String>,
-
-    /// Number of replicas
-    #[arg(long)]
-    replicas: Option<i32>,
+    ha: Option<bool>,
 
     /// Organization ID (uses linked org if not provided)
     #[arg(long)]
@@ -142,13 +135,13 @@ pub async fn execute(command: DatabasesCommands) -> Result<()> {
     }
 }
 
-fn state_color(state: &DatabaseState) -> colored::ColoredString {
-    match state {
-        DatabaseState::Initializing => "Initializing".yellow(),
-        DatabaseState::Ready => "Ready".green(),
-        DatabaseState::Paused => "Paused".dimmed(),
-        DatabaseState::Stopping => "Stopping".yellow(),
-        DatabaseState::Error => "Error".red(),
+fn status_color(status: &str) -> colored::ColoredString {
+    match status {
+        "running" => status.green(),
+        "pending" | "provisioning" | "updating" => status.yellow(),
+        "failed" => status.red(),
+        "stopped" | "deleting" => status.dimmed(),
+        other => other.normal(),
     }
 }
 
@@ -168,29 +161,23 @@ async fn list(args: ListArgs) -> Result<()> {
     sp.finish_and_clear();
 
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&response.databases)?);
+        println!("{}", serde_json::to_string_pretty(&response.data)?);
     } else {
-        if response.databases.is_empty() {
+        if response.data.is_empty() {
             println!("No databases found.");
             return Ok(());
         }
 
         let rows: Vec<DatabaseRow> = response
-            .databases
+            .data
             .iter()
-            .map(|db| {
-                let status = db
-                    .status
-                    .as_ref()
-                    .map(|s| state_color(&s.state).to_string())
-                    .unwrap_or_else(|| "-".to_string());
-                DatabaseRow {
-                    id: db.id.to_string(),
-                    name: db.name.clone(),
-                    version: format!("PG {}", db.postgres.major_version),
-                    status,
-                    created: db.created_at.format("%Y-%m-%d %H:%M").to_string(),
-                }
+            .map(|db| DatabaseRow {
+                id: db.id.to_string(),
+                name: db.name.clone(),
+                version: format!("PG {}", db.version),
+                tier: db.tier.clone(),
+                status: status_color(&db.status).to_string(),
+                created: db.created_at.format("%Y-%m-%d %H:%M").to_string(),
             })
             .collect();
 
@@ -213,23 +200,11 @@ async fn create(args: CreateArgs) -> Result<()> {
 
     let req = CreateDatabaseRequest {
         name: args.name.clone(),
-        compute: DatabaseCompute {
-            requested: ComputeRequested {
-                vcpu: args.vcpu,
-                memory: args.memory,
-            },
-        },
-        storage: DatabaseStorage {
-            requested: StorageRequested {
-                disk_space: args.disk,
-            },
-        },
-        replicas: DatabaseReplicas {
-            requested: args.replicas,
-        },
-        postgres: DatabasePostgres {
-            major_version: args.version,
-        },
+        description: args.description,
+        version: args.version,
+        tier: args.tier,
+        storage_gb: args.storage_gb,
+        ha_enabled: args.ha,
     };
 
     let sp = ui::spinner("Creating database...");
@@ -241,7 +216,11 @@ async fn create(args: CreateArgs) -> Result<()> {
     } else {
         ui::print_success(
             "Created database",
-            &[("ID", &db.id.to_string()), ("Name", &db.name)],
+            &[
+                ("ID", &db.id.to_string()),
+                ("Name", &db.name),
+                ("Status", &db.status),
+            ],
         );
     }
 
@@ -266,37 +245,30 @@ async fn get(args: GetArgs) -> Result<()> {
     if args.json {
         println!("{}", serde_json::to_string_pretty(&db)?);
     } else {
-        let status = db
-            .status
-            .as_ref()
-            .map(|s| state_color(&s.state).to_string())
-            .unwrap_or_else(|| "-".to_string());
-
-        let details = vec![
+        let mut details = vec![
             ("ID", db.id.to_string()),
             ("Name", db.name.clone()),
-            ("Status", status),
-            ("PostgreSQL", format!("v{}", db.postgres.major_version)),
-            (
-                "Compute",
-                format!(
-                    "{} vCPU, {} memory",
-                    db.compute.requested.vcpu, db.compute.requested.memory
-                ),
-            ),
-            ("Storage", db.storage.requested.disk_space.clone()),
-            ("Replicas", db.replicas.requested.to_string()),
-            (
-                "Created",
-                db.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
-            ),
-            (
-                "Updated",
-                db.updated_at.format("%Y-%m-%d %H:%M:%S").to_string(),
-            ),
+            ("Status", status_color(&db.status).to_string()),
+            ("PostgreSQL", format!("v{}", db.version)),
+            ("Tier", db.tier.clone()),
+            ("Storage", format!("{} GB", db.storage_gb)),
+            ("HA", db.ha_enabled.to_string()),
         ];
 
-        let details_ref: Vec<(&str, &str)> = details.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        if let Some(ref ip) = db.private_ip {
+            details.push(("Private IP", ip.clone()));
+        }
+        details.push((
+            "Created",
+            db.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+        ));
+        details.push((
+            "Updated",
+            db.updated_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+        ));
+
+        let details_ref: Vec<(&str, &str)> =
+            details.iter().map(|(k, v)| (*k, v.as_str())).collect();
 
         ui::print_detail(&db.name, &details_ref);
     }
@@ -315,47 +287,11 @@ async fn update(args: UpdateArgs) -> Result<()> {
 
     let client = QuomeClient::new(Some(&token), None)?;
 
-    let compute = match (&args.vcpu, &args.memory) {
-        (Some(vcpu), Some(memory)) => Some(DatabaseCompute {
-            requested: ComputeRequested {
-                vcpu: vcpu.clone(),
-                memory: memory.clone(),
-            },
-        }),
-        (Some(vcpu), None) => {
-            // Fetch current to get memory
-            let current = client.get_database(org_id, args.id).await?;
-            Some(DatabaseCompute {
-                requested: ComputeRequested {
-                    vcpu: vcpu.clone(),
-                    memory: current.compute.requested.memory,
-                },
-            })
-        }
-        (None, Some(memory)) => {
-            // Fetch current to get vcpu
-            let current = client.get_database(org_id, args.id).await?;
-            Some(DatabaseCompute {
-                requested: ComputeRequested {
-                    vcpu: current.compute.requested.vcpu,
-                    memory: memory.clone(),
-                },
-            })
-        }
-        (None, None) => None,
-    };
-
-    let storage = args.disk.map(|disk| DatabaseStorage {
-        requested: StorageRequested { disk_space: disk },
-    });
-
-    let replicas = args.replicas.map(|r| DatabaseReplicas { requested: r });
-
     let req = UpdateDatabaseRequest {
-        name: args.name,
-        compute,
-        storage,
-        replicas,
+        description: args.description,
+        tier: args.tier,
+        storage_gb: args.storage_gb,
+        ha_enabled: args.ha,
     };
 
     let sp = ui::spinner("Updating database...");

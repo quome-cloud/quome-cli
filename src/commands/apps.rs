@@ -2,10 +2,10 @@ use clap::{Parser, Subcommand};
 use colored::Colorize;
 use uuid::Uuid;
 
-use crate::api::models::{AppSpec, ContainerSpec, CreateAppRequest, UpdateAppRequest};
+use crate::api::models::{AppSource, AppSpecCreate, CreateAppRequest, UpdateAppRequest};
 use crate::client::QuomeClient;
 use crate::config::Config;
-use crate::errors::Result;
+use crate::errors::{QuomeError, Result};
 use crate::ui::{self, AppRow};
 
 #[derive(Subcommand)]
@@ -35,19 +35,27 @@ pub struct ListArgs {
 
 #[derive(Parser)]
 pub struct CreateArgs {
-    /// Application name
+    /// Application name (lowercase letters, digits, hyphens)
     name: String,
 
     /// Application description
     #[arg(short, long)]
     description: Option<String>,
 
-    /// Container image (e.g., nginx:latest)
+    /// Container image (e.g., nginx:1.27) — creates an image-sourced app
+    #[arg(long, conflicts_with = "repo")]
+    image: Option<String>,
+
+    /// GitHub repository as owner/name — creates a git-sourced app
     #[arg(long)]
-    image: String,
+    repo: Option<String>,
+
+    /// Git branch (used with --repo)
+    #[arg(long, default_value = "main")]
+    branch: String,
 
     /// Container port
-    #[arg(long, default_value = "80")]
+    #[arg(long, default_value = "8080")]
     port: u16,
 
     /// Organization ID (uses linked org if not provided)
@@ -80,13 +88,13 @@ pub struct UpdateArgs {
     #[arg(short, long)]
     id: Option<Uuid>,
 
-    /// New name
-    #[arg(long)]
-    name: Option<String>,
-
     /// New description
     #[arg(long)]
     description: Option<String>,
+
+    /// New deploy branch (git-sourced apps)
+    #[arg(long)]
+    branch: Option<String>,
 
     /// Organization ID (uses linked org if not provided)
     #[arg(long)]
@@ -121,6 +129,16 @@ pub async fn execute(command: AppsCommands) -> Result<()> {
     }
 }
 
+fn status_color(status: &str) -> colored::ColoredString {
+    match status {
+        "running" => status.green(),
+        "pending" | "provisioning" => status.yellow(),
+        "failed" => status.red(),
+        "stopped" | "deleting" => status.dimmed(),
+        other => other.normal(),
+    }
+}
+
 async fn list(args: ListArgs) -> Result<()> {
     let config = Config::load()?;
     let token = config.require_token()?;
@@ -137,19 +155,21 @@ async fn list(args: ListArgs) -> Result<()> {
     sp.finish_and_clear();
 
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&response.apps)?);
+        println!("{}", serde_json::to_string_pretty(&response.data)?);
     } else {
-        if response.apps.is_empty() {
+        if response.data.is_empty() {
             println!("No applications found.");
             return Ok(());
         }
 
         let rows: Vec<AppRow> = response
-            .apps
+            .data
             .iter()
             .map(|app| AppRow {
                 id: app.id.to_string(),
                 name: app.name.clone(),
+                status: status_color(&app.status).to_string(),
+                url: app.primary_url.clone().unwrap_or_else(|| "-".to_string()),
                 created: app.created_at.format("%Y-%m-%d %H:%M").to_string(),
             })
             .collect();
@@ -169,15 +189,24 @@ async fn create(args: CreateArgs) -> Result<()> {
         None => config.require_linked_org()?,
     };
 
-    let client = QuomeClient::new(Some(&token), None)?;
-
-    let spec = AppSpec {
-        containers: vec![ContainerSpec {
-            name: args.name.clone(),
-            image: args.image,
-            port: args.port,
-        }],
+    let source = if let Some(image) = args.image {
+        AppSource::Image { image_url: image }
+    } else if let Some(repo) = args.repo {
+        let (owner, name) = repo
+            .split_once('/')
+            .ok_or_else(|| QuomeError::ApiError("--repo must be in owner/name format".into()))?;
+        AppSource::Git {
+            repo_owner: owner.to_string(),
+            repo_name: name.to_string(),
+            branch: args.branch,
+        }
+    } else {
+        return Err(QuomeError::ApiError(
+            "Provide a source: --image <image:tag> or --repo <owner/name>".into(),
+        ));
     };
+
+    let client = QuomeClient::new(Some(&token), None)?;
 
     let sp = ui::spinner("Creating application...");
     let app = client
@@ -186,7 +215,11 @@ async fn create(args: CreateArgs) -> Result<()> {
             &CreateAppRequest {
                 name: args.name,
                 description: args.description,
-                spec,
+                source,
+                spec: AppSpecCreate {
+                    port: Some(args.port),
+                    ..Default::default()
+                },
             },
         )
         .await?;
@@ -195,10 +228,14 @@ async fn create(args: CreateArgs) -> Result<()> {
     if args.json {
         println!("{}", serde_json::to_string_pretty(&app)?);
     } else {
-        ui::print_success("Created application", &[
-            ("ID", &app.id.to_string()),
-            ("Name", &app.name),
-        ]);
+        ui::print_success(
+            "Created application",
+            &[
+                ("ID", &app.id.to_string()),
+                ("Name", &app.name),
+                ("Status", &app.status),
+            ],
+        );
     }
 
     Ok(())
@@ -230,38 +267,41 @@ async fn get(args: GetArgs) -> Result<()> {
         let mut details = vec![
             ("ID", app.id.to_string()),
             ("Name", app.name.clone()),
+            ("Status", status_color(&app.status).to_string()),
         ];
 
         if let Some(ref desc) = app.description {
             details.push(("Description", desc.clone()));
         }
+        if let Some(ref source_type) = app.source_type {
+            details.push(("Source", source_type.clone()));
+        }
+        if let (Some(owner), Some(name)) = (&app.github_repo_owner, &app.github_repo_name) {
+            details.push(("Repo", format!("{}/{}", owner, name)));
+        }
+        if let Some(ref image) = app.container_image_url {
+            details.push(("Image", image.clone()));
+        }
+        if let Some(ref url) = app.primary_url {
+            details.push(("URL", url.clone()));
+        }
+        if let Some(ref domain) = app.custom_domain {
+            details.push(("Custom domain", domain.clone()));
+        }
 
-        details.push(("Created", app.created_at.format("%Y-%m-%d %H:%M:%S").to_string()));
-        details.push(("Updated", app.updated_at.format("%Y-%m-%d %H:%M:%S").to_string()));
+        details.push((
+            "Created",
+            app.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+        ));
+        details.push((
+            "Updated",
+            app.updated_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+        ));
 
-        let details_ref: Vec<(&str, &str)> = details
-            .iter()
-            .map(|(k, v)| (*k, v.as_str()))
-            .collect();
+        let details_ref: Vec<(&str, &str)> =
+            details.iter().map(|(k, v)| (*k, v.as_str())).collect();
 
         ui::print_detail(&app.name, &details_ref);
-
-        // Show containers if any
-        if let Some(ref spec) = app.spec {
-            if !spec.containers.is_empty() {
-                println!();
-                println!("{}", "Containers".bold());
-                for container in &spec.containers {
-                    println!(
-                        "  {} {} ({}, port {})",
-                        "•".cyan(),
-                        container.name.bold(),
-                        container.image.dimmed(),
-                        container.port
-                    );
-                }
-            }
-        }
     }
 
     Ok(())
@@ -289,9 +329,8 @@ async fn update(args: UpdateArgs) -> Result<()> {
             org_id,
             app_id,
             &UpdateAppRequest {
-                name: args.name,
                 description: args.description,
-                spec: None,
+                github_branch: args.branch,
             },
         )
         .await?;
@@ -300,10 +339,10 @@ async fn update(args: UpdateArgs) -> Result<()> {
     if args.json {
         println!("{}", serde_json::to_string_pretty(&app)?);
     } else {
-        ui::print_success("Updated application", &[
-            ("ID", &app.id.to_string()),
-            ("Name", &app.name),
-        ]);
+        ui::print_success(
+            "Updated application",
+            &[("ID", &app.id.to_string()), ("Name", &app.name)],
+        );
     }
 
     Ok(())
@@ -339,9 +378,7 @@ async fn delete(args: DeleteArgs) -> Result<()> {
     client.delete_app(org_id, args.id).await?;
     sp.finish_and_clear();
 
-    ui::print_success("Deleted application", &[
-        ("ID", &args.id.to_string()),
-    ]);
+    ui::print_success("Deleted application", &[("ID", &args.id.to_string())]);
 
     Ok(())
 }

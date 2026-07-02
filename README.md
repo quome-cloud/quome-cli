@@ -1,50 +1,40 @@
 # Quome CLI
 
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
+Command line interface for the [Quome](https://quome.studio) platform (quome-fastapi control plane).
 
-## Overview
+This is a private fork of [quome-cloud/quome-cli](https://github.com/quome-cloud/quome-cli), repointed at the new platform API. It keeps the same command UX but targets the quome-fastapi REST surface with `X-API-Key` authentication.
 
-This is the command line interface for [Quome](https://quome.com). Use it to manage your Quome infrastructure, applications, and deployments directly from the terminal.
+## What you can do
 
-The Quome CLI allows you to:
-
-- Authenticate using API keys from the Quome dashboard
-- Create and manage organizations
-- Deploy and monitor applications
-- Manage secrets and environment variables
-- View logs and audit events
-- Generate and manage API keys
-- Build full-stack applications with AI using natural language prompts
+- Authenticate with an API key from the Quome dashboard
+- Manage organizations, members (via invites), and API keys
+- Create, inspect, and delete applications (image- or git-sourced)
+- Trigger and inspect deployments
+- View application logs (grouped by Cloud Run revision)
+- Manage secrets (values read via the by-name endpoint) and databases (DBaaS)
+- View organization audit events
 
 ## Installation
 
-### Homebrew (Recommended)
+### Build from source
 
 ```bash
-brew tap quome-cloud/quome
-brew install quome
-```
-
-### From Source (Cargo)
-
-```bash
-cargo install --git https://github.com/quome-cloud/quome-cli.git
-```
-
-### Build from Source
-
-```bash
-git clone https://github.com/quome-cloud/quome-cli.git
-cd quome-cli
+git clone https://github.com/quome-cloud/cli.git
+cd cli
 cargo build --release
-# Binary will be at ./target/release/quome
+# Binary at ./target/release/quome
 ```
 
-## Quick Start
+### Cargo install
 
 ```bash
-# Login to Quome
+cargo install --git https://github.com/quome-cloud/cli.git
+```
+
+## Quick start
+
+```bash
+# Login with an API key (qk_...) from the Quome dashboard
 quome login
 
 # Link your current directory to an organization and app
@@ -53,7 +43,10 @@ quome link
 # View your applications
 quome apps list
 
-# View application logs
+# Trigger a deployment
+quome deployments create
+
+# Tail recent logs
 quome logs
 
 # Check who you're logged in as
@@ -62,776 +55,47 @@ quome whoami
 
 ## Authentication
 
-The Quome CLI uses API keys for authentication. You'll need to generate an API key from the Quome web interface before using the CLI.
-
-### Getting Your API Key
-
-1. Log in to the [Quome Dashboard](https://quome.com)
-2. Navigate to your organization settings
-3. Go to **API Keys** section
-4. Click **Create API Key**
-5. Copy the generated key (it's only shown once!)
-
-### Interactive Login
-
-```bash
-quome login
-```
-
-You'll be prompted to enter your API key. The key is stored securely in `~/.quome/config.json`.
-
-### Non-Interactive Login
-
-```bash
-quome login --token your-api-key
-```
-
-### Using Environment Variables
-
-For CI/CD pipelines, you can use environment variables instead of logging in:
-
-```bash
-export QUOME_TOKEN=your-api-key
-export QUOME_ORG=your-org-id
-export QUOME_APP=your-app-id
-
-quome logs  # Uses environment variables
-```
-
-### Logout
-
-```bash
-quome logout
-```
-
-## Directory Linking
-
-Link your project directory to a Quome organization and application. This allows you to run commands without specifying `--org` and `--app` flags.
-
-```bash
-# Interactive selection
-quome link
-
-# Direct linking
-quome link --org <org-id> --app <app-id>
-
-# Unlink current directory
-quome unlink
-```
-
-Linking is stored per-directory in `~/.quome/config.json`.
-
-## Commands Reference
-
-### Authentication
-
-#### `quome login`
-
-Authenticate with Quome using an API key generated from the [Quome Dashboard](https://quome.com).
-
-```bash
-quome login [OPTIONS]
-
-Options:
-  -t, --token <TOKEN>  API key (will prompt if not provided)
-```
-
-#### `quome logout`
-
-Log out and clear stored credentials.
-
-```bash
-quome logout
-```
-
-#### `quome whoami`
-
-Display current user information and linked context.
-
-```bash
-quome whoami [OPTIONS]
-
-Options:
-      --json  Output as JSON
-```
-
----
-
-### Organizations
-
-#### `quome orgs list`
-
-List all organizations you belong to.
-
-```bash
-quome orgs list [OPTIONS]
-
-Options:
-      --json  Output as JSON
-```
-
-#### `quome orgs create`
-
-Create a new organization.
-
-```bash
-quome orgs create <NAME> [OPTIONS]
-
-Arguments:
-  <NAME>  Organization name
-
-Options:
-      --json  Output as JSON
-```
-
-#### `quome orgs get`
-
-Get details of an organization.
-
-```bash
-quome orgs get [OPTIONS]
-
-Options:
-  -i, --id <ID>  Organization ID (uses linked org if not provided)
-      --json     Output as JSON
-```
-
----
-
-### Organization Members
-
-#### `quome members list`
-
-List members of an organization.
-
-```bash
-quome members list [OPTIONS]
-
-Options:
-      --org <ORG>  Organization ID (uses linked org if not provided)
-      --json       Output as JSON
-```
-
-#### `quome members add`
-
-Add a user to an organization.
-
-```bash
-quome members add <USER_ID> [OPTIONS]
-
-Arguments:
-  <USER_ID>  User ID to add
-
-Options:
-      --org <ORG>  Organization ID (uses linked org if not provided)
-      --json       Output as JSON
-```
-
----
-
-### Applications
-
-#### `quome apps list`
-
-List all applications in an organization.
-
-```bash
-quome apps list [OPTIONS]
-
-Options:
-      --org <ORG>  Organization ID (uses linked org if not provided)
-      --json       Output as JSON
-```
-
-#### `quome apps create`
-
-Create a new application.
-
-```bash
-quome apps create <NAME> [OPTIONS]
-
-Arguments:
-  <NAME>  Application name
-
-Options:
-  -d, --description <DESC>  Application description
-      --image <IMAGE>       Container image (e.g., nginx:latest)
-      --port <PORT>         Container port [default: 80]
-      --org <ORG>           Organization ID (uses linked org if not provided)
-      --json                Output as JSON
-```
-
-#### `quome apps get`
-
-Get application details.
-
-```bash
-quome apps get [OPTIONS]
-
-Options:
-  -i, --id <ID>   Application ID (uses linked app if not provided)
-      --org <ORG> Organization ID (uses linked org if not provided)
-      --json      Output as JSON
-```
-
-#### `quome apps update`
-
-Update an application.
-
-```bash
-quome apps update [OPTIONS]
-
-Options:
-  -i, --id <ID>             Application ID (uses linked app if not provided)
-      --name <NAME>         New name
-      --description <DESC>  New description
-      --org <ORG>           Organization ID (uses linked org if not provided)
-      --json                Output as JSON
-```
-
-#### `quome apps delete`
-
-Delete an application.
-
-```bash
-quome apps delete <ID> [OPTIONS]
-
-Arguments:
-  <ID>  Application ID
-
-Options:
-      --org <ORG>  Organization ID (uses linked org if not provided)
-  -f, --force      Skip confirmation prompt
-```
-
----
-
-### Deployments
-
-#### `quome deployments list`
-
-List deployments for an application.
-
-```bash
-quome deployments list [OPTIONS]
-
-Options:
-      --app <APP>  Application ID (uses linked app if not provided)
-      --org <ORG>  Organization ID (uses linked org if not provided)
-      --json       Output as JSON
-```
-
-#### `quome deployments get`
-
-Get deployment details including events.
-
-```bash
-quome deployments get <ID> [OPTIONS]
-
-Arguments:
-  <ID>  Deployment ID
-
-Options:
-      --app <APP>  Application ID (uses linked app if not provided)
-      --org <ORG>  Organization ID (uses linked org if not provided)
-      --json       Output as JSON
-```
-
----
-
-### Databases
-
-#### `quome db list`
-
-List all databases in an organization.
-
-```bash
-quome db list [OPTIONS]
-
-Options:
-      --org <ORG>  Organization ID (uses linked org if not provided)
-      --json       Output as JSON
-```
-
-#### `quome db create`
-
-Create a new database.
-
-```bash
-quome db create <NAME> [OPTIONS]
-
-Arguments:
-  <NAME>  Database name
-
-Options:
-      --version <VERSION>    PostgreSQL major version (15, 16, or 17) [default: 17]
-      --vcpu <VCPU>          Number of vCPUs [default: 1]
-      --memory <MEMORY>      Memory allocation (e.g., 2Gi) [default: 2Gi]
-      --disk <DISK>          Disk space (e.g., 1024Mi) [default: 1024Mi]
-      --replicas <REPLICAS>  Number of replicas [default: 1]
-      --org <ORG>            Organization ID (uses linked org if not provided)
-      --json                 Output as JSON
-```
-
-#### `quome db get`
-
-Get database details.
-
-```bash
-quome db get <ID> [OPTIONS]
-
-Arguments:
-  <ID>  Database ID
-
-Options:
-      --org <ORG>  Organization ID (uses linked org if not provided)
-      --json       Output as JSON
-```
-
-#### `quome db update`
-
-Update a database.
-
-```bash
-quome db update <ID> [OPTIONS]
-
-Arguments:
-  <ID>  Database ID
-
-Options:
-      --name <NAME>          New name
-      --vcpu <VCPU>          Number of vCPUs
-      --memory <MEMORY>      Memory allocation (e.g., 2Gi)
-      --disk <DISK>          Disk space (e.g., 1024Mi)
-      --replicas <REPLICAS>  Number of replicas
-      --org <ORG>            Organization ID (uses linked org if not provided)
-      --json                 Output as JSON
-```
-
-#### `quome db delete`
-
-Delete a database.
-
-```bash
-quome db delete <ID> [OPTIONS]
-
-Arguments:
-  <ID>  Database ID
-
-Options:
-      --org <ORG>  Organization ID (uses linked org if not provided)
-  -f, --force      Skip confirmation prompt
-```
-
----
-
-### Logs
-
-#### `quome logs`
-
-View application logs.
-
-```bash
-quome logs [OPTIONS]
-
-Options:
-      --app <APP>      Application ID (uses linked app if not provided)
-      --org <ORG>      Organization ID (uses linked org if not provided)
-  -n, --limit <LIMIT>  Number of log entries [default: 100]
-      --json           Output as JSON
-```
-
----
-
-### Secrets
-
-#### `quome secrets list`
-
-List all secrets in an organization.
-
-```bash
-quome secrets list [OPTIONS]
-
-Options:
-      --org <ORG>  Organization ID (uses linked org if not provided)
-      --json       Output as JSON
-```
-
-#### `quome secrets set`
-
-Create or update a secret.
-
-```bash
-quome secrets set <NAME> <VALUE> [OPTIONS]
-
-Arguments:
-  <NAME>   Secret name
-  <VALUE>  Secret value
-
-Options:
-  -d, --description <DESC>  Secret description
-      --org <ORG>           Organization ID (uses linked org if not provided)
-      --json                Output as JSON
-```
-
-#### `quome secrets get`
-
-Get a secret value.
-
-```bash
-quome secrets get <NAME> [OPTIONS]
-
-Arguments:
-  <NAME>  Secret name
-
-Options:
-      --org <ORG>  Organization ID (uses linked org if not provided)
-      --json       Output as JSON
-```
-
-#### `quome secrets delete`
-
-Delete a secret.
-
-```bash
-quome secrets delete <NAME> [OPTIONS]
-
-Arguments:
-  <NAME>  Secret name
-
-Options:
-      --org <ORG>  Organization ID (uses linked org if not provided)
-  -f, --force      Skip confirmation prompt
-```
-
----
-
-### API Keys
-
-#### `quome keys list`
-
-List API keys for an organization.
-
-```bash
-quome keys list [OPTIONS]
-
-Options:
-      --org <ORG>  Organization ID (uses linked org if not provided)
-      --json       Output as JSON
-```
-
-#### `quome keys create`
-
-Create a new API key.
-
-```bash
-quome keys create [OPTIONS]
-
-Options:
-      --expires-days <DAYS>  Days until expiration (0 = never) [default: 0]
-      --org <ORG>            Organization ID (uses linked org if not provided)
-      --json                 Output as JSON
-```
-
-**Important:** The API key is only displayed once upon creation. Store it securely.
-
-#### `quome keys delete`
-
-Delete an API key.
-
-```bash
-quome keys delete <ID> [OPTIONS]
-
-Arguments:
-  <ID>  API key ID
-
-Options:
-      --org <ORG>  Organization ID (uses linked org if not provided)
-  -f, --force      Skip confirmation prompt
-```
-
----
-
-### Events
-
-#### `quome events`
-
-View organization audit events.
-
-```bash
-quome events [OPTIONS]
-
-Options:
-      --org <ORG>      Organization ID (uses linked org if not provided)
-  -n, --limit <LIMIT>  Number of events [default: 50]
-      --json           Output as JSON
-```
-
----
-
-### AI Agent
-
-The Quome Agent uses AI to build full-stack applications from natural language prompts. Describe what you want to build, and the agent will analyze your requirements, generate a plan, write the code, and deploy it.
-
-#### `quome agent start`
-
-Start a new AI app building workflow. By default, this command watches progress in real-time with a beautiful progress display until the app is deployed.
-
-```bash
-quome agent start <PROMPT> [OPTIONS]
-
-Arguments:
-  <PROMPT>  Description of the application to build
-
-Options:
-      --name <NAME>              Project name (auto-generated if not provided)
-      --github                   Create a GitHub repository for the app
-      --parallel                 Run build stages in parallel for faster completion
-      --accessibility <LEVEL>    WCAG compliance target: A, AA, or AAA [default: AA]
-      --backend <STACK>          Backend framework (e.g., fastapi, express, django)
-      --backend-lang <LANG>      Backend language (e.g., python, javascript, typescript)
-      --frontend <STACK>         Frontend framework (e.g., react, vue, nextjs)
-      --frontend-lang <LANG>     Frontend language (e.g., javascript, typescript)
-      --database <TYPE>          Database type (e.g., postgresql, sqlite, mongodb)
-      --primary-color <HEX>      Primary color hex code (e.g., #3B82F6)
-      --secondary-color <HEX>    Secondary color hex code
-      --no-watch                 Don't watch progress (just start and return thread ID)
-      --json                     Output as JSON
-```
-
-**Example:**
-
-```bash
-# Build and watch until deployed (default)
-quome agent start "Build a task management app with user authentication"
-
-# With tech stack preferences
-quome agent start "Build an e-commerce store" \
-  --backend fastapi --backend-lang python \
-  --frontend react --frontend-lang typescript \
-  --database postgresql \
-  --github --parallel
-
-# Start without watching (returns thread ID immediately)
-quome agent start "Build a blog" --no-watch
-```
-
-The progress display shows:
-- Real-time progress bar with percentage and stage
-- Current phase (planning, building, testing, deploying)
-- Live preview URLs when available
-- AI assistant messages as they come in
-- Final deployment URL when complete
-
-#### `quome agent prompt`
-
-Send a follow-up prompt to an active workflow. Use this to request changes, additions, or refinements to the app being built.
-
-```bash
-quome agent prompt <THREAD_ID> <PROMPT> [OPTIONS]
-
-Arguments:
-  <THREAD_ID>  The workflow thread ID
-  <PROMPT>     The follow-up instruction
-
-Options:
-  -w, --watch  Watch progress after sending prompt
-      --json   Output as JSON
-```
-
-**Example:**
-
-```bash
-# Send prompt and return immediately
-quome agent prompt 123e4567-e89b-12d3-a456-426614174000 "Add a dark mode toggle to the header"
-
-# Send prompt and watch until changes are deployed
-quome agent prompt 123e4567-e89b-12d3-a456-426614174000 "Add user profiles" --watch
-```
-
-#### `quome agent state`
-
-Get the current state of a workflow, including progress, generated files, deployment status, and conversation history.
-
-```bash
-quome agent state <THREAD_ID> [OPTIONS]
-
-Arguments:
-  <THREAD_ID>  The workflow thread ID
-
-Options:
-  -w, --watch  Watch progress continuously until complete
-      --json   Output as JSON
-```
-
-**Example:**
-
-```bash
-# Get current state snapshot
-quome agent state 123e4567-e89b-12d3-a456-426614174000
-
-# Watch progress in real-time
-quome agent state 123e4567-e89b-12d3-a456-426614174000 --watch
-```
-
-#### `quome agent stop`
-
-Stop an active workflow. The workflow state will be preserved.
-
-```bash
-quome agent stop <THREAD_ID> [OPTIONS]
-
-Arguments:
-  <THREAD_ID>  The workflow thread ID
-
-Options:
-  -f, --force  Skip confirmation prompt
-      --json   Output as JSON
-```
-
-#### `quome agent pull`
-
-Pull the latest state and changes from a workflow. Use this to synchronize with the latest workflow state after the agent has made changes.
-
-```bash
-quome agent pull <THREAD_ID> [OPTIONS]
-
-Arguments:
-  <THREAD_ID>  The workflow thread ID
-
-Options:
-      --json  Output as JSON
-```
-
----
+The CLI authenticates with org-scoped API keys (`qk_...`), sent as an `X-API-Key` header.
+
+1. Log in to the Quome dashboard
+2. Organization settings → **API Keys** → **Create API Key**
+3. Copy the key (shown only once) and run `quome login`
+
+The token is stored in `~/.quome/config.json`. `QUOME_TOKEN` overrides it for CI use.
+
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| `quome login` / `logout` / `whoami` | Session management |
+| `quome link` / `unlink` | Bind the current directory to an org + app |
+| `quome orgs list\|create\|get` | Organizations |
+| `quome members list\|invite` | Org members (adds happen via email invites) |
+| `quome keys list\|create\|delete` | Org API keys |
+| `quome apps list\|create\|get\|update\|delete` | Applications |
+| `quome deployments list\|get\|create` | Deployments (`create` triggers a deploy) |
+| `quome logs` | Application logs |
+| `quome secrets list\|set\|get\|delete` | Secrets |
+| `quome db list\|create\|get\|update\|delete` | Managed Postgres (DBaaS) |
+| `quome events` | Organization audit events |
+
+Every command accepts `--json` for machine-readable output, and `--org` / `--app` to override the linked context. `QUOME_ORG` / `QUOME_APP` env vars work too.
 
 ## Configuration
 
-### User Configuration
-
-User credentials and linked directories are stored in `~/.quome/config.json`:
-
-```json
-{
-  "user": {
-    "token": "your-api-key",
-    "id": "user-uuid",
-    "email": "you@example.com"
-  },
-  "linked": {
-    "/path/to/project": {
-      "org_id": "org-uuid",
-      "org_name": "My Organization",
-      "app_id": "app-uuid",
-      "app_name": "My App"
-    }
-  }
-}
-```
-
-### Settings File
-
-You can customize API endpoints and URLs using a `settings.json` file. The CLI looks for settings in this order:
-
-1. `./settings.json` (local, in current directory)
-2. `~/.quome/settings.json` (global)
-3. Built-in defaults
-
-Example `settings.json`:
-
-```json
-{
-  "api_url": "https://demo.quome.cloud",
-  "docs_url": "https://documentation.demo.quome.cloud",
-  "website_url": "https://quome.com"
-}
-```
-
-| Setting | Description | Default |
-|---------|-------------|---------|
-| `api_url` | API base URL | `https://demo.quome.cloud` |
-| `docs_url` | Documentation URL | `https://documentation.demo.quome.cloud` |
-| `website_url` | Main website URL | `https://quome.com` |
-
-This is useful for:
-- Pointing to different environments (staging, production)
-- Self-hosted Quome installations
-- Local development
-
-## Environment Variables
-
-| Variable | Description |
-|----------|-------------|
-| `QUOME_TOKEN` | API key (overrides stored key) |
-| `QUOME_ORG` | Organization ID (overrides linked org) |
-| `QUOME_APP` | Application ID (overrides linked app) |
-| `QUOME_API_URL` | API base URL (default: `https://demo.quome.cloud`) |
-| `QUOME_DEBUG` | Set to any value to print raw API responses to stderr |
-
-## JSON Output
-
-All commands support `--json` flag for machine-readable output:
-
-```bash
-quome apps list --json | jq '.[] | .name'
-```
-
-## Exit Codes
-
-| Code | Description |
-|------|-------------|
-| 0 | Success |
-| 1 | Error (see stderr for details) |
+- `~/.quome/config.json` — token + per-directory org/app links
+- `~/.quome/settings.json` or `./settings.json` — `api_url` override
+- `QUOME_API_URL` — env var override for the API base URL (default `https://quome.studio`)
+- `QUOME_DEBUG=1` — print raw API responses
 
 ## Development
 
-### Prerequisites
-
-- Rust 1.70 or later
-- Cargo
-
-### Building
-
 ```bash
+./scripts/setup.sh    # install git hooks
 cargo build
-```
-
-### Running Tests
-
-```bash
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
 cargo test
 ```
 
-### Running Locally
-
-```bash
-cargo run -- login
-cargo run -- apps list
-```
-
-### Linting
-
-```bash
-cargo clippy
-cargo fmt
-```
-
-## Contributing
-
-We welcome contributions! Please see our contributing guidelines for more information.
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
-## License
-
-This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
-
-## Support
-
-- [Documentation](https://documentation.demo.quome.cloud)
-- [Issue Tracker](https://github.com/quome-cloud/quome-cli/issues)
-
+CI runs fmt, clippy, build, and tests on every push and PR.

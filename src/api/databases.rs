@@ -5,8 +5,9 @@ use crate::client::QuomeClient;
 use crate::errors::Result;
 
 impl QuomeClient {
-    pub async fn list_databases(&self, org_id: Uuid) -> Result<ListDatabasesResponse> {
-        self.get(&format!("/api/v1/orgs/{}/dbaas", org_id)).await
+    pub async fn list_databases(&self, org_id: Uuid) -> Result<PaginatedResponse<Database>> {
+        self.get(&format!("/api/v1/orgs/{}/dbaas?limit=100", org_id))
+            .await
     }
 
     pub async fn create_database(

@@ -2,7 +2,6 @@ use clap::Parser;
 use colored::Colorize;
 use uuid::Uuid;
 
-use crate::api::models::LogLevel;
 use crate::client::QuomeClient;
 use crate::config::Config;
 use crate::errors::Result;
@@ -19,7 +18,7 @@ pub struct Args {
     org: Option<Uuid>,
 
     /// Number of log entries to fetch
-    #[arg(short = 'n', long, default_value = "100")]
+    #[arg(short = 'n', long, default_value = "200")]
     limit: u32,
 
     /// Output as JSON
@@ -27,12 +26,13 @@ pub struct Args {
     json: bool,
 }
 
-fn level_color(level: &LogLevel) -> colored::ColoredString {
-    match level {
-        LogLevel::Debug => "DEBUG".dimmed(),
-        LogLevel::Info => "INFO ".blue(),
-        LogLevel::Warn => "WARN ".yellow(),
-        LogLevel::Error => "ERROR".red(),
+fn severity_color(severity: &str) -> colored::ColoredString {
+    match severity.to_uppercase().as_str() {
+        "DEBUG" => "DEBUG".dimmed(),
+        "INFO" | "DEFAULT" | "NOTICE" => "INFO ".blue(),
+        "WARNING" | "WARN" => "WARN ".yellow(),
+        "ERROR" | "CRITICAL" | "ALERT" | "EMERGENCY" => "ERROR".red(),
+        other => other.normal(),
     }
 }
 
@@ -58,14 +58,19 @@ pub async fn execute(args: Args) -> Result<()> {
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&logs)?);
-    } else {
-        if logs.is_empty() {
-            println!("No logs found.");
-            return Ok(());
-        }
+        return Ok(());
+    }
 
-        // Logs are better displayed as a stream rather than a table
-        for entry in logs {
+    if logs.revisions.is_empty() {
+        println!("No logs found.");
+        return Ok(());
+    }
+
+    // Logs are grouped by Cloud Run revision; print each group as a stream
+    for revision in &logs.revisions {
+        println!("{}", format!("── {} ──", revision.revision_name).dimmed());
+        for entry in &revision.logs {
+            let severity = entry.severity.as_deref().unwrap_or("INFO");
             println!(
                 "{} {} {}",
                 entry
@@ -73,7 +78,7 @@ pub async fn execute(args: Args) -> Result<()> {
                     .format("%Y-%m-%d %H:%M:%S")
                     .to_string()
                     .dimmed(),
-                level_color(&entry.level),
+                severity_color(severity),
                 entry.message
             );
         }

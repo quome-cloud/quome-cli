@@ -78,15 +78,8 @@ enum Commands {
         #[command(subcommand)]
         command: commands::keys::KeysCommands,
     },
-    /// View organization events
+    /// View organization audit events
     Events(commands::events::Args),
-    /// AI-powered app building agent
-    Agent {
-        #[command(subcommand)]
-        command: commands::agent::AgentCommands,
-    },
-    /// Upgrade quome to the latest version
-    Upgrade,
 }
 
 #[tokio::main]
@@ -108,8 +101,6 @@ async fn main() {
         Commands::Secrets { command } => commands::secrets::execute(command).await,
         Commands::Keys { command } => commands::keys::execute(command).await,
         Commands::Events(args) => commands::events::execute(args).await,
-        Commands::Agent { command } => commands::agent::execute(command).await,
-        Commands::Upgrade => commands::upgrade::execute().await,
     };
 
     if let Err(e) = result {

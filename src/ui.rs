@@ -1,8 +1,8 @@
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::time::Duration;
-use tabled::settings::object::Rows;
 use tabled::settings::disable::Remove;
+use tabled::settings::object::Rows;
 use tabled::settings::{Alignment, Color, Modify, Panel, Style};
 use tabled::{Table, Tabled};
 
@@ -72,6 +72,10 @@ pub struct AppRow {
     pub id: String,
     #[tabled(rename = "NAME")]
     pub name: String,
+    #[tabled(rename = "STATUS")]
+    pub status: String,
+    #[tabled(rename = "URL")]
+    pub url: String,
     #[tabled(rename = "CREATED")]
     pub created: String,
 }
@@ -82,6 +86,8 @@ pub struct OrgRow {
     pub id: String,
     #[tabled(rename = "NAME")]
     pub name: String,
+    #[tabled(rename = "SLUG")]
+    pub slug: String,
     #[tabled(rename = "CREATED")]
     pub created: String,
 }
@@ -102,6 +108,8 @@ pub struct DeploymentRow {
     pub id: String,
     #[tabled(rename = "STATUS")]
     pub status: String,
+    #[tabled(rename = "BRANCH")]
+    pub branch: String,
     #[tabled(rename = "CREATED")]
     pub created: String,
 }
@@ -110,16 +118,22 @@ pub struct DeploymentRow {
 pub struct KeyRow {
     #[tabled(rename = "ID")]
     pub id: String,
+    #[tabled(rename = "NAME")]
+    pub name: String,
+    #[tabled(rename = "PREFIX")]
+    pub prefix: String,
     #[tabled(rename = "CREATED")]
     pub created: String,
 }
 
 #[derive(Tabled)]
 pub struct MemberRow {
-    #[tabled(rename = "USER ID")]
-    pub user_id: String,
-    #[tabled(rename = "MEMBER ID")]
-    pub member_id: String,
+    #[tabled(rename = "NAME")]
+    pub name: String,
+    #[tabled(rename = "EMAIL")]
+    pub email: String,
+    #[tabled(rename = "ROLE")]
+    pub role: String,
     #[tabled(rename = "JOINED")]
     pub joined: String,
 }
@@ -128,10 +142,8 @@ pub struct MemberRow {
 pub struct EventRow {
     #[tabled(rename = "TIME")]
     pub time: String,
-    #[tabled(rename = "TYPE")]
-    pub event_type: String,
-    #[tabled(rename = "ACTOR")]
-    pub actor: String,
+    #[tabled(rename = "ACTION")]
+    pub action: String,
     #[tabled(rename = "RESOURCE")]
     pub resource: String,
 }
@@ -144,6 +156,8 @@ pub struct DatabaseRow {
     pub name: String,
     #[tabled(rename = "VERSION")]
     pub version: String,
+    #[tabled(rename = "TIER")]
+    pub tier: String,
     #[tabled(rename = "STATUS")]
     pub status: String,
     #[tabled(rename = "CREATED")]

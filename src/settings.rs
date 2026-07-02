@@ -8,7 +8,7 @@ const SETTINGS_FILE: &str = "settings.json";
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Settings {
-    /// API base URL (e.g., "https://demo.quome.cloud")
+    /// API base URL (e.g., "https://quome.studio")
     #[serde(default = "default_api_url")]
     pub api_url: String,
 
@@ -22,7 +22,7 @@ pub struct Settings {
 }
 
 fn default_api_url() -> String {
-    "https://demo.quome.cloud".to_string()
+    "https://quome.studio".to_string()
 }
 
 fn default_docs_url() -> String {

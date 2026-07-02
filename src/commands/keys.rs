@@ -1,9 +1,8 @@
-use chrono::{Duration, Utc};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use uuid::Uuid;
 
-use crate::api::models::CreateOrgKeyRequest;
+use crate::api::models::CreateApiKeyRequest;
 use crate::client::QuomeClient;
 use crate::config::Config;
 use crate::errors::Result;
@@ -32,6 +31,17 @@ pub struct ListArgs {
 
 #[derive(Parser)]
 pub struct CreateArgs {
+    /// Key name
+    name: String,
+
+    /// Key description
+    #[arg(short, long)]
+    description: Option<String>,
+
+    /// Scopes ("*" or space-separated like "read:secret write:app")
+    #[arg(long, default_value = "*")]
+    scopes: String,
+
     /// Days until expiration (0 = never expires)
     #[arg(long, default_value = "0")]
     expires_days: u32,
@@ -79,22 +89,23 @@ async fn list(args: ListArgs) -> Result<()> {
     let client = QuomeClient::new(Some(&token), None)?;
 
     let sp = ui::spinner("Fetching API keys...");
-    let response = client.list_org_keys(org_id).await?;
+    let keys = client.list_org_keys(org_id).await?;
     sp.finish_and_clear();
 
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&response.keys)?);
+        println!("{}", serde_json::to_string_pretty(&keys)?);
     } else {
-        if response.keys.is_empty() {
+        if keys.is_empty() {
             println!("No API keys found.");
             return Ok(());
         }
 
-        let rows: Vec<KeyRow> = response
-            .keys
+        let rows: Vec<KeyRow> = keys
             .iter()
             .map(|key| KeyRow {
                 id: key.id.to_string(),
+                name: key.name.clone(),
+                prefix: key.key_prefix.clone(),
                 created: key.created_at.format("%Y-%m-%d %H:%M").to_string(),
             })
             .collect();
@@ -114,8 +125,8 @@ async fn create(args: CreateArgs) -> Result<()> {
         None => config.require_linked_org()?,
     };
 
-    let expiration = if args.expires_days > 0 {
-        Some(Utc::now() + Duration::days(args.expires_days as i64))
+    let expires_in_days = if args.expires_days > 0 {
+        Some(args.expires_days)
     } else {
         None
     };
@@ -124,17 +135,29 @@ async fn create(args: CreateArgs) -> Result<()> {
 
     let sp = ui::spinner("Creating API key...");
     let key = client
-        .create_org_key(org_id, &CreateOrgKeyRequest { expiration })
+        .create_org_key(
+            org_id,
+            &CreateApiKeyRequest {
+                name: args.name,
+                description: args.description,
+                scopes: args.scopes,
+                expires_in_days,
+            },
+        )
         .await?;
     sp.finish_and_clear();
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&key)?);
     } else {
-        ui::print_success("Created API key", &[
-            ("ID", &key.id.to_string()),
-            ("Key", &key.key),
-        ]);
+        ui::print_success(
+            "Created API key",
+            &[
+                ("ID", &key.id.to_string()),
+                ("Name", &key.name),
+                ("Key", &key.key),
+            ],
+        );
         println!();
         println!("  {}", "Save this key - it won't be shown again!".yellow());
     }
@@ -172,9 +195,7 @@ async fn delete(args: DeleteArgs) -> Result<()> {
     client.delete_org_key(org_id, args.id).await?;
     sp.finish_and_clear();
 
-    ui::print_success("Deleted API key", &[
-        ("ID", &args.id.to_string()),
-    ]);
+    ui::print_success("Deleted API key", &[("ID", &args.id.to_string())]);
 
     Ok(())
 }

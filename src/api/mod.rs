@@ -1,7 +1,6 @@
 mod apps;
-mod auth;
+mod audit;
 mod databases;
-mod events;
 pub mod models;
 mod orgs;
 mod secrets;
