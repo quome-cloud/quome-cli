@@ -2,6 +2,7 @@ pub mod apps;
 pub mod databases;
 pub mod deployments;
 pub mod events;
+pub mod host;
 pub mod keys;
 pub mod link;
 pub mod login;

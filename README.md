@@ -88,6 +88,7 @@ Full walkthrough with expected output: **[Getting started](docs/getting-started.
 | `quome members …` | Members and invites | [Members](docs/reference/members.md) |
 | `quome keys …` | API keys | [Keys](docs/reference/keys.md) |
 | `quome events` | Organization audit trail | [Events](docs/reference/events.md) |
+| `quome host …` | Run a sandbox host on your own computer | [Host](docs/reference/host.md) |
 | `quome upgrade` | Self-update via Homebrew | [Upgrade](docs/reference/upgrade.md) |
 
 ## Documentation
