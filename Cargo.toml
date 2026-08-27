@@ -2,7 +2,7 @@
 name = "quome-cli"
 version = "0.2.2"
 edition = "2021"
-description = "CLI for the Quome platform (quome-fastapi control plane)"
+description = "CLI for the Quome platform"
 license = "MIT"
 
 [[bin]]

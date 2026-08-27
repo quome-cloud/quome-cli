@@ -76,5 +76,5 @@ Mirrors `quome-host`: `0` success, `1` the requested action failed, `2` this mac
 The same install, as a one-liner served by your control plane:
 
 ```bash
-curl -fsSL https://<control-plane>/api/v1/downloads/sandbox-host/host.sh | sh -s -- --enroll <CODE>
+curl -fsSL https://quome.studio/api/v1/downloads/sandbox-host/host.sh | sh -s -- --enroll <CODE>
 ```
