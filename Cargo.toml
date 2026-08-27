@@ -36,6 +36,7 @@ tabled = { version = "0.17", features = ["ansi"] }
 
 # Utilities
 dirs = "5.0"
+sha2 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.0", features = ["serde"] }
 

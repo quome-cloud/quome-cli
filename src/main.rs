@@ -80,6 +80,11 @@ enum Commands {
     },
     /// View organization audit events
     Events(commands::events::Args),
+    /// Run a Quome sandbox host on this computer
+    Host {
+        #[command(subcommand)]
+        command: commands::host::HostCommands,
+    },
     /// Upgrade quome to the latest version
     Upgrade,
 }
@@ -103,6 +108,7 @@ async fn main() {
         Commands::Secrets { command } => commands::secrets::execute(command).await,
         Commands::Keys { command } => commands::keys::execute(command).await,
         Commands::Events(args) => commands::events::execute(args).await,
+        Commands::Host { command } => commands::host::execute(command).await,
         Commands::Upgrade => commands::upgrade::execute().await,
     };
 
