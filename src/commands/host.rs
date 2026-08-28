@@ -193,7 +193,10 @@ pub async fn execute(command: HostCommands) -> Result<()> {
         }
         HostCommands::Login(args) => {
             let bin = ensure_installed(&api_url, false).await?;
-            let mut argv = login_argv(&api_url, args.web_url.as_deref());
+            let mut argv = login_argv(
+                explicit_control_plane_url().as_deref(),
+                args.web_url.as_deref(),
+            );
             argv.extend(args.extra);
             run(&bin, &argv)
         }
@@ -249,16 +252,42 @@ fn with_extra(sub: &str, extra: Vec<String>) -> Vec<String> {
     argv
 }
 
-/// `quome-host login` argv. Like `up`, `--control-plane-url` goes first so the
-/// CLI session is minted against the control plane this wrapper is configured
-/// for; `--web-url` overrides the approval-page origin the control plane
-/// advertises (`/auth/config` → `frontend_url`).
-fn login_argv(api_url: &str, web_url: Option<&str>) -> Vec<String> {
-    let mut argv = vec![
-        "login".to_string(),
-        "--control-plane-url".to_string(),
-        api_url.to_string(),
-    ];
+/// The control plane the user EXPLICITLY configured — `QUOME_API_URL` or a
+/// settings file — or `None` when we would only be passing on the compiled-in
+/// production default. The device-scoped commands (`login`, and through it
+/// `shell`/`logout`) hand that default to nobody: a device enrolled against
+/// dev with an inline `QUOME_API_URL=…` must not be logged in against prod
+/// the next day just because the env var is gone. When this is `None`,
+/// `quome-host` resolves the control plane itself, from the enrolled VM's
+/// own agent config first (2026-08-28: exactly this footgun on the dev laptop).
+fn explicit_control_plane_url() -> Option<String> {
+    if let Ok(v) = std::env::var("QUOME_API_URL") {
+        let v = v.trim().trim_end_matches('/').to_string();
+        if !v.is_empty() {
+            return Some(v);
+        }
+    }
+    let has_settings_file = std::path::Path::new("settings.json").exists()
+        || dirs::home_dir()
+            .map(|h| h.join(".quome").join("settings.json").exists())
+            .unwrap_or(false);
+    if has_settings_file {
+        return control_plane_url().ok();
+    }
+    None
+}
+
+/// `quome-host login` argv. `--control-plane-url` is passed only when the
+/// user configured one explicitly (see `explicit_control_plane_url`); it goes
+/// first so a later user-supplied flag still wins. `--web-url` overrides the
+/// approval-page origin the control plane advertises (`/auth/config` →
+/// `frontend_url`).
+fn login_argv(api_url: Option<&str>, web_url: Option<&str>) -> Vec<String> {
+    let mut argv = vec!["login".to_string()];
+    if let Some(cp) = api_url {
+        argv.push("--control-plane-url".to_string());
+        argv.push(cp.to_string());
+    }
     if let Some(url) = web_url {
         argv.push("--web-url".to_string());
         argv.push(url.to_string());
@@ -580,13 +609,18 @@ not-a-sum quome-host-darwin-amd64
     }
 
     #[test]
-    fn login_argv_pins_the_control_plane_and_forwards_web_url() {
+    fn login_argv_pins_the_control_plane_only_when_explicit_and_forwards_web_url() {
+        // No explicit control plane → quome-host resolves it from the enrolled VM.
+        assert_eq!(login_argv(None, None), vec!["login"]);
         assert_eq!(
-            login_argv("https://api.example.test", None),
+            login_argv(Some("https://api.example.test"), None),
             vec!["login", "--control-plane-url", "https://api.example.test"]
         );
         assert_eq!(
-            login_argv("https://api.example.test", Some("https://app.example.test")),
+            login_argv(
+                Some("https://api.example.test"),
+                Some("https://app.example.test")
+            ),
             vec![
                 "login",
                 "--control-plane-url",
