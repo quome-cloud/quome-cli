@@ -58,7 +58,8 @@ Stop the VM. Sandboxes running on it stop with it.
 ## `quome host login`
 
 Authorize this CLI for the device you enrolled. Opens your browser to the
-platform's approval page (your normal sign-in plus MFA step-up); the session
+platform's approval page (your normal sign-in; MFA if you have an
+authenticator enrolled); the session
 it mints is a **CLI session** — scoped to sandbox actions on *this* device
 only, nothing else — and lives in `~/.quome/cli/session.json` (0600) for
 7 days of inactivity.
@@ -66,6 +67,11 @@ only, nothing else — and lives in `~/.quome/cli/session.json` (0600) for
 | Flag | Description |
 |------|-------------|
 | `--web-url <URL>` | Override the approval-page origin (default: what the control plane advertises). |
+
+The control plane comes from the enrolled VM itself unless you set
+`QUOME_API_URL` or a settings file — so a device enrolled against a dev
+control plane keeps logging in there even when the env var you used for
+`up --enroll` is long gone.
 
 ## `quome host shell [SANDBOX] [--session NAME]`
 
