@@ -50,6 +50,12 @@ pub enum HostCommands {
     Down(PassthroughArgs),
     /// Download and verify quome-host without running it
     Install(InstallArgs),
+    /// Authorize this CLI for the device (browser approval; PKCE)
+    Login(LoginArgs),
+    /// Revoke and remove the local CLI session
+    Logout(PassthroughArgs),
+    /// Attach this terminal to a sandbox running on THIS device
+    Shell(ShellArgs),
 }
 
 #[derive(Args)]
@@ -100,6 +106,31 @@ pub struct InstallArgs {
     /// Re-download even if quome-host is already installed
     #[arg(long)]
     refresh: bool,
+}
+
+#[derive(Args)]
+pub struct LoginArgs {
+    /// Web app origin that serves the approval page (default: discovered from the control plane)
+    #[arg(long)]
+    web_url: Option<String>,
+
+    /// Any further quome-host flags
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    extra: Vec<String>,
+}
+
+#[derive(Args)]
+pub struct ShellArgs {
+    /// Sandbox name or id prefix (omit when exactly one sandbox is running here)
+    sandbox: Option<String>,
+
+    /// tmux session to attach (default: the browser terminal's "quome" session)
+    #[arg(long)]
+    session: Option<String>,
+
+    /// Any further quome-host flags
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    extra: Vec<String>,
 }
 
 pub async fn execute(command: HostCommands) -> Result<()> {
@@ -160,6 +191,22 @@ pub async fn execute(command: HostCommands) -> Result<()> {
             let bin = ensure_installed(&api_url, false).await?;
             run(&bin, &with_extra("down", args.extra))
         }
+        HostCommands::Login(args) => {
+            let bin = ensure_installed(&api_url, false).await?;
+            let mut argv = login_argv(&api_url, args.web_url.as_deref());
+            argv.extend(args.extra);
+            run(&bin, &argv)
+        }
+        HostCommands::Logout(args) => {
+            let bin = ensure_installed(&api_url, false).await?;
+            run(&bin, &with_extra("logout", args.extra))
+        }
+        HostCommands::Shell(args) => {
+            let bin = ensure_installed(&api_url, false).await?;
+            let mut argv = shell_argv(args.sandbox.as_deref(), args.session.as_deref());
+            argv.extend(args.extra);
+            run(&bin, &argv)
+        }
     }
 }
 
@@ -199,6 +246,38 @@ fn up_argv(api_url: &str, enroll: Option<&str>, native: bool) -> Vec<String> {
 fn with_extra(sub: &str, extra: Vec<String>) -> Vec<String> {
     let mut argv = vec![sub.to_string()];
     argv.extend(extra);
+    argv
+}
+
+/// `quome-host login` argv. Like `up`, `--control-plane-url` goes first so the
+/// CLI session is minted against the control plane this wrapper is configured
+/// for; `--web-url` overrides the approval-page origin the control plane
+/// advertises (`/auth/config` → `frontend_url`).
+fn login_argv(api_url: &str, web_url: Option<&str>) -> Vec<String> {
+    let mut argv = vec![
+        "login".to_string(),
+        "--control-plane-url".to_string(),
+        api_url.to_string(),
+    ];
+    if let Some(url) = web_url {
+        argv.push("--web-url".to_string());
+        argv.push(url.to_string());
+    }
+    argv
+}
+
+/// `quome-host shell` argv: the sandbox positional (if any) first, then
+/// `--session`. quome-host splits positionals from flags itself, so the order
+/// is cosmetic — this one matches what the dashboard shows users.
+fn shell_argv(sandbox: Option<&str>, session: Option<&str>) -> Vec<String> {
+    let mut argv = vec!["shell".to_string()];
+    if let Some(name) = sandbox {
+        argv.push(name.to_string());
+    }
+    if let Some(s) = session {
+        argv.push("--session".to_string());
+        argv.push(s.to_string());
+    }
     argv
 }
 
@@ -498,6 +577,38 @@ not-a-sum quome-host-darwin-amd64
         // A malformed digest never matches.
         assert_eq!(sums_entry(sums, "quome-host-darwin-amd64"), None);
         assert_eq!(sums_entry(sums, "quome-host-windows-amd64"), None);
+    }
+
+    #[test]
+    fn login_argv_pins_the_control_plane_and_forwards_web_url() {
+        assert_eq!(
+            login_argv("https://api.example.test", None),
+            vec!["login", "--control-plane-url", "https://api.example.test"]
+        );
+        assert_eq!(
+            login_argv("https://api.example.test", Some("https://app.example.test")),
+            vec![
+                "login",
+                "--control-plane-url",
+                "https://api.example.test",
+                "--web-url",
+                "https://app.example.test"
+            ]
+        );
+    }
+
+    #[test]
+    fn shell_argv_puts_the_sandbox_first_then_session() {
+        assert_eq!(shell_argv(None, None), vec!["shell"]);
+        assert_eq!(shell_argv(Some("api"), None), vec!["shell", "api"]);
+        assert_eq!(
+            shell_argv(Some("api"), Some("claude")),
+            vec!["shell", "api", "--session", "claude"]
+        );
+        assert_eq!(
+            shell_argv(None, Some("quome")),
+            vec!["shell", "--session", "quome"]
+        );
     }
 
     #[test]

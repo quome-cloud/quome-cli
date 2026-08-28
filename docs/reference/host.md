@@ -55,6 +55,35 @@ Re-provision the host, which reinstalls the verified current agent.
 
 Stop the VM. Sandboxes running on it stop with it.
 
+## `quome host login`
+
+Authorize this CLI for the device you enrolled. Opens your browser to the
+platform's approval page (your normal sign-in plus MFA step-up); the session
+it mints is a **CLI session** — scoped to sandbox actions on *this* device
+only, nothing else — and lives in `~/.quome/cli/session.json` (0600) for
+7 days of inactivity.
+
+| Flag | Description |
+|------|-------------|
+| `--web-url <URL>` | Override the approval-page origin (default: what the control plane advertises). |
+
+## `quome host shell [SANDBOX] [--session NAME]`
+
+Attach this terminal to a sandbox running on this device — the same tmux
+session the browser terminal shows, over loopback, so both views share one
+screen. With exactly one sandbox running the name is optional; otherwise pass
+its name or an id prefix (an ambiguous call prints the candidates and exits
+`1`). `--session` picks a tmux session (default `quome`, the main browser
+terminal; Power Mode terminals are named after their agent, e.g. `claude`).
+Detach with `Ctrl-b d`.
+
+Exit codes: `0` detached · `1` no/ambiguous sandbox · `2` not logged in ·
+`3` the org has direct terminals off · `4` could not connect.
+
+## `quome host logout`
+
+Revoke the CLI session server-side and remove the local file.
+
 ## `quome host install [--refresh]`
 
 Download and verify `quome-host` without running anything — useful to pre-stage a machine or to check what the control plane publishes.
