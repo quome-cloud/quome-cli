@@ -24,6 +24,10 @@ pub struct Args {
     /// Read the API key from stdin (automatic when stdin is not a terminal, e.g. a pipe).
     #[arg(long)]
     stdin: bool,
+
+    /// Approve a new key in your browser instead of pasting one (nothing to copy).
+    #[arg(long, conflicts_with_all = ["token", "token_file", "stdin"])]
+    browser: bool,
 }
 
 /// Where the key came from — decided before anything is read, so the
@@ -99,7 +103,7 @@ fn prompt_key() -> Result<String> {
         // question was "I pasted and nothing happened".
         .with_display_mode(inquire::PasswordDisplayMode::Masked)
         .with_help_message(&format!(
-            "Create one at {} → Create key → Full access",
+            "Create one at {} → Create key → Full access, or run `quome login --browser`",
             dashboard
         ))
         .prompt()
@@ -107,6 +111,13 @@ fn prompt_key() -> Result<String> {
 }
 
 pub async fn execute(args: Args) -> Result<()> {
+    if args.browser {
+        let dashboard = crate::settings::Settings::load()
+            .unwrap_or_default()
+            .get_api_url();
+        let (token, identity) = crate::commands::login_browser::run(&dashboard).await?;
+        return finish_login(token, identity);
+    }
     let stdin_tty = std::io::stdin().is_terminal();
     let source = token_source(&args.token, &args.token_file, args.stdin, stdin_tty);
 
@@ -164,7 +175,11 @@ pub async fn execute(args: Args) -> Result<()> {
         other => other,
     })?;
     sp.finish_and_clear();
+    finish_login(token, identity)
+}
 
+/// Store a validated key and print what it resolves to.
+fn finish_login(token: String, identity: crate::api::models::ApiKeySelf) -> Result<()> {
     let mut config = Config::load()?;
     config.set_key_login(token, &identity);
     config.save()?;

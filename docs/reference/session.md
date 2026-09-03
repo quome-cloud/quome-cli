@@ -11,7 +11,25 @@ Options:
   -t, --token <TOKEN>       API key (qk_...). Lands in shell history — prefer the prompt, --token-file, or stdin.
       --token-file <PATH>   Read the API key from a file (first line; the file is not deleted).
       --stdin               Read the API key from stdin (automatic when stdin is not a terminal, e.g. a pipe).
+      --browser             Approve a new key in your browser instead of pasting one (nothing to copy).
 ```
+
+Browser (nothing to paste — the dashboard creates the key and hands it to the CLI over loopback):
+
+```console
+$ quome login --browser
+Opening your browser to approve a new API key (quome-cli@Jims-MacBook)…
+If nothing opened, use this URL:
+  https://quome.studio/cli/authorize?kind=api_key&state=…&port=51234&code_challenge=…&key_name=quome-cli%40Jims-MacBook
+
+✓ Logged in
+  Key              qk_AbC123Xy…
+  Organization     acme (0d9f4a3b-…)
+  Service account  9c1e6679-…
+  Scopes           *
+```
+
+You pick the organization in the browser (Settings → admin capability required there; TOTP if enrolled) and click **Create key**. The key is minted only when the CLI redeems the one-time code, so an approval you abandon creates nothing. It appears on the dashboard's API Keys page as `quome-cli@<hostname>`. If the control plane doesn't offer browser login, the CLI says so and falls back to the paste path.
 
 Interactive (recommended locally — the key never lands in shell history; asterisks show the paste landing):
 

@@ -36,6 +36,11 @@ tabled = { version = "0.17", features = ["ansi"] }
 
 # Utilities
 dirs = "5.0"
+# `quome login --browser`: PKCE + loopback callback
+rand = "0.8"
+base64 = "0.22"
+open = "5"
+gethostname = "0.5"
 sha2 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.0", features = ["serde"] }

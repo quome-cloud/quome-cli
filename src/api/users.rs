@@ -14,4 +14,10 @@ impl QuomeClient {
     pub async fn get_api_key_self(&self) -> Result<ApiKeySelf> {
         self.get("/api/v1/api-keys/self").await
     }
+
+    /// `quome login --browser`: redeem the browser-approved one-time code.
+    /// Unauthenticated — the code + PKCE verifier are the credential.
+    pub async fn exchange_cli_key(&self, req: &CliKeyExchangeRequest) -> Result<CliApiKeyResponse> {
+        self.post("/api/v1/auth/cli/key", req).await
+    }
 }

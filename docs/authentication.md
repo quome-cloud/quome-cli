@@ -19,7 +19,19 @@ The API Keys page shows each key's backing service account. A key badged **Legac
 
 ## Logging in
 
-`quome login` validates the key against the API (`GET /api-keys/self`) and stores it together with the org, service account, and scopes it resolves to:
+**No paste at all:** `quome login --browser` opens the dashboard, you pick the organization and click **Create key**, and the new key is handed straight to the CLI over a loopback callback (a one-time code + PKCE, the same handoff `quome host login` uses). Nothing to copy; the key is named `quome-cli@<your computer>` on the API Keys page so you can find and delete it later. You need the Settings → admin capability in that organization, and TOTP if you have it set up.
+
+```console
+$ quome login --browser
+Opening your browser to approve a new API key (quome-cli@Jims-MacBook)…
+✓ Logged in
+  Key              qk_AbC123Xy…
+  Organization     acme (0d9f4a3b-…)
+  Service account  9c1e…
+  Scopes           *
+```
+
+**With a key you already have:** `quome login` validates the key against the API (`GET /api-keys/self`) and stores it together with the org, service account, and scopes it resolves to:
 
 ```console
 $ quome login
@@ -35,6 +47,7 @@ The prompt shows asterisks as you paste so you can see the key landed. Every oth
 
 | How | Command | Notes |
 |---|---|---|
+| Browser | `quome login --browser` | Approve in the dashboard; the key never passes through your clipboard |
 | Prompt | `quome login` | Masked; never in shell history |
 | Pipe | `pbpaste \| quome login` / `cat key.txt \| quome login` | Automatic when stdin isn't a terminal; `--stdin` forces it |
 | File | `quome login --token-file ~/.quome-key` | Reads the first line |

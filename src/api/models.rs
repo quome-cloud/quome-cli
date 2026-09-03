@@ -64,6 +64,28 @@ pub struct ApiKeySelf {
     pub org_slug: Option<String>,
 }
 
+/// `POST /api/v1/auth/cli/key` request — the PKCE exchange for `quome login --browser`.
+#[derive(Debug, Serialize)]
+pub struct CliKeyExchangeRequest {
+    pub code: String,
+    pub state: String,
+    pub code_verifier: String,
+}
+
+/// `POST /api/v1/auth/cli/key` response — the new key, shown exactly once.
+#[derive(Debug, Deserialize)]
+pub struct CliApiKeyResponse {
+    pub api_key: String,
+    #[allow(dead_code)]
+    pub key_prefix: String,
+    pub org_id: Uuid,
+    pub org_name: String,
+    pub org_slug: String,
+    pub service_account_id: Uuid,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+}
+
 // ============ Organizations ============
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
