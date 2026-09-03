@@ -22,6 +22,9 @@ pub struct Args {
 }
 
 pub async fn execute(args: Args) -> Result<()> {
+    if !crate::commands::dashboard_only_override() {
+        return Err(crate::commands::dashboard_only("Reading the audit trail"));
+    }
     let config = Config::load()?;
     let token = config.require_token()?;
 

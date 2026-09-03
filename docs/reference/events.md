@@ -1,5 +1,7 @@
 # Events: `events`
 
+> **Dashboard-only.** This is organization administration. An API key authenticates as an org-scoped service account and can never hold the org-level permission these commands need, so the CLI refuses them up front (`… is organization administration, which an API key cannot do`). Do this in the dashboard: **Settings → Security → Audit**. `QUOME_ALLOW_ADMIN_COMMANDS=1` re-enables the commands against a control plane that still resolves keys to a user.
+
 The organization audit trail — who did what, when. Useful for compliance reviews and "what changed?" debugging.
 
 ```

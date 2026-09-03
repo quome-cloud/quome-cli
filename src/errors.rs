@@ -11,7 +11,11 @@ pub enum QuomeError {
     #[error("No linked application. Run `quome link` to connect.")]
     NoLinkedApp,
 
-    #[error("Unauthorized. Your session may have expired. Run `quome login`.")]
+    #[error(
+        "Unauthorized. The API key was rejected — it is deleted, expired, or flagged \
+         \"Legacy (non-functional)\" on the dashboard's API Keys page. Create a new \
+         Full-access key there and run `quome login`."
+    )]
     Unauthorized,
 
     #[error("Not found: {0}")]
@@ -19,6 +23,11 @@ pub enum QuomeError {
 
     #[error("API error: {0}")]
     ApiError(String),
+
+    /// A problem the CLI detected itself (bad input, a command the current
+    /// credential can never run) — printed verbatim, no "API error" prefix.
+    #[error("{0}")]
+    Usage(String),
 
     #[error("Rate limited. Please wait and try again.")]
     RateLimited,

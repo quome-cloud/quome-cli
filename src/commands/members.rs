@@ -45,6 +45,11 @@ pub struct InviteArgs {
 }
 
 pub async fn execute(command: MembersCommands) -> Result<()> {
+    if !crate::commands::dashboard_only_override() {
+        return Err(crate::commands::dashboard_only(
+            "Managing members and invites",
+        ));
+    }
     match command {
         MembersCommands::List(args) => list(args).await,
         MembersCommands::Invite(args) => invite(args).await,

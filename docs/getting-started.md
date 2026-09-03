@@ -27,33 +27,38 @@ quome 0.2.1
 
 ## 2. Get an API key
 
-The CLI authenticates with org-scoped API keys (they start with `qk_`).
+The CLI authenticates with org-scoped API keys (they start with `qk_`). Every key is backed by a service account in one organization.
 
 1. Log in to the [Quome dashboard](https://quome.studio)
-2. Open your organization settings → **API Keys**
-3. Click **Create API Key** and copy it — it's shown only once
+2. **Settings → API Keys** → **Create key**
+3. Choose **Full access** and copy the key — it's shown only once
 
-More detail (scopes, expiry, CI keys): [Authentication](authentication.md).
+More detail (scopes, what a key can and can't do, CI keys): [Authentication](authentication.md).
 
 ## 3. Log in
 
 ```console
 $ quome login
-? API Key: ********
+? API key: ************************************
 ✓ Logged in
-  Email    you@example.com
-  User ID  a1b2c3d4-...
+  Key              qk_AbC123Xy…
+  Organization     acme (0d9f4a3b-…)
+  Service account  9c1e6679-…
+  Scopes           *
 ```
 
-`quome login` validates the key against the API and stores it in `~/.quome/config.json`. Non-interactive alternative: `quome login --token qk_...` or set `QUOME_TOKEN` (see [Configuration](configuration.md)).
+`quome login` validates the key against the API, learns which organization it belongs to, and stores both in `~/.quome/config.json`. The prompt masks the key with asterisks so you can see a paste land.
+
+No terminal to paste into? Pipe it (`pbpaste | quome login`), point at a file (`quome login --token-file key.txt`), or set `QUOME_TOKEN` (see [Configuration](configuration.md)).
+
+> A key rejected here is deleted, expired, or badged **Legacy (non-functional)** on the API Keys page — create a new one.
 
 ## 4. Link your directory
 
-`quome link` binds the current directory to an organization (and optionally an app). After linking, commands run in that directory don't need `--org` or `--app` flags.
+Your key already names its organization, so commands work right after `login`. `quome link` additionally binds the current directory to an **app**, so app-scoped commands (`logs`, `deployments`) don't need `--app`:
 
 ```console
 $ quome link
-? Select organization: acme (0d9f...)
 ? Select application: (Skip - don't link an app)
 ✓ Linked
   Organization  acme
@@ -63,12 +68,13 @@ Check your context any time:
 
 ```console
 $ quome whoami
-┌ Jane Developer ─────────────────────┐
-│ ID            a1b2c3d4-...          │
-│ Name          Jane Developer        │
-│ Email         you@example.com      │
-│ Organization  acme                  │
-└─────────────────────────────────────┘
+┌ API key ─────────────────────────────────────┐
+│ Key              qk_AbC123Xy…                │
+│ Organization     acme (0d9f4a3b-…)           │
+│ Service account  9c1e6679-…                  │
+│ Scopes           *                           │
+│ Linked org       acme                        │
+└──────────────────────────────────────────────┘
 ```
 
 ## 5. Deploy your first app

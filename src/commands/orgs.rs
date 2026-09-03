@@ -54,6 +54,11 @@ pub struct GetArgs {
 }
 
 pub async fn execute(command: OrgsCommands) -> Result<()> {
+    if !crate::commands::dashboard_only_override() {
+        return Err(crate::commands::dashboard_only(
+            "Listing, creating, or reading organizations",
+        ));
+    }
     match command {
         OrgsCommands::List(args) => list(args).await,
         OrgsCommands::Create(args) => create(args).await,

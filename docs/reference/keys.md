@@ -1,6 +1,8 @@
 # Keys: `keys list|create|delete`
 
-Org-scoped API keys — the same kind the CLI itself logs in with. Mint scoped, expiring keys for CI instead of reusing your personal one.
+> **Dashboard-only.** This is organization administration. An API key authenticates as an org-scoped service account and can never hold the org-level permission these commands need, so the CLI refuses them up front (`… is organization administration, which an API key cannot do`). Do this in the dashboard: **Settings → API Keys**. `QUOME_ALLOW_ADMIN_COMMANDS=1` re-enables the commands against a control plane that still resolves keys to a user.
+
+Org-scoped API keys — the same kind the CLI itself logs in with. Mint scoped, expiring keys for CI from the dashboard instead of reusing your personal one.
 
 ## `quome keys list`
 

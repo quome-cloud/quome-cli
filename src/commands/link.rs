@@ -1,5 +1,6 @@
 use clap::Parser;
 use inquire::Select;
+use uuid::Uuid;
 
 use crate::client::QuomeClient;
 use crate::config::{Config, LinkedContext};
@@ -23,50 +24,32 @@ pub async fn execute(args: Args) -> Result<()> {
 
     let client = QuomeClient::new(Some(&token), None)?;
 
-    // Get or select organization
-    let (org_id, org_name) = if let Some(ref org_str) = args.org {
-        let org_id = org_str
-            .parse()
-            .map_err(|_| crate::errors::QuomeError::ApiError("Invalid organization ID".into()))?;
+    // The org is decided by the key: an API key belongs to exactly one
+    // organization and cannot list or read others, so there is nothing to
+    // select. `--org` is accepted for scripts but must name that same org.
+    let sp = ui::spinner("Resolving key...");
+    let identity = client.get_api_key_self().await?;
+    sp.finish_and_clear();
 
-        let sp = ui::spinner("Fetching organization...");
-        let org = client.get_org(org_id).await?;
-        sp.finish_and_clear();
-
-        (org.id, org.name)
-    } else {
-        let sp = ui::spinner("Fetching organizations...");
-        let orgs = client.list_orgs().await?;
-        sp.finish_and_clear();
-
-        if orgs.is_empty() {
-            println!("No organizations found. Create one with `quome orgs create <name>`");
-            return Ok(());
-        }
-
-        let options: Vec<String> = orgs
-            .iter()
-            .map(|o| format!("{} ({})", o.name, o.id))
-            .collect();
-
-        let selection = Select::new("Select organization:", options)
-            .prompt()
-            .map_err(|e| crate::errors::QuomeError::Io(std::io::Error::other(e.to_string())))?;
-
-        let idx = orgs
-            .iter()
-            .position(|o| format!("{} ({})", o.name, o.id) == selection)
-            .unwrap();
-
-        let org = &orgs[idx];
-        (org.id, org.name.clone())
+    let requested: Option<uuid::Uuid> = match args.org {
+        Some(ref org_str) => Some(
+            org_str
+                .parse()
+                .map_err(|_| crate::errors::QuomeError::Usage("Invalid organization ID".into()))?,
+        ),
+        None => None,
     };
+    let org_id = link_org(identity.org_id, requested)?;
+    let org_name = identity
+        .org_name
+        .clone()
+        .unwrap_or_else(|| short_id(&org_id));
 
     // Get or select application (optional)
     let (app_id, app_name) = if let Some(ref app_str) = args.app {
         let app_id = app_str
             .parse()
-            .map_err(|_| crate::errors::QuomeError::ApiError("Invalid application ID".into()))?;
+            .map_err(|_| crate::errors::QuomeError::Usage("Invalid application ID".into()))?;
 
         let sp = ui::spinner("Fetching application...");
         let app = client.get_app(org_id, app_id).await?;
@@ -127,4 +110,38 @@ pub async fn execute(args: Args) -> Result<()> {
     ui::print_success("Linked", &details_ref);
 
     Ok(())
+}
+
+/// The org a link may target: always the key's own. A `--org` that names a
+/// different org is refused up front instead of failing on the first
+/// resource call with a confusing "no access".
+pub fn link_org(key_org: Uuid, requested: Option<Uuid>) -> Result<Uuid> {
+    match requested {
+        Some(r) if r != key_org => Err(crate::errors::QuomeError::Usage(format!(
+            "This API key belongs to organization {} and cannot act on {}. \
+             Log in with a key from that organization (one org = one key).",
+            key_org, r
+        ))),
+        _ => Ok(key_org),
+    }
+}
+
+fn short_id(id: &Uuid) -> String {
+    let s = id.to_string();
+    format!("org {}", &s[..8])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn link_uses_the_keys_org_and_refuses_another() {
+        let mine = Uuid::from_u128(1);
+        let other = Uuid::from_u128(2);
+        assert_eq!(link_org(mine, None).unwrap(), mine);
+        assert_eq!(link_org(mine, Some(mine)).unwrap(), mine);
+        let err = link_org(mine, Some(other)).unwrap_err().to_string();
+        assert!(err.contains("one org = one key"), "{err}");
+    }
 }

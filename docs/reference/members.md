@@ -1,5 +1,7 @@
 # Members: `members list|invite`
 
+> **Dashboard-only.** This is organization administration. An API key authenticates as an org-scoped service account and can never hold the org-level permission these commands need, so the CLI refuses them up front (`… is organization administration, which an API key cannot do`). Do this in the dashboard: **Settings → Members**. `QUOME_ALLOW_ADMIN_COMMANDS=1` re-enables the commands against a control plane that still resolves keys to a user.
+
 Membership changes happen through **email invites** — there is intentionally no "add user by ID". The invitee accepts from their dashboard (or signs up first) and appears in `members list` once redeemed.
 
 ## `quome members list`
