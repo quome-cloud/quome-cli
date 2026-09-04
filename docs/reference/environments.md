@@ -13,7 +13,7 @@ name). An unresolvable reference errors with a pointer to `quome apps envs`.
 ## `quome apps envs`
 
 ```
-Usage: quome apps envs <COMMAND>
+Usage: quome apps envs [COMMAND]
 
 Commands:
   list     List the app's environments (pipeline order)
@@ -22,6 +22,8 @@ Commands:
   promote  Promote a source environment's exact image to a target environment
   config   Show or edit an environment's build/runtime override keys
 ```
+
+`COMMAND` is optional — a bare `quome apps envs` runs `list`.
 
 ```console
 $ quome apps envs
@@ -148,6 +150,9 @@ quome apps envs config set memory=1Gi cpu=1 --environment staging
 quome apps envs config unset memory --environment staging
 ```
 
+`set`/`unset` honor `--json`, printing `{"changed": [keys...], "environment":
+<name>}` instead of the prose confirmation (same shape as `env-vars set`).
+
 `env_vars` and `sidecar_env_vars` are rejected here — those two keys belong
 to `quome apps env-vars` below, and are elided from `config show`'s output so
 the two commands never fight over the same keys.
@@ -198,7 +203,8 @@ PORT       8080         app
 - With `--environment`: the **effective** deploy-time set — the app's vars
   merged with that environment's overrides, environment wins per key
   (`SOURCE` reads `app` or `env` accordingly). Add `--overrides-only` to see
-  just the environment's own rows instead of the merge.
+  just the environment's own rows instead of the merge. `--overrides-only`
+  requires `--environment` — there's no "overrides" view at app scope.
 - `--container <name>` scopes to one sidecar's env vars instead of the main
   container's.
 - Non-string values (numbers, booleans) render as their JSON text so they're
@@ -217,11 +223,11 @@ Arguments:
   <PAIRS>...  KEY=VALUE pairs
 
 Options:
-      --environment <ENVIRONMENT>
-      --container <CONTAINER>
-      --app <APP>
-      --org <ORG>
-      --json
+      --environment <ENVIRONMENT>  Environment (name or UUID) — write to this environment's overrides instead of the app spec
+      --container <CONTAINER>      Sidecar container name
+      --app <APP>                  Application ID (uses linked app if not provided)
+      --org <ORG>                  Organization ID (uses linked org if not provided)
+      --json                       Output as JSON
 
 Usage: quome apps env-vars unset [OPTIONS] <KEYS>...
 
@@ -229,11 +235,11 @@ Arguments:
   <KEYS>...  Keys to remove
 
 Options:
-      --environment <ENVIRONMENT>
-      --container <CONTAINER>
-      --app <APP>
-      --org <ORG>
-      --json
+      --environment <ENVIRONMENT>  Environment (name or UUID) — remove from this environment's overrides instead of the app spec
+      --container <CONTAINER>      Sidecar container name
+      --app <APP>                  Application ID (uses linked app if not provided)
+      --org <ORG>                  Organization ID (uses linked org if not provided)
+      --json                       Output as JSON
 ```
 
 ```bash
@@ -249,10 +255,18 @@ Updated LOG_LEVEL on environment 'staging' — applies on the next deploy
 ```
 
 Key grammar (checked client-side before any request): `^[A-Za-z_][A-Za-z0-9_]*$`,
-and the platform-reserved `QUOME_` prefix is rejected. `KEY=VALUE` splits on
-the **first** `=`, so values may themselves contain `=`. `unset` of a key
-that isn't set at the given scope is an error naming the scope it looked in
-(app spec, an environment's overrides, or a named sidecar's overrides).
+and the platform-reserved `QUOME_` prefix is rejected on `set` — `unset` only
+checks the grammar, so a grandfathered `QUOME_`-prefixed key that somehow got
+set can still be removed. `KEY=VALUE` splits on the **first** `=`, so values
+may themselves contain `=`. `unset` of a key that isn't set at the given
+scope is an error naming the scope it looked in (app spec, an environment's
+overrides, or a named sidecar's overrides).
+
+A per-environment write with `--container <name>` validates the name against
+the app's actual sidecars first (same error shape as the app-scope write) —
+the backend otherwise merges `config_overrides.sidecar_env_vars` by name and
+silently ignores an unrecognized one, which would look like a successful
+no-op write.
 
 If a key being set matches an existing [binding](apps.md#bindings)'s env var
 name, the CLI prints a warning that the binding may shadow this plain value

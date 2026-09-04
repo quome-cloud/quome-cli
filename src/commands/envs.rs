@@ -143,7 +143,14 @@ pub(crate) fn resolve_context(
     Ok((org_id, app_id))
 }
 
-pub async fn execute(command: EnvsCommands) -> Result<()> {
+pub async fn execute(command: Option<EnvsCommands>) -> Result<()> {
+    // Bare `quome apps envs` defaults to `list` — matching `envs config`'s
+    // existing default-to-`show` pattern below.
+    let command = command.unwrap_or(EnvsCommands::List(EnvListArgs {
+        app: None,
+        org: None,
+        json: false,
+    }));
     match command {
         EnvsCommands::List(args) => list(args).await,
         EnvsCommands::Create(args) => create(args).await,
@@ -392,7 +399,7 @@ async fn config_cmd(args: EnvConfigArgs) -> Result<()> {
                 validate_config_key(key).map_err(QuomeError::Usage)?;
                 patch.insert(key.to_string(), parse_config_value(value));
             }
-            let summary = patch.keys().cloned().collect::<Vec<_>>().join(", ");
+            let changed: Vec<String> = patch.keys().cloned().collect();
             client
                 .update_environment_overrides(
                     org_id,
@@ -401,10 +408,20 @@ async fn config_cmd(args: EnvConfigArgs) -> Result<()> {
                     &serde_json::Value::Object(patch),
                 )
                 .await?;
-            println!(
-                "Set {} on '{}' — applies on the next deploy",
-                summary, env.name
-            );
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "changed": changed, "environment": env.name
+                    }))?
+                );
+            } else {
+                println!(
+                    "Set {} on '{}' — applies on the next deploy",
+                    changed.join(", "),
+                    env.name
+                );
+            }
         }
         EnvConfigAction::Unset { keys } => {
             if keys.is_empty() {
@@ -423,11 +440,20 @@ async fn config_cmd(args: EnvConfigArgs) -> Result<()> {
                     &serde_json::Value::Object(patch),
                 )
                 .await?;
-            println!(
-                "Unset {} on '{}' — applies on the next deploy",
-                keys.join(", "),
-                env.name
-            );
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "changed": keys, "environment": env.name
+                    }))?
+                );
+            } else {
+                println!(
+                    "Unset {} on '{}' — applies on the next deploy",
+                    keys.join(", "),
+                    env.name
+                );
+            }
         }
     }
     Ok(())

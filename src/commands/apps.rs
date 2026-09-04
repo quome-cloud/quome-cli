@@ -26,10 +26,10 @@ pub enum AppsCommands {
     Bind(crate::commands::bindings::BindArgs),
     /// Remove a resource binding
     Unbind(crate::commands::bindings::UnbindArgs),
-    /// Manage app environments
+    /// Manage app environments (bare invocation lists them)
     Envs {
         #[command(subcommand)]
-        command: crate::commands::envs::EnvsCommands,
+        command: Option<crate::commands::envs::EnvsCommands>,
     },
     /// Manage plain env vars (app or environment scope)
     EnvVars {
