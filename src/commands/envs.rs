@@ -1,7 +1,9 @@
+use std::io::IsTerminal;
+
 use clap::{Parser, Subcommand};
 use uuid::Uuid;
 
-use crate::api::models::{AppEnvironment, CreateEnvironmentRequest};
+use crate::api::models::{AppEnvironment, CreateEnvironmentRequest, PromoteEnvironmentRequest};
 use crate::client::QuomeClient;
 use crate::config::Config;
 use crate::errors::{QuomeError, Result};
@@ -15,6 +17,10 @@ pub enum EnvsCommands {
     Create(EnvCreateArgs),
     /// Delete an environment (tears down its deploy target)
     Delete(EnvDeleteArgs),
+    /// Promote a source environment's exact image to a target environment
+    Promote(EnvPromoteArgs),
+    /// Show or edit an environment's build/runtime override keys
+    Config(EnvConfigArgs),
 }
 
 #[derive(Parser)]
@@ -72,6 +78,55 @@ pub struct EnvDeleteArgs {
     json: bool,
 }
 
+#[derive(Parser)]
+pub struct EnvPromoteArgs {
+    /// Target environment (name or UUID)
+    target: String,
+    /// Source environment (name or UUID)
+    #[arg(long = "from")]
+    from: String,
+    /// Gate acknowledgement: the TARGET environment's name (for gated envs / CI)
+    #[arg(long)]
+    gate_ack: Option<String>,
+    /// Application ID (uses linked app if not provided)
+    #[arg(long)]
+    app: Option<Uuid>,
+    /// Organization ID (uses linked org if not provided)
+    #[arg(long)]
+    org: Option<Uuid>,
+    /// Output as JSON
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Parser)]
+pub struct EnvConfigArgs {
+    #[command(subcommand)]
+    action: Option<EnvConfigAction>,
+    /// Environment (name or UUID) — required
+    #[arg(long, global = true)]
+    environment: Option<String>,
+    /// Application ID (uses linked app if not provided)
+    #[arg(long, global = true)]
+    app: Option<Uuid>,
+    /// Organization ID (uses linked org if not provided)
+    #[arg(long, global = true)]
+    org: Option<Uuid>,
+    /// Output as JSON
+    #[arg(long, global = true)]
+    json: bool,
+}
+
+#[derive(Subcommand)]
+pub enum EnvConfigAction {
+    /// Show the environment's override keys (default)
+    Show,
+    /// Set override keys (KEY=VALUE ...)
+    Set { pairs: Vec<String> },
+    /// Remove override keys
+    Unset { keys: Vec<String> },
+}
+
 fn resolve_context(org: Option<Uuid>, app: Option<Uuid>, config: &Config) -> Result<(Uuid, Uuid)> {
     let org_id = match org {
         Some(id) => id,
@@ -89,6 +144,8 @@ pub async fn execute(command: EnvsCommands) -> Result<()> {
         EnvsCommands::List(args) => list(args).await,
         EnvsCommands::Create(args) => create(args).await,
         EnvsCommands::Delete(args) => delete(args).await,
+        EnvsCommands::Promote(args) => promote(args).await,
+        EnvsCommands::Config(args) => config_cmd(args).await,
     }
 }
 
@@ -223,6 +280,184 @@ async fn delete(args: EnvDeleteArgs) -> Result<()> {
     Ok(())
 }
 
+async fn promote(args: EnvPromoteArgs) -> Result<()> {
+    let config = Config::load()?;
+    let token = config.require_token()?;
+    let (org_id, app_id) = resolve_context(args.org, args.app, &config)?;
+    let client = QuomeClient::new(Some(&token), None)?;
+
+    let target = resolve_environment(&client, org_id, app_id, &args.target).await?;
+    let source = resolve_environment(&client, org_id, app_id, &args.from).await?;
+
+    let sp = ui::spinner("Promoting...");
+    let mut result = client
+        .promote_environment(
+            org_id,
+            app_id,
+            target.id,
+            &PromoteEnvironmentRequest {
+                from_environment_id: source.id,
+                gate_ack: args.gate_ack.clone(),
+            },
+        )
+        .await;
+    sp.finish_and_clear();
+
+    // Type-the-name gate: one interactive retry on a TTY.
+    if let Err(QuomeError::ApiError(detail)) = &result {
+        if is_gate_denial(detail) && args.gate_ack.is_none() {
+            if std::io::stdin().is_terminal() {
+                let typed = inquire::Text::new(&format!(
+                    "'{}' is gated. Type the environment name to confirm:",
+                    target.name
+                ))
+                .prompt()
+                .map_err(|_| QuomeError::Usage("cancelled".into()))?;
+                let sp = ui::spinner("Promoting...");
+                result = client
+                    .promote_environment(
+                        org_id,
+                        app_id,
+                        target.id,
+                        &PromoteEnvironmentRequest {
+                            from_environment_id: source.id,
+                            gate_ack: Some(typed),
+                        },
+                    )
+                    .await;
+                sp.finish_and_clear();
+            } else {
+                return Err(QuomeError::Usage(format!(
+                    "{} — pass --gate-ack {}",
+                    detail, target.name
+                )));
+            }
+        }
+    }
+    let env = result?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&env)?);
+    } else {
+        ui::print_success(
+            "Promotion started",
+            &[
+                ("Target", &env.name),
+                ("From", &source.name),
+                (
+                    "Note",
+                    "target deploys the source's exact image digest (no rebuild)",
+                ),
+            ],
+        );
+    }
+    Ok(())
+}
+
+async fn config_cmd(args: EnvConfigArgs) -> Result<()> {
+    let env_ref = args
+        .environment
+        .as_deref()
+        .ok_or_else(|| QuomeError::Usage("--environment is required for envs config".into()))?;
+    let config = Config::load()?;
+    let token = config.require_token()?;
+    let (org_id, app_id) = resolve_context(args.org, args.app, &config)?;
+    let client = QuomeClient::new(Some(&token), None)?;
+    let env = resolve_environment(&client, org_id, app_id, env_ref).await?;
+
+    match args.action.unwrap_or(EnvConfigAction::Show) {
+        EnvConfigAction::Show => {
+            let mut overrides = env.config_overrides.clone();
+            if let Some(map) = overrides.as_object_mut() {
+                map.remove("env_vars");
+                map.remove("sidecar_env_vars");
+            }
+            println!("{}", serde_json::to_string_pretty(&overrides)?);
+        }
+        EnvConfigAction::Set { pairs } => {
+            if pairs.is_empty() {
+                return Err(QuomeError::Usage(
+                    "set requires at least one KEY=VALUE".into(),
+                ));
+            }
+            let mut patch = serde_json::Map::new();
+            for pair in &pairs {
+                let (key, value) = pair
+                    .split_once('=')
+                    .ok_or_else(|| QuomeError::Usage(format!("'{}' is not KEY=VALUE", pair)))?;
+                validate_config_key(key).map_err(QuomeError::Usage)?;
+                patch.insert(key.to_string(), parse_config_value(value));
+            }
+            let summary = patch.keys().cloned().collect::<Vec<_>>().join(", ");
+            client
+                .update_environment_overrides(
+                    org_id,
+                    app_id,
+                    env.id,
+                    &serde_json::Value::Object(patch),
+                )
+                .await?;
+            println!(
+                "Set {} on '{}' — applies on the next deploy",
+                summary, env.name
+            );
+        }
+        EnvConfigAction::Unset { keys } => {
+            if keys.is_empty() {
+                return Err(QuomeError::Usage("unset requires at least one KEY".into()));
+            }
+            let mut patch = serde_json::Map::new();
+            for key in &keys {
+                validate_config_key(key).map_err(QuomeError::Usage)?;
+                patch.insert(key.clone(), serde_json::Value::Null);
+            }
+            client
+                .update_environment_overrides(
+                    org_id,
+                    app_id,
+                    env.id,
+                    &serde_json::Value::Object(patch),
+                )
+                .await?;
+            println!(
+                "Unset {} on '{}' — applies on the next deploy",
+                keys.join(", "),
+                env.name
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Parse a `KEY=VALUE` value into a JSON scalar: numbers and booleans parse
+/// as their JSON type, everything else (including things that merely look
+/// numeric-ish like "1Gi") stays a string.
+fn parse_config_value(raw: &str) -> serde_json::Value {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .filter(|v| v.is_number() || v.is_boolean())
+        .unwrap_or_else(|| serde_json::Value::String(raw.to_string()))
+}
+
+/// `env_vars`/`sidecar_env_vars` are managed by `quome apps env-vars`, not
+/// `envs config` — reject them here so the two commands don't fight over the
+/// same PATCH surface.
+fn validate_config_key(key: &str) -> std::result::Result<(), String> {
+    if key == "env_vars" || key == "sidecar_env_vars" {
+        return Err(format!(
+            "'{}' is managed by `quome apps env-vars`, not `envs config`",
+            key
+        ));
+    }
+    Ok(())
+}
+
+/// Detect the promotion-gate denial so `promote` can retry with an
+/// interactive type-the-name confirmation instead of surfacing a raw 403.
+fn is_gate_denial(detail: &str) -> bool {
+    detail.contains("gated")
+}
+
 /// Pure matcher the resolver delegates to (unit-testable without a client):
 /// exact name match first, then UUID. Env names are slug-validated and
 /// unique per app, so no ambiguity.
@@ -314,5 +549,29 @@ mod tests {
         let envs = vec![env("staging", uuid(ID_A))];
         assert!(match_environment(&envs, "nonexistent").is_none());
         assert!(match_environment(&envs, ID_C).is_none());
+    }
+
+    #[test]
+    fn config_kv_parses_json_scalars() {
+        assert_eq!(parse_config_value("2"), serde_json::json!(2));
+        assert_eq!(parse_config_value("true"), serde_json::json!(true));
+        assert_eq!(parse_config_value("1Gi"), serde_json::json!("1Gi"));
+        assert_eq!(parse_config_value("2.5"), serde_json::json!(2.5));
+    }
+
+    #[test]
+    fn config_rejects_env_var_keys() {
+        for key in ["env_vars", "sidecar_env_vars"] {
+            assert!(validate_config_key(key).is_err());
+        }
+        assert!(validate_config_key("memory").is_ok());
+    }
+
+    #[test]
+    fn gate_detection() {
+        assert!(is_gate_denial(
+            "This environment is gated. Type the environment name ('production') to confirm."
+        ));
+        assert!(!is_gate_denial("Permission denied: update on app"));
     }
 }
