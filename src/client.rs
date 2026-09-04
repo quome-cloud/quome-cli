@@ -4,8 +4,13 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::time::Duration;
 
+use crate::api::models::PaginatedResponse;
 use crate::errors::{QuomeError, Result};
 use crate::settings::Settings;
+
+/// Page size used by `list_all_pages` — matches the `?limit=100` already
+/// hard-coded on the individual list endpoints.
+const LIST_ALL_PAGE_SIZE: i64 = 100;
 
 const USER_AGENT: &str = concat!("quome-cli/", env!("CARGO_PKG_VERSION"));
 
@@ -119,5 +124,34 @@ impl QuomeClient {
     pub async fn delete(&self, path: &str) -> Result<()> {
         let response = self.http.delete(self.url(path)).send().await?;
         self.handle_empty_response(response).await
+    }
+
+    /// Fetch every page of a `PaginatedResponse<T>` list endpoint, following
+    /// `meta.has_more` with `limit`/`offset`. `base_path` must not already
+    /// carry a `limit`/`offset` query param; it may or may not have other
+    /// query params (`?` vs `&` is joined correctly either way).
+    ///
+    /// Page-one-only lookups false-negative in orgs with >100 rows — this is
+    /// the port of the Python CLI's `has_more`-driven loop (`api.py::iter_apps`
+    /// and friends).
+    pub async fn list_all_pages<T: DeserializeOwned>(&self, base_path: &str) -> Result<Vec<T>> {
+        let sep = if base_path.contains('?') { '&' } else { '?' };
+        let mut all = Vec::new();
+        let mut offset: i64 = 0;
+        loop {
+            let path = format!(
+                "{}{}limit={}&offset={}",
+                base_path, sep, LIST_ALL_PAGE_SIZE, offset
+            );
+            let page: PaginatedResponse<T> = self.get(&path).await?;
+            let got = page.data.len();
+            all.extend(page.data);
+            let has_more = page.meta.and_then(|m| m.has_more).unwrap_or(false);
+            if !has_more || got == 0 {
+                break;
+            }
+            offset += got as i64;
+        }
+        Ok(all)
     }
 }

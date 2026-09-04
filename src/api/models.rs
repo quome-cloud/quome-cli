@@ -10,7 +10,6 @@ use uuid::Uuid;
 pub struct PaginatedResponse<T> {
     pub data: Vec<T>,
     #[serde(default)]
-    #[allow(dead_code)]
     pub meta: Option<PaginationMeta>,
 }
 
@@ -26,7 +25,6 @@ pub struct PaginationMeta {
     #[allow(dead_code)]
     pub offset: Option<i64>,
     #[serde(default)]
-    #[allow(dead_code)]
     pub has_more: Option<bool>,
 }
 
@@ -212,6 +210,10 @@ pub enum AppSource {
         repo_name: String,
         branch: String,
     },
+    /// No container, no build step — files live in a per-app GCS bucket.
+    /// `framework` is a hint only (defaults server-side to "plain").
+    #[serde(rename = "static")]
+    Static { framework: String },
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -237,6 +239,34 @@ pub struct UpdateAppRequest {
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub github_branch: Option<String>,
+}
+
+// ============ Static sites ============
+
+#[derive(Debug, Serialize)]
+pub struct StaticManifestFile {
+    pub path: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateStaticDeploymentRequest {
+    pub source_type: &'static str, // always "api"
+    pub files: Vec<StaticManifestFile>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StaticDeploymentSession {
+    pub deployment_id: Uuid,
+    pub upload_urls: HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StaticDeployment {
+    pub id: Uuid,
+    pub status: String,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 // ============ Deployments ============
@@ -434,4 +464,167 @@ pub struct UpdateDatabaseRequest {
     pub storage_gb: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ha_enabled: Option<bool>,
+}
+
+// ── App resource bindings ───────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingResourceType {
+    Secret,
+    Database,
+    Bucket,
+    Cache,
+    // Created by event flows, never by `quome apps bind` — present so list
+    // rows deserialize.
+    EventSubscription,
+}
+
+impl BindingResourceType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Secret => "secret",
+            Self::Database => "database",
+            Self::Bucket => "bucket",
+            Self::Cache => "cache",
+            Self::EventSubscription => "event_subscription",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AppBinding {
+    pub id: Uuid,
+    pub app_id: Uuid,
+    pub resource_type: BindingResourceType,
+    pub resource_id: Uuid,
+    pub env_var_name: String,
+    #[serde(default)]
+    pub container_name: Option<String>,
+    #[serde(default)]
+    pub environment_id: Option<String>,
+    #[serde(default)]
+    pub allow_in_preview: bool,
+    #[serde(default)]
+    pub created_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateBindingRequest {
+    pub resource_type: BindingResourceType,
+    pub resource_id: Uuid,
+    pub env_var_name: String,
+    pub container_name: Option<String>,
+    pub environment_id: Option<String>,
+    pub allow_in_preview: bool,
+}
+
+// ============ Storage buckets ============
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct StorageBucket {
+    pub id: Uuid,
+    pub name: String,
+    pub region: String,
+    pub status: String,
+    pub storage_class: String,
+    #[serde(default)]
+    pub size_bytes: i64,
+    #[serde(default)]
+    pub object_count: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+// ============ Caches ============
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct Cache {
+    pub id: Uuid,
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    pub engine: String,
+    pub engine_version: String,
+    pub status: String,
+    pub tier: String,
+    pub memory_size_gb: i32,
+    #[serde(default)]
+    pub private_ip: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[cfg(test)]
+mod static_site_tests {
+    use super::*;
+
+    #[test]
+    fn static_session_deserializes() {
+        let body = r#"{"deployment_id":"9b2f0a34-1111-2222-3333-444455556666",
+                       "upload_urls":{"index.html":"https://signed"},
+                       "expires_at":"2026-09-04T00:00:00Z"}"#;
+        let s: StaticDeploymentSession = serde_json::from_str(body).unwrap();
+        assert_eq!(s.upload_urls["index.html"], "https://signed");
+    }
+
+    #[test]
+    fn static_deployment_list_page_deserializes() {
+        // The list endpoint's real envelope (confirmed against
+        // `app/api/v1/apps/static_sites.py::list_static_deployments`,
+        // `response_model=PaginatedResponse[StaticDeploymentResponse]`):
+        // `{"data": [...], "meta": {...}}`, not a bare array. Extra
+        // response-only fields (site_id, source_type, ...) are ignored.
+        let body = r#"{
+            "data": [
+                {"id": "9b2f0a34-1111-2222-3333-444455556666", "status": "active", "error": null,
+                 "site_id": "aaaa0a34-1111-2222-3333-444455556666", "source_type": "api"}
+            ],
+            "meta": {"total": 1, "limit": 50, "offset": 0, "has_more": false}
+        }"#;
+        let page: PaginatedResponse<StaticDeployment> = serde_json::from_str(body).unwrap();
+        assert_eq!(page.data.len(), 1);
+        assert_eq!(page.data[0].status, "active");
+    }
+}
+
+#[cfg(test)]
+mod binding_tests {
+    use super::*;
+
+    #[test]
+    fn app_binding_deserializes_api_row() {
+        let row = r#"{
+            "id": "9b2f0a34-1111-2222-3333-444455556666",
+            "app_id": "aaaa0a34-1111-2222-3333-444455556666",
+            "resource_type": "secret",
+            "resource_id": "bbbb0a34-1111-2222-3333-444455556666",
+            "env_var_name": "DATABASE_PASSWORD",
+            "container_name": null,
+            "environment_id": null,
+            "allow_in_preview": false,
+            "created_at": "2026-09-01T00:00:00Z"
+        }"#;
+        let b: AppBinding = serde_json::from_str(row).unwrap();
+        assert_eq!(b.resource_type, BindingResourceType::Secret);
+        assert_eq!(b.env_var_name, "DATABASE_PASSWORD");
+        assert!(b.environment_id.is_none());
+    }
+
+    #[test]
+    fn create_binding_request_serializes_snake_case() {
+        let req = CreateBindingRequest {
+            resource_type: BindingResourceType::Bucket,
+            resource_id: uuid::Uuid::nil(),
+            env_var_name: "ASSETS".into(),
+            container_name: None,
+            environment_id: None,
+            allow_in_preview: true,
+        };
+        let v: serde_json::Value = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["resource_type"], "bucket");
+        assert_eq!(v["allow_in_preview"], true);
+        // None fields serialize as null — the API treats null and absent alike.
+        assert!(v.get("container_name").is_some());
+    }
 }

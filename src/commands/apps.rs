@@ -20,6 +20,12 @@ pub enum AppsCommands {
     Update(UpdateArgs),
     /// Delete an application
     Delete(DeleteArgs),
+    /// List resource bindings (env vars backed by secrets/databases/buckets/caches)
+    Bindings(crate::commands::bindings::BindingsArgs),
+    /// Bind a resource to the app as an env var
+    Bind(crate::commands::bindings::BindArgs),
+    /// Remove a resource binding
+    Unbind(crate::commands::bindings::UnbindArgs),
 }
 
 #[derive(Parser)]
@@ -126,6 +132,9 @@ pub async fn execute(command: AppsCommands) -> Result<()> {
         AppsCommands::Get(args) => get(args).await,
         AppsCommands::Update(args) => update(args).await,
         AppsCommands::Delete(args) => delete(args).await,
+        AppsCommands::Bindings(args) => crate::commands::bindings::list(args).await,
+        AppsCommands::Bind(args) => crate::commands::bindings::bind(args).await,
+        AppsCommands::Unbind(args) => crate::commands::bindings::unbind(args).await,
     }
 }
 

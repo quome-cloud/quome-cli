@@ -149,6 +149,20 @@ pub struct EventRow {
 }
 
 #[derive(Tabled)]
+pub struct BindingRow {
+    #[tabled(rename = "ENV VAR")]
+    pub env_var: String,
+    #[tabled(rename = "TYPE")]
+    pub resource_type: String,
+    #[tabled(rename = "RESOURCE")]
+    pub resource: String,
+    #[tabled(rename = "SCOPE")]
+    pub scope: String,
+    #[tabled(rename = "BINDING ID")]
+    pub id: String,
+}
+
+#[derive(Tabled)]
 pub struct DatabaseRow {
     #[tabled(rename = "ID")]
     pub id: String,

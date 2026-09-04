@@ -19,6 +19,7 @@ Every command, every flag. All examples assume you've [logged in](../getting-sta
 | [Members](members.md) | `members list`, `members invite` |
 | [Keys](keys.md) | `keys list`, `keys create`, `keys delete` |
 | [Apps](apps.md) | `apps list`, `apps create`, `apps get`, `apps update`, `apps delete` |
+| [Deploy](deploy.md) | `deploy` |
 | [Deployments](deployments.md) | `deployments list`, `deployments get`, `deployments create` |
 | [Logs](logs.md) | `logs` |
 | [Secrets](secrets.md) | `secrets list`, `secrets set`, `secrets get`, `secrets delete` |
