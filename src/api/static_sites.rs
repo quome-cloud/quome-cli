@@ -16,7 +16,7 @@ impl QuomeClient {
     ) -> Result<serde_json::Value> {
         self.post(
             &format!("/api/v1/orgs/{}/apps/{}/static/sites", org_id, app_id),
-            &serde_json::json!({}),
+            &serde_json::json!({"framework": "plain"}),
         )
         .await
     }

@@ -40,7 +40,7 @@ pub struct DeployArgs {
 
 pub async fn execute(args: DeployArgs) -> Result<()> {
     let entries = build_manifest(&args.directory.canonicalize().map_err(|_| {
-        QuomeError::ApiError(format!("directory not found: {}", args.directory.display()))
+        QuomeError::Usage(format!("directory not found: {}", args.directory.display()))
     })?)?;
 
     let config = Config::load()?;
@@ -107,11 +107,11 @@ pub async fn execute(args: DeployArgs) -> Result<()> {
     if args.json {
         println!(
             "{}",
-            serde_json::json!({
+            serde_json::to_string_pretty(&serde_json::json!({
                 "deployment_id": session.deployment_id,
                 "status": row.status,
                 "url": url,
-            })
+            }))?
         );
     } else {
         match url {
@@ -137,9 +137,11 @@ async fn resolve_app(
     if let Ok(id) = Uuid::parse_str(app_ref) {
         return Ok((id, app_ref.clone()));
     }
-    let apps = client.list_apps(org_id).await?;
+    // Paginate in full — page-one-only false-negatives past 100 apps.
+    let apps = client
+        .list_all_pages::<crate::api::models::App>(&format!("/api/v1/orgs/{}/apps", org_id))
+        .await?;
     if let Some(app) = apps
-        .data
         .iter()
         .find(|a| a.slug.as_deref() == Some(app_ref.as_str()))
     {
@@ -150,7 +152,7 @@ async fn resolve_app(
         let app = client.create_static_app(org_id, app_ref).await?;
         return Ok((app.id, app_ref.clone()));
     }
-    let slugs: Vec<String> = apps.data.iter().filter_map(|a| a.slug.clone()).collect();
+    let slugs: Vec<String> = apps.iter().filter_map(|a| a.slug.clone()).collect();
     Err(QuomeError::NotFound(format!(
         "no app with slug or id '{}'. Existing: {}. Pass --create to create it.",
         app_ref,

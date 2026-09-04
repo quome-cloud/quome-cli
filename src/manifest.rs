@@ -54,19 +54,43 @@ pub fn build_manifest(root: &Path) -> Result<Vec<ManifestEntry>> {
     let mut entries = Vec::new();
     walk(root, root, &mut entries)?;
     if entries.len() > MAX_FILES {
-        return Err(QuomeError::ApiError(format!(
+        return Err(QuomeError::Usage(format!(
             "{} files exceeds the {} file limit",
             entries.len(),
             MAX_FILES
         )));
     }
     if !entries.iter().any(|e| e.path == "index.html") {
-        return Err(QuomeError::ApiError(
-            "no index.html at the site root — deploy your build output directory".into(),
-        ));
+        return Err(QuomeError::Usage(format!(
+            "no index.html at the site root — deploy your build output directory{}",
+            nested_index_hint(root, &entries)
+        )));
     }
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(entries)
+}
+
+/// When there's no root `index.html` but exactly one first-level subdirectory
+/// has one, point at it — the Python original did this by finding the
+/// shallowest nested `index.html` anywhere in the tree; this mirrors the
+/// common case (a single build-output subdir) without over-guessing when
+/// several subdirs qualify.
+fn nested_index_hint(root: &Path, entries: &[ManifestEntry]) -> String {
+    let mut candidates: Vec<&str> = entries
+        .iter()
+        .filter_map(|e| e.path.strip_suffix("/index.html"))
+        .filter(|dir| !dir.contains('/'))
+        .collect();
+    candidates.sort_unstable();
+    candidates.dedup();
+    match candidates.as_slice() {
+        [dir] => format!(
+            " — did you mean to deploy {}/? (e.g. `quome deploy {}`)",
+            dir,
+            root.join(dir).display()
+        ),
+        _ => String::new(),
+    }
 }
 
 fn walk(root: &Path, dir: &Path, out: &mut Vec<ManifestEntry>) -> Result<()> {
@@ -77,13 +101,29 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<ManifestEntry>) -> Result<()> {
             continue;
         }
         let path = entry.path();
-        let meta = entry.metadata()?;
-        if meta.is_dir() {
+        // DirEntry::metadata() does NOT follow symlinks (unlike fs::metadata),
+        // so a symlinked directory correctly reads as a symlink here — walking
+        // into it would risk a cycle. A symlinked FILE, however, should behave
+        // like the Python original (which used Path.rglob + is_file, both of
+        // which follow symlinks): read it with fs::metadata so it's included.
+        let entry_meta = entry.metadata()?;
+        if entry_meta.is_dir() {
             if SKIP_DIRS.contains(&name.as_str()) {
                 continue;
             }
             walk(root, &path, out)?;
-        } else if meta.is_file() {
+            continue;
+        }
+        let meta = if entry_meta.is_symlink() {
+            match std::fs::metadata(&path) {
+                Ok(m) => m,
+                // Broken symlink — nothing to upload.
+                Err(_) => continue,
+            }
+        } else {
+            entry_meta
+        };
+        if meta.is_file() {
             let rel = path
                 .strip_prefix(root)
                 .expect("walk stays under root")
@@ -149,5 +189,34 @@ mod tests {
         assert_eq!(content_type_for("f.woff2"), "font/woff2");
         assert_eq!(content_type_for("x.html"), "text/html");
         assert_eq!(content_type_for("unknown.zzz"), "application/octet-stream");
+    }
+
+    #[test]
+    fn suggests_the_nested_index_when_exactly_one_subdir_has_one() {
+        let dir = site(&["dist/index.html", "dist/assets/app.js"]);
+        let err = build_manifest(dir.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("did you mean to deploy dist/?"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn no_hint_when_multiple_subdirs_have_index_html() {
+        let dir = site(&["dist/index.html", "build/index.html"]);
+        let err = build_manifest(dir.path()).unwrap_err();
+        assert!(!err.to_string().contains("did you mean"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn follows_symlinked_files() {
+        let dir = site(&["index.html", "real.txt"]);
+        std::os::unix::fs::symlink(dir.path().join("real.txt"), dir.path().join("alias.txt"))
+            .unwrap();
+        let entries = build_manifest(dir.path()).unwrap();
+        let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+        assert!(paths.contains(&"real.txt"), "{paths:?}");
+        assert!(paths.contains(&"alias.txt"), "symlink dropped: {paths:?}");
     }
 }
