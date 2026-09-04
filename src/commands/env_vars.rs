@@ -13,7 +13,10 @@ use crate::ui::{self, EnvVarRow};
 
 const RESERVED_PREFIX: &str = "QUOME_";
 
-pub fn validate_key(key: &str) -> std::result::Result<(), String> {
+/// Grammar-only check ([A-Za-z_][A-Za-z0-9_]*), no reserved-prefix rejection.
+/// `unset` uses this alone — a grandfathered `QUOME_`-prefixed key that
+/// somehow got set must still be removable.
+fn validate_key_grammar(key: &str) -> std::result::Result<(), String> {
     let mut chars = key.chars();
     let head_ok = matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_');
     let tail_ok = chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
@@ -23,6 +26,11 @@ pub fn validate_key(key: &str) -> std::result::Result<(), String> {
             key
         ));
     }
+    Ok(())
+}
+
+pub fn validate_key(key: &str) -> std::result::Result<(), String> {
+    validate_key_grammar(key)?;
     if key.starts_with(RESERVED_PREFIX) {
         return Err(format!(
             "'{}' uses the platform-reserved {} prefix",
@@ -42,6 +50,37 @@ pub fn parse_pairs(raw: &[String]) -> Result<Vec<(String, String)>> {
             Ok((k.to_string(), v.to_string()))
         })
         .collect()
+}
+
+/// Sidecar container names declared on an app spec, in spec order. Empty if
+/// the spec has no `sidecars` array at all.
+pub fn sidecar_names(spec: &serde_json::Value) -> Vec<String> {
+    spec.get("sidecars")
+        .and_then(|s| s.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|s| s["name"].as_str().map(String::from))
+        .collect()
+}
+
+/// Validate a sidecar name against a spec, erroring with the same message
+/// shape whether the caller is about to mutate the spec in place
+/// (`mutate_spec_env_vars`) or just needs a pre-flight check before a
+/// per-env `config_overrides` write (`write_vars`).
+fn check_sidecar_exists(spec: &serde_json::Value, name: &str) -> Result<()> {
+    if spec.get("sidecars").and_then(|s| s.as_array()).is_none() {
+        return Err(QuomeError::Usage("this app has no sidecars".into()));
+    }
+    let known = sidecar_names(spec);
+    if known.iter().any(|n| n == name) {
+        Ok(())
+    } else {
+        Err(QuomeError::Usage(format!(
+            "no sidecar '{}' — this app has: {}",
+            name,
+            known.join(", ")
+        )))
+    }
 }
 
 /// Mutate ONLY the env-var map at the requested scope inside an opaque spec.
@@ -66,24 +105,15 @@ pub fn mutate_spec_env_vars(
     let map_slot: &mut serde_json::Value = match container {
         None => &mut spec["env_vars"],
         Some(name) => {
+            check_sidecar_exists(spec, name)?;
             let sidecars = spec
                 .get_mut("sidecars")
                 .and_then(|s| s.as_array_mut())
-                .ok_or_else(|| QuomeError::Usage("this app has no sidecars".into()))?;
-            let known: Vec<String> = sidecars
-                .iter()
-                .filter_map(|s| s["name"].as_str().map(String::from))
-                .collect();
+                .expect("check_sidecar_exists verified this array exists");
             let sc = sidecars
                 .iter_mut()
                 .find(|s| s["name"].as_str() == Some(name))
-                .ok_or_else(|| {
-                    QuomeError::Usage(format!(
-                        "no sidecar '{}' — this app has: {}",
-                        name,
-                        known.join(", ")
-                    ))
-                })?;
+                .expect("check_sidecar_exists verified this name is present");
             &mut sc["env_vars"]
         }
     };
@@ -223,8 +253,10 @@ pub enum EnvVarsCommands {
 
 #[derive(Parser)]
 pub struct EnvVarsListArgs {
+    /// Application ID (uses linked app if not provided)
     #[arg(long)]
     app: Option<Uuid>,
+    /// Organization ID (uses linked org if not provided)
     #[arg(long)]
     org: Option<Uuid>,
     /// Environment (name or UUID) — shows the effective merged set
@@ -234,8 +266,9 @@ pub struct EnvVarsListArgs {
     #[arg(long)]
     container: Option<String>,
     /// With --environment: show only the environment's own overrides
-    #[arg(long)]
+    #[arg(long, requires = "environment")]
     overrides_only: bool,
+    /// Output as JSON
     #[arg(long)]
     json: bool,
 }
@@ -245,14 +278,20 @@ pub struct EnvVarsSetArgs {
     /// KEY=VALUE pairs
     #[arg(required = true)]
     pairs: Vec<String>,
+    /// Environment (name or UUID) — write to this environment's overrides
+    /// instead of the app spec
     #[arg(long)]
     environment: Option<String>,
+    /// Sidecar container name
     #[arg(long)]
     container: Option<String>,
+    /// Application ID (uses linked app if not provided)
     #[arg(long)]
     app: Option<Uuid>,
+    /// Organization ID (uses linked org if not provided)
     #[arg(long)]
     org: Option<Uuid>,
+    /// Output as JSON
     #[arg(long)]
     json: bool,
 }
@@ -262,14 +301,20 @@ pub struct EnvVarsUnsetArgs {
     /// Keys to remove
     #[arg(required = true)]
     keys: Vec<String>,
+    /// Environment (name or UUID) — remove from this environment's overrides
+    /// instead of the app spec
     #[arg(long)]
     environment: Option<String>,
+    /// Sidecar container name
     #[arg(long)]
     container: Option<String>,
+    /// Application ID (uses linked app if not provided)
     #[arg(long)]
     app: Option<Uuid>,
+    /// Organization ID (uses linked org if not provided)
     #[arg(long)]
     org: Option<Uuid>,
+    /// Output as JSON
     #[arg(long)]
     json: bool,
 }
@@ -380,8 +425,10 @@ pub async fn set(args: EnvVarsSetArgs) -> Result<()> {
 }
 
 pub async fn unset(args: EnvVarsUnsetArgs) -> Result<()> {
+    // Grammar only, not the reserved-prefix rejection: a grandfathered
+    // QUOME_-prefixed key that somehow got set must still be removable.
     for k in &args.keys {
-        validate_key(k).map_err(QuomeError::Usage)?;
+        validate_key_grammar(k).map_err(QuomeError::Usage)?;
     }
     write_vars(
         args.org,
@@ -443,6 +490,14 @@ async fn write_vars(
         Some(env_ref) => {
             let env = crate::commands::envs::resolve_environment(&client, org_id, app_id, env_ref)
                 .await?;
+            // The backend merges config_overrides.sidecar_env_vars by name and
+            // silently ignores any name it doesn't recognize, so an unknown
+            // --container here would otherwise report success while writing a
+            // dead override. Validate against the app's actual sidecars first.
+            if let Some(name) = container.as_deref() {
+                let app_raw = fetch_app_raw(&client, org_id, app_id).await?;
+                check_sidecar_exists(&app_raw["spec"], name)?;
+            }
             let sp = ui::spinner("Updating environment overrides...");
             let (key, value) =
                 merged_overrides_map(&env.config_overrides, container.as_deref(), &set, &unset)?;
@@ -507,6 +562,41 @@ mod tests {
         assert!(validate_key("1BAD").is_err());
         assert!(validate_key("BAD-DASH").is_err());
         assert!(validate_key("QUOME_RESERVED").is_err());
+    }
+
+    #[test]
+    fn grammar_only_check_allows_reserved_prefix() {
+        // unset uses the grammar-only check so a grandfathered QUOME_-prefixed
+        // key can still be removed, unlike set's full validate_key.
+        assert!(validate_key_grammar("QUOME_LEGACY").is_ok());
+        assert!(validate_key("QUOME_LEGACY").is_err());
+        assert!(validate_key_grammar("1BAD").is_err());
+        assert!(validate_key_grammar("BAD-DASH").is_err());
+    }
+
+    #[test]
+    fn sidecar_names_lists_known_containers() {
+        assert_eq!(
+            sidecar_names(&spec_fixture()),
+            vec!["worker".to_string(), "cache-warm".to_string()]
+        );
+        assert_eq!(
+            sidecar_names(&json!({"env_vars": {}})),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn check_sidecar_exists_errors_on_unknown_name() {
+        let spec = spec_fixture();
+        assert!(check_sidecar_exists(&spec, "worker").is_ok());
+        let err = check_sidecar_exists(&spec, "nope").unwrap_err();
+        assert!(err.to_string().contains("worker"), "{err}");
+        assert!(err.to_string().contains("cache-warm"), "{err}");
+
+        let no_sidecars = json!({"env_vars": {}});
+        let err = check_sidecar_exists(&no_sidecars, "anything").unwrap_err();
+        assert!(err.to_string().contains("no sidecars"), "{err}");
     }
 
     #[test]
