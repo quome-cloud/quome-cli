@@ -163,6 +163,24 @@ pub struct BindingRow {
 }
 
 #[derive(Tabled)]
+pub struct EnvRow {
+    #[tabled(rename = "NAME")]
+    pub name: String,
+    #[tabled(rename = "SLUG")]
+    pub slug: String,
+    #[tabled(rename = "DEFAULT")]
+    pub default: String,
+    #[tabled(rename = "BRANCH")]
+    pub branch: String,
+    #[tabled(rename = "AUTO")]
+    pub auto: String,
+    #[tabled(rename = "STATUS")]
+    pub status: String,
+    #[tabled(rename = "ID")]
+    pub id: String,
+}
+
+#[derive(Tabled)]
 pub struct DatabaseRow {
     #[tabled(rename = "ID")]
     pub id: String,

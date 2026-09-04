@@ -131,6 +131,34 @@ $ quome apps delete 7c9e6679-7425-40de-944b-e07fc1f90ae7
 
 Deletion tears down the app's infrastructure asynchronously — the app shows `deleting` until it's gone.
 
+## Environments
+
+`quome apps envs` manages an app's pipeline environments (e.g. dev/staging/prod). Apps that never opted into multiple environments have none — commands that take an environment reference (`--environment`, `envs delete <env>`, `envs create --copy-vars-from <env>`) accept either the environment's name or its UUID, resolved name-first.
+
+```
+Usage: quome apps envs <COMMAND>
+
+Commands:
+  list    List the app's environments (pipeline order)
+  create  Create an environment
+  delete  Delete an environment (tears down its deploy target)
+```
+
+```console
+$ quome apps envs
+NAME     SLUG     DEFAULT  BRANCH   AUTO  STATUS  ID
+prod     prod     yes      main     yes   active  9b2f0a34-...
+staging  staging           staging  yes   active  3c1d2e4f-...
+```
+
+```bash
+quome apps envs create staging --branch staging
+quome apps envs create qa --branch qa --copy-vars-from staging --no-auto-deploy
+quome apps envs delete staging
+```
+
+`envs create --copy-vars-from <name|UUID>` copies that environment's plain env vars (not secrets/bindings) into the new one. `envs delete` refuses the app's default environment, and prompts for confirmation unless `--force` is given — deletion tears down the environment's deploy target and any dedicated resources provisioned for it.
+
 ## Bindings
 
 A binding injects a secret, database, storage bucket, or cache into the app as an environment variable. Bindings are managed with `quome apps bind` / `quome apps bindings` / `quome apps unbind`, and are **org-admin gated** server-side on top of ordinary app permissions — an API key without org-admin gets a 403 with the hint "(managing bindings requires org admin)".
@@ -148,7 +176,7 @@ Options:
       --cache <CACHE>              Cache to bind (name or UUID)
       --app <APP>                  Application ID (uses linked app if not provided)
       --org <ORG>                  Organization ID (uses linked org if not provided)
-      --environment <ENVIRONMENT>  Bind only for one app environment (environment UUID)
+      --environment <ENVIRONMENT>  Bind only for one app environment (name or UUID)
       --preview                    Also inject into PR preview deploys (app-level bindings only)
       --container <CONTAINER>      Target container for multi-container apps
       --json                       Output as JSON
@@ -170,7 +198,7 @@ $ quome apps bind --env-var DATABASE_PASSWORD --secret prod-db-password
 
 By default a binding applies to the app everywhere. Two scope flags narrow that, and are themselves mutually exclusive:
 
-- `--environment <ID>` scopes the binding to one app environment (dev/staging/prod) — it never injects into other environments or into PR previews.
+- `--environment <NAME|ID>` scopes the binding to one app environment (dev/staging/prod) — it never injects into other environments or into PR previews.
 - `--preview` additionally injects the (app-level) binding into PR preview deploys. It can't be combined with `--environment`, since environment-scoped overrides are never injected into previews.
 
 ### `quome apps bindings`
@@ -206,7 +234,7 @@ Arguments:
 
 Options:
       --env-var <ENV_VAR>          Resolve the binding by env var name instead of ID
-      --environment <ENVIRONMENT>  Disambiguate --env-var to one environment's binding
+      --environment <ENVIRONMENT>  Disambiguate --env-var to one environment's binding (name or UUID)
       --app <APP>                  Application ID (uses linked app if not provided)
       --org <ORG>                  Organization ID (uses linked org if not provided)
   -f, --force                      Skip confirmation prompt

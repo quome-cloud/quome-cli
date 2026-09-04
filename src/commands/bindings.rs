@@ -110,9 +110,9 @@ pub struct BindArgs {
     /// Organization ID (uses linked org if not provided)
     #[arg(long)]
     org: Option<Uuid>,
-    /// Bind only for one app environment (environment UUID)
+    /// Bind only for one app environment (name or UUID)
     #[arg(long)]
-    environment: Option<Uuid>,
+    environment: Option<String>,
     /// Also inject into PR preview deploys (app-level bindings only)
     #[arg(long)]
     preview: bool,
@@ -131,9 +131,9 @@ pub struct UnbindArgs {
     /// Resolve the binding by env var name instead of ID
     #[arg(long, conflicts_with = "binding_id")]
     env_var: Option<String>,
-    /// Disambiguate --env-var to one environment's binding
+    /// Disambiguate --env-var to one environment's binding (name or UUID)
     #[arg(long)]
-    environment: Option<Uuid>,
+    environment: Option<String>,
     /// Application ID (uses linked app if not provided)
     #[arg(long)]
     app: Option<Uuid>,
@@ -416,6 +416,15 @@ pub async fn bind(args: BindArgs) -> Result<()> {
         resolve_resource(&client, org_id, resource_type, raw).await?;
     sp.finish_and_clear();
 
+    let environment_id = match &args.environment {
+        Some(env_ref) => Some(
+            crate::commands::envs::resolve_environment(&client, org_id, app_id, env_ref)
+                .await?
+                .id,
+        ),
+        None => None,
+    };
+
     let sp = ui::spinner("Creating binding...");
     let binding = client
         .create_binding(
@@ -426,7 +435,7 @@ pub async fn bind(args: BindArgs) -> Result<()> {
                 resource_id,
                 env_var_name: args.env_var.clone(),
                 container_name: args.container.clone(),
-                environment_id: args.environment.map(|e| e.to_string()),
+                environment_id: environment_id.map(|e| e.to_string()),
                 allow_in_preview: args.preview,
             },
         )
@@ -467,7 +476,15 @@ pub async fn unbind(args: UnbindArgs) -> Result<()> {
         }
         (None, Some(name)) => {
             let all = client.list_bindings(org_id, app_id).await?;
-            let env = args.environment.map(|e| e.to_string());
+            let env = match &args.environment {
+                Some(env_ref) => Some(
+                    crate::commands::envs::resolve_environment(&client, org_id, app_id, env_ref)
+                        .await?
+                        .id
+                        .to_string(),
+                ),
+                None => None,
+            };
             let matches: Vec<AppBinding> = all
                 .into_iter()
                 .filter(|b| &b.env_var_name == name && b.environment_id == env)

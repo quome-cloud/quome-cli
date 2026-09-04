@@ -26,6 +26,11 @@ pub enum AppsCommands {
     Bind(crate::commands::bindings::BindArgs),
     /// Remove a resource binding
     Unbind(crate::commands::bindings::UnbindArgs),
+    /// Manage app environments
+    Envs {
+        #[command(subcommand)]
+        command: crate::commands::envs::EnvsCommands,
+    },
 }
 
 #[derive(Parser)]
@@ -135,6 +140,7 @@ pub async fn execute(command: AppsCommands) -> Result<()> {
         AppsCommands::Bindings(args) => crate::commands::bindings::list(args).await,
         AppsCommands::Bind(args) => crate::commands::bindings::bind(args).await,
         AppsCommands::Unbind(args) => crate::commands::bindings::unbind(args).await,
+        AppsCommands::Envs { command } => crate::commands::envs::execute(command).await,
     }
 }
 
