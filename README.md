@@ -49,9 +49,8 @@ cargo build --release   # binary at ./target/release/quome
 ## 60-second quickstart
 
 ```bash
-# 1. Authenticate with an API key (qk_...) from the dashboard:
-#    Settings → API Keys → Create key → Full access
-quome login          # or: pbpaste | quome login
+# 1. Authenticate — approve a key in your browser, nothing to paste
+quome login --browser   # or paste one: quome login  /  pbpaste | quome login
 
 # 2. (Optional) link this directory to an app — the key already names
 #    your organization; linking adds the app so `logs` needs no flags

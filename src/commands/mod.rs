@@ -6,6 +6,7 @@ pub mod host;
 pub mod keys;
 pub mod link;
 pub mod login;
+pub mod login_browser;
 pub mod logout;
 pub mod logs;
 pub mod members;

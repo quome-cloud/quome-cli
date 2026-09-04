@@ -37,6 +37,8 @@ More detail (scopes, what a key can and can't do, CI keys): [Authentication](aut
 
 ## 3. Log in
 
+The quickest way: `quome login --browser` — approve the key in the dashboard and it arrives in the terminal, nothing to copy. Or paste one:
+
 ```console
 $ quome login
 ? API key: ************************************
