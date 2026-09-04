@@ -555,6 +555,48 @@ pub struct Cache {
     pub updated_at: DateTime<Utc>,
 }
 
+// ── App environments ─────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AppEnvironment {
+    pub id: Uuid,
+    pub name: String,
+    pub slug: String,
+    pub is_default: bool,
+    #[serde(default)]
+    pub deploy_branch: Option<String>,
+    pub auto_deploy: bool,
+    pub status: String,
+    #[serde(default)]
+    pub sort_order: i64,
+    #[serde(default = "default_promotion_gate")]
+    pub promotion_gate: String,
+    #[serde(default)]
+    pub config_overrides: serde_json::Value,
+}
+
+fn default_promotion_gate() -> String {
+    "none".to_string()
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateEnvironmentRequest {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deploy_branch: Option<String>,
+    pub auto_deploy: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub copy_vars_from_environment_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[allow(dead_code)]
+pub struct PromoteEnvironmentRequest {
+    pub from_environment_id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gate_ack: Option<String>,
+}
+
 #[cfg(test)]
 mod static_site_tests {
     use super::*;
@@ -626,5 +668,43 @@ mod binding_tests {
         assert_eq!(v["allow_in_preview"], true);
         // None fields serialize as null — the API treats null and absent alike.
         assert!(v.get("container_name").is_some());
+    }
+}
+
+#[cfg(test)]
+mod environment_tests {
+    use super::*;
+
+    #[test]
+    fn app_environment_deserializes_api_row() {
+        let row = r#"{
+            "id": "9b2f0a34-1111-2222-3333-444455556666",
+            "app_id": "aaaa0a34-1111-2222-3333-444455556666",
+            "organization_id": "bbbb0a34-1111-2222-3333-444455556666",
+            "name": "staging", "slug": "staging", "is_default": false,
+            "kind": "persistent", "deploy_branch": "staging",
+            "auto_deploy": true, "status": "active", "sort_order": 2,
+            "promotion_gate": "confirm", "color": "blue",
+            "config_overrides": {"env_vars": {"A": "1"}, "memory": "1Gi"},
+            "primary_url": null, "current_deployment_id": null,
+            "last_deployed_at": null, "created_at": "2026-09-01T00:00:00Z"
+        }"#;
+        let e: AppEnvironment = serde_json::from_str(row).unwrap();
+        assert_eq!(e.name, "staging");
+        assert_eq!(e.promotion_gate, "confirm");
+        assert_eq!(e.config_overrides["env_vars"]["A"], "1");
+    }
+
+    #[test]
+    fn create_environment_request_serializes() {
+        let req = CreateEnvironmentRequest {
+            name: "staging".into(),
+            deploy_branch: Some("staging".into()),
+            auto_deploy: true,
+            copy_vars_from_environment_id: None,
+        };
+        let v: serde_json::Value = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["name"], "staging");
+        assert_eq!(v["auto_deploy"], true);
     }
 }

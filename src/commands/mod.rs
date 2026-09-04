@@ -3,6 +3,7 @@ pub mod bindings;
 pub mod databases;
 pub mod deploy;
 pub mod deployments;
+pub mod envs;
 pub mod events;
 pub mod host;
 pub mod keys;

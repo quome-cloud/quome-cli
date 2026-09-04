@@ -121,6 +121,16 @@ impl QuomeClient {
         self.handle_response(response).await
     }
 
+    #[allow(dead_code)]
+    pub async fn patch<T: DeserializeOwned, B: Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
+        let response = self.http.patch(self.url(path)).json(body).send().await?;
+        self.handle_response(response).await
+    }
+
     pub async fn delete(&self, path: &str) -> Result<()> {
         let response = self.http.delete(self.url(path)).send().await?;
         self.handle_empty_response(response).await
