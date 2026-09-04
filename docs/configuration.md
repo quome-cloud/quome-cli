@@ -12,8 +12,10 @@ Written by `quome login` and `quome link`. Holds your token and per-directory li
 {
   "user": {
     "token": "qk_...",
-    "id": "a1b2c3d4-...",
-    "email": "you@example.com"
+    "org_id": "0d9f...",
+    "org_name": "acme",
+    "service_account_id": "9c1e...",
+    "scopes": ["*"]
   },
   "linked": {
     "/Users/jane/projects/my-api": {
@@ -50,12 +52,13 @@ Optional. Overrides the API endpoint. Looked up in this order:
 | `QUOME_APP` | Application UUID; overrides the linked app |
 | `QUOME_API_URL` | API base URL; overrides settings files and the default |
 | `QUOME_DEBUG` | Set to anything to print raw API responses to stderr |
+| `QUOME_ALLOW_ADMIN_COMMANDS` | `1` re-enables `orgs`/`members`/`keys`/`events` against a control plane that still resolves keys to a user (see [Authentication](authentication.md#what-a-key-cannot-do)) |
 
 ## Precedence (highest first)
 
 | Setting | Order |
 |---------|-------|
-| Organization | `--org` flag → `QUOME_ORG` → linked directory |
+| Organization | `--org` flag → `QUOME_ORG` → linked directory → the key's own org |
 | Application | `--app` flag → `QUOME_APP` → linked directory |
 | Token | `QUOME_TOKEN` → `~/.quome/config.json` |
 | API URL | `QUOME_API_URL` → `./settings.json` → `~/.quome/settings.json` → `https://quome.studio` |

@@ -49,11 +49,12 @@ cargo build --release   # binary at ./target/release/quome
 ## 60-second quickstart
 
 ```bash
-# 1. Authenticate with an API key (qk_...) from the Quome dashboard
-quome login
+# 1. Authenticate with an API key (qk_...) from the dashboard:
+#    Settings → API Keys → Create key → Full access
+quome login          # or: pbpaste | quome login
 
-# 2. Link this directory to your organization and app — every command
-#    after this knows your context, no flags needed
+# 2. (Optional) link this directory to an app — the key already names
+#    your organization; linking adds the app so `logs` needs no flags
 quome link
 
 # 3. Ship something
@@ -77,17 +78,17 @@ Full walkthrough with expected output: **[Getting started](docs/getting-started.
 
 | Command | What it does | Docs |
 |---------|--------------|------|
-| `quome login` / `logout` / `whoami` | Authenticate with your API key | [Session](docs/reference/session.md) |
+| `quome login` / `logout` / `whoami` | Authenticate with an org API key (prompt, pipe, file, or env) | [Session](docs/reference/session.md) |
 | `quome link` / `unlink` | Bind the current directory to an org + app | [Link](docs/reference/link.md) |
 | `quome apps …` | Create, inspect, update, delete applications | [Apps](docs/reference/apps.md) |
 | `quome deployments …` | Trigger and inspect deployments | [Deployments](docs/reference/deployments.md) |
 | `quome logs` | View application logs by revision | [Logs](docs/reference/logs.md) |
 | `quome secrets …` | Manage encrypted secrets | [Secrets](docs/reference/secrets.md) |
 | `quome db …` | Managed Postgres (DBaaS) | [Databases](docs/reference/databases.md) |
-| `quome orgs …` | Organizations | [Orgs](docs/reference/orgs.md) |
-| `quome members …` | Members and invites | [Members](docs/reference/members.md) |
-| `quome keys …` | API keys | [Keys](docs/reference/keys.md) |
-| `quome events` | Organization audit trail | [Events](docs/reference/events.md) |
+| `quome orgs …` | Organizations (dashboard-only for API keys) | [Orgs](docs/reference/orgs.md) |
+| `quome members …` | Members and invites (dashboard-only for API keys) | [Members](docs/reference/members.md) |
+| `quome keys …` | API keys (dashboard-only for API keys) | [Keys](docs/reference/keys.md) |
+| `quome events` | Organization audit trail (dashboard-only for API keys) | [Events](docs/reference/events.md) |
 | `quome host …` | Run a sandbox host on your own computer | [Host](docs/reference/host.md) |
 | `quome upgrade` | Self-update via Homebrew | [Upgrade](docs/reference/upgrade.md) |
 
@@ -96,7 +97,7 @@ Full walkthrough with expected output: **[Getting started](docs/getting-started.
 **Guides**
 
 - [Getting started](docs/getting-started.md) — install → login → link → first deploy, end to end
-- [Authentication](docs/authentication.md) — API keys, scopes, CI tokens
+- [Authentication](docs/authentication.md) — API keys, service accounts, scopes, what a key can't do, CI tokens
 - [Configuration](docs/configuration.md) — config files, env vars, precedence
 - [Troubleshooting](docs/troubleshooting.md) — every error message, decoded
 

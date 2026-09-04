@@ -47,6 +47,23 @@ pub struct User {
     pub updated_at: DateTime<Utc>,
 }
 
+/// `GET /api/v1/api-keys/self` — what the presented API key resolves to.
+/// This is the only identity endpoint an API key can call: keys authenticate
+/// as an org-scoped service account, never as a user (the platform removed
+/// the "key acts as the org owner" path in 2026-08). `org_name` / `org_slug`
+/// are served by newer control planes only.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ApiKeySelf {
+    pub org_id: Uuid,
+    pub service_account_id: Uuid,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    #[serde(default)]
+    pub org_name: Option<String>,
+    #[serde(default)]
+    pub org_slug: Option<String>,
+}
+
 // ============ Organizations ============
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

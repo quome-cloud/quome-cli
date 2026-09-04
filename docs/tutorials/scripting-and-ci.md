@@ -14,11 +14,7 @@ export QUOME_APP=7c9e...    # instead of `quome link` (app-scoped commands)
 
 Precedence is `flag → env → linked directory`, so env vars in CI never fight with a developer's local links. Full table: [Configuration](../configuration.md).
 
-Use a dedicated key for CI — scoped and expiring:
-
-```bash
-quome keys create github-actions --scopes "write:app read:secret" --expires-days 90
-```
+Use a dedicated key for CI — scoped and expiring. Keys are minted on the dashboard (**Settings → API Keys → Create key → Choose permissions**), not from the CLI: a key can't mint other keys. `QUOME_ORG` is optional since 0.2.6 — the key names its org.
 
 ## `--json` + `jq` recipes
 

@@ -8,20 +8,27 @@ Every error the CLI prints, what it means, and how to fix it. Errors always go t
 
 No token found. Run `quome login`, or set `QUOME_TOKEN` in CI.
 
-### `error: Unauthorized. Your session may have expired. Run 'quome login'.`
+### `error: Unauthorized. The API key was rejected …`
 
 The API rejected your key (HTTP 401). Causes, most common first:
 
-1. The key was deleted or expired — check `quome keys list` from a working session or the dashboard, then `quome login` with a fresh key
-2. The key belongs to a different org than the one you're targeting
+1. The key was deleted or expired — check the dashboard's **Settings → API Keys** page, create a new **Full access** key, and `quome login` with it
+2. The key is badged **Legacy (non-functional)** there — it has no backing service account and can never authenticate; delete it and create a new one
 3. You're pointing at the wrong API URL (`echo $QUOME_API_URL`)
+
+### `error: … is organization administration, which an API key cannot do`
+
+You ran `quome orgs`, `members`, `keys`, or `events`. Those need an org-level permission a key never holds — use the dashboard (the message prints the URL). Details: [Authentication → What a key cannot do](authentication.md#what-a-key-cannot-do).
+
+### `error: This API key belongs to organization … and cannot act on …`
+
+You passed `--org` (or set `QUOME_ORG`) for an org other than the key's own. One org = one key: log in with a key from that organization.
 
 ### `error: No linked organization. Run 'quome link' to connect.`
 
-The command needs an org and none was found. Fix any of these ways:
+Only happens with a login made by a CLI older than 0.2.6 (which stored no org) and no `QUOME_ORG`. Run `quome login` again — the key names its org and commands then work without a link — or:
 
 ```bash
-quome link                 # interactive, per-directory
 quome apps list --org <uuid>
 QUOME_ORG=<uuid> quome apps list
 ```
@@ -40,11 +47,10 @@ The resource doesn't exist *in the org you're targeting*. The most common cause 
 
 API keys are **org-scoped** — a key only works for the organization it was created in. You're almost certainly targeting a different org than the key's own:
 
-1. `quome whoami` — see which org the current directory is linked to
-2. Compare with the org the key was created in (dashboard → that org → API Keys)
-3. Fix by relinking (`quome link`), passing `--org <uuid>`, or logging in with a key from the right org
+1. `quome whoami` — the key's organization and the directory's linked org are both shown
+2. Fix by relinking (`quome link`), dropping a stale `--org`/`QUOME_ORG`, or logging in with a key from the right org
 
-Note that `quome orgs list` can *show* orgs your key can't *act on*: it lists the orgs of the resolved user, while resource commands are gated to the key's own org. One org = one key.
+`quome whoami` shows the key's own organization. One org = one key.
 
 ### `error: API error: Authorization service unavailable. Please try again.`
 

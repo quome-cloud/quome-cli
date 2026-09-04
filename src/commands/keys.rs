@@ -70,6 +70,9 @@ pub struct DeleteArgs {
 }
 
 pub async fn execute(command: KeysCommands) -> Result<()> {
+    if !crate::commands::dashboard_only_override() {
+        return Err(crate::commands::dashboard_only("Managing API keys"));
+    }
     match command {
         KeysCommands::List(args) => list(args).await,
         KeysCommands::Create(args) => create(args).await,
