@@ -3,6 +3,7 @@ mod client;
 mod commands;
 mod config;
 mod errors;
+mod manifest;
 mod settings;
 mod ui;
 
