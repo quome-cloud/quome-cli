@@ -1,4 +1,5 @@
 pub mod apps;
+pub mod bindings;
 pub mod databases;
 pub mod deployments;
 pub mod events;

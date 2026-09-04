@@ -86,13 +86,11 @@ impl QuomeClient {
         self.get(&path).await
     }
 
-    #[allow(dead_code)]
     pub async fn list_bindings(&self, org_id: Uuid, app_id: Uuid) -> Result<Vec<AppBinding>> {
         self.get(&format!("/api/v1/orgs/{}/apps/{}/bindings", org_id, app_id))
             .await
     }
 
-    #[allow(dead_code)]
     pub async fn create_binding(
         &self,
         org_id: Uuid,
@@ -106,7 +104,6 @@ impl QuomeClient {
         .await
     }
 
-    #[allow(dead_code)]
     pub async fn delete_binding(&self, org_id: Uuid, app_id: Uuid, binding_id: Uuid) -> Result<()> {
         self.delete(&format!(
             "/api/v1/orgs/{}/apps/{}/bindings/{}",

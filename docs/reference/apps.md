@@ -130,3 +130,95 @@ $ quome apps delete 7c9e6679-7425-40de-944b-e07fc1f90ae7
 ```
 
 Deletion tears down the app's infrastructure asynchronously — the app shows `deleting` until it's gone.
+
+## Bindings
+
+A binding injects a secret, database, storage bucket, or cache into the app as an environment variable. Bindings are managed with `quome apps bind` / `quome apps bindings` / `quome apps unbind`, and are **org-admin gated** server-side on top of ordinary app permissions — an API key without org-admin gets a 403 with a hint to use the dashboard.
+
+### `quome apps bind`
+
+```
+Usage: quome apps bind [OPTIONS] --env-var <ENV_VAR> <--secret <SECRET>|--database <DATABASE>|--bucket <BUCKET>|--cache <CACHE>>
+
+Options:
+      --env-var <ENV_VAR>          Environment variable name (must match ^[A-Z][A-Z0-9_]*$)
+      --secret <SECRET>            Secret to bind (name or UUID)
+      --database <DATABASE>        Database to bind (name or UUID)
+      --bucket <BUCKET>            Storage bucket to bind (name or UUID)
+      --cache <CACHE>              Cache to bind (name or UUID)
+      --app <APP>                  Application ID (uses linked app if not provided)
+      --org <ORG>                  Organization ID (uses linked org if not provided)
+      --environment <ENVIRONMENT>  Bind only for one app environment (environment UUID)
+      --preview                    Also inject into PR preview deploys (app-level bindings only)
+      --container <CONTAINER>      Target container for multi-container apps
+      --json                       Output as JSON
+```
+
+Exactly one resource flag is required (`--secret`, `--database`, `--bucket`, or `--cache`) — they're mutually exclusive. Each accepts a resource name or a UUID; a name is resolved against that resource type's list endpoint, and an unrecognized name errors with the list command to run.
+
+```bash
+quome apps bind --env-var DATABASE_PASSWORD --secret prod-db-password
+```
+
+```console
+$ quome apps bind --env-var DATABASE_PASSWORD --secret prod-db-password
+✓ Created binding
+  Env var     DATABASE_PASSWORD
+  Resource    secret prod-db-password
+  Binding ID  9b2f0a34-...
+```
+
+By default a binding applies to the app everywhere. Two scope flags narrow that, and are themselves mutually exclusive:
+
+- `--environment <ID>` scopes the binding to one app environment (dev/staging/prod) — it never injects into other environments or into PR previews.
+- `--preview` additionally injects the (app-level) binding into PR preview deploys. It can't be combined with `--environment`, since environment-scoped overrides are never injected into previews.
+
+### `quome apps bindings`
+
+```
+Usage: quome apps bindings [OPTIONS]
+
+Options:
+      --app <APP>  Application ID (uses linked app if not provided)
+      --org <ORG>  Organization ID (uses linked org if not provided)
+      --json       Output as JSON
+```
+
+```console
+$ quome apps bindings
+╭────────────────────┬────────┬───────────────────┬────────────┬───────────────────────────────────────╮
+│ ENV VAR             │ TYPE   │ RESOURCE           │ SCOPE      │ BINDING ID                              │
+├────────────────────┼────────┼───────────────────┼────────────┼───────────────────────────────────────┤
+│ DATABASE_PASSWORD   │ secret │ prod-db-password   │ app        │ 9b2f0a34-...                            │
+│ ASSETS_BUCKET       │ bucket │ app-assets         │ env:staging│ 3c1d2e4f-...                            │
+╰────────────────────┴────────┴───────────────────┴────────────┴───────────────────────────────────────╯
+```
+
+`SCOPE` reads `app` (everywhere), `preview` (app-level, also injected into PR previews), or `env:<name>` (one app environment; falls back to the raw environment ID if environment names can't be resolved). `RESOURCE` shows the bound resource's name, falling back to its raw ID if the resource has since been deleted.
+
+### `quome apps unbind`
+
+```
+Usage: quome apps unbind [OPTIONS] [BINDING_ID]
+
+Arguments:
+  [BINDING_ID]  Binding ID to remove (or use --env-var)
+
+Options:
+      --env-var <ENV_VAR>          Resolve the binding by env var name instead of ID
+      --environment <ENVIRONMENT>  Disambiguate --env-var to one environment's binding
+      --app <APP>                  Application ID (uses linked app if not provided)
+      --org <ORG>                  Organization ID (uses linked org if not provided)
+  -f, --force                      Skip confirmation prompt
+      --json                       Output as JSON
+```
+
+Remove by binding ID, or by `--env-var NAME` (pass `--environment` too if the same env var is bound at both app scope and an environment scope — the CLI never guesses between them and instead lists the candidates and asks for the binding ID).
+
+```console
+$ quome apps unbind --env-var DATABASE_PASSWORD
+? Remove binding 9b2f0a34-... (DATABASE_PASSWORD → secret)? Yes
+✓ Removed binding
+  Env var     DATABASE_PASSWORD
+  Binding ID  9b2f0a34-...
+```

@@ -438,7 +438,6 @@ pub struct UpdateDatabaseRequest {
 
 // ── App resource bindings ───────────────────────────────────────────────
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BindingResourceType {
@@ -452,7 +451,6 @@ pub enum BindingResourceType {
 }
 
 impl BindingResourceType {
-    #[allow(dead_code)]
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Secret => "secret",
@@ -464,7 +462,6 @@ impl BindingResourceType {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AppBinding {
     pub id: Uuid,
@@ -482,7 +479,6 @@ pub struct AppBinding {
     pub created_at: Option<DateTime<Utc>>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize)]
 pub struct CreateBindingRequest {
     pub resource_type: BindingResourceType,
@@ -491,6 +487,42 @@ pub struct CreateBindingRequest {
     pub container_name: Option<String>,
     pub environment_id: Option<String>,
     pub allow_in_preview: bool,
+}
+
+// ============ Storage buckets ============
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct StorageBucket {
+    pub id: Uuid,
+    pub name: String,
+    pub region: String,
+    pub status: String,
+    pub storage_class: String,
+    #[serde(default)]
+    pub size_bytes: i64,
+    #[serde(default)]
+    pub object_count: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+// ============ Caches ============
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct Cache {
+    pub id: Uuid,
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    pub engine: String,
+    pub engine_version: String,
+    pub status: String,
+    pub tier: String,
+    pub memory_size_gb: i32,
+    #[serde(default)]
+    pub private_ip: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[cfg(test)]
