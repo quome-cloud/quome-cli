@@ -49,6 +49,13 @@ pub fn mutate_spec_env_vars(
     set: &[(String, String)],
     unset: &[String],
 ) -> Result<Vec<String>> {
+    // Guard against non-object specs that would panic on IndexMut.
+    if !spec.is_object() {
+        return Err(QuomeError::Usage(
+            "the app's spec is not an object — refusing to modify it".into(),
+        ));
+    }
+
     let scope_desc = container
         .map(|c| format!("sidecar '{}'", c))
         .unwrap_or_else(|| "the app spec".to_string());
@@ -184,18 +191,20 @@ pub fn effective_rows(
     let mut rows: std::collections::BTreeMap<String, (String, &'static str)> = Default::default();
     if let Some(map) = app_env_vars.as_object() {
         for (k, v) in map {
-            rows.insert(
-                k.clone(),
-                (v.as_str().unwrap_or_default().to_string(), "app"),
-            );
+            let rendered = v
+                .as_str()
+                .map(String::from)
+                .unwrap_or_else(|| v.to_string());
+            rows.insert(k.clone(), (rendered, "app"));
         }
     }
     if let Some(map) = override_env_vars.as_object() {
         for (k, v) in map {
-            rows.insert(
-                k.clone(),
-                (v.as_str().unwrap_or_default().to_string(), "env"),
-            );
+            let rendered = v
+                .as_str()
+                .map(String::from)
+                .unwrap_or_else(|| v.to_string());
+            rows.insert(k.clone(), (rendered, "env"));
         }
     }
     rows.into_iter().map(|(k, (v, s))| (k, v, s)).collect()
@@ -326,5 +335,25 @@ mod tests {
                 ("C".to_string(), "env".to_string(), "env"),
             ]
         );
+    }
+
+    #[test]
+    fn non_object_spec_errors_instead_of_panicking() {
+        for mut bad in [
+            serde_json::json!("str"),
+            serde_json::json!(3),
+            serde_json::json!([1]),
+            serde_json::Value::Null,
+        ] {
+            let err = mutate_spec_env_vars(&mut bad, None, &[("A".into(), "1".into())], &[]);
+            assert!(err.is_err(), "expected error for {bad}");
+        }
+    }
+
+    #[test]
+    fn effective_rows_renders_non_string_values_visibly() {
+        let rows = effective_rows(&json!({"N": 5, "B": true}), &serde_json::Value::Null);
+        assert_eq!(rows[0], ("B".to_string(), "true".to_string(), "app"));
+        assert_eq!(rows[1], ("N".to_string(), "5".to_string(), "app"));
     }
 }
