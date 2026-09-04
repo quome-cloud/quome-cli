@@ -153,14 +153,23 @@ pub async fn execute(args: Args) -> Result<()> {
     let token = normalize_key(&raw)?;
 
     let sp = ui::spinner("Validating key...");
+    let api_url = crate::settings::Settings::load()
+        .unwrap_or_default()
+        .get_api_url();
     let client = QuomeClient::new(Some(&token), None)?;
     let identity = client.get_api_key_self().await.map_err(|e| match e {
-        QuomeError::Unauthorized => QuomeError::Usage(
-            "The platform rejected this key. It is deleted, expired, or a key flagged \
-             \"Legacy (non-functional)\" on the API Keys page — create a new one \
-             (Settings → API Keys → Create key → Full access) and try again."
-                .into(),
-        ),
+        // Name the API we actually asked: the most common cause in practice
+        // is a key minted on a DIFFERENT Quome environment than the CLI's
+        // target (default or QUOME_API_URL), which is indistinguishable from
+        // a dead key by status code alone.
+        QuomeError::Unauthorized => QuomeError::Usage(format!(
+            "{} rejected this key. Either it belongs to a different Quome \
+             environment (set QUOME_API_URL to the API this key was created \
+             on), or it is deleted, expired, or flagged \"Legacy \
+             (non-functional)\" on that environment's API Keys page — create \
+             a new Full-access key there and try again.",
+            api_url
+        )),
         other => other,
     })?;
     sp.finish_and_clear();
