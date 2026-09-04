@@ -1,6 +1,6 @@
 use uuid::Uuid;
 
-use crate::api::models::{AppBinding, CreateBindingRequest, *};
+use crate::api::models::*;
 use crate::client::QuomeClient;
 use crate::errors::Result;
 

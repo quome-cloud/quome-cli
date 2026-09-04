@@ -10,7 +10,6 @@ use uuid::Uuid;
 pub struct PaginatedResponse<T> {
     pub data: Vec<T>,
     #[serde(default)]
-    #[allow(dead_code)]
     pub meta: Option<PaginationMeta>,
 }
 
@@ -26,7 +25,6 @@ pub struct PaginationMeta {
     #[allow(dead_code)]
     pub offset: Option<i64>,
     #[serde(default)]
-    #[allow(dead_code)]
     pub has_more: Option<bool>,
 }
 

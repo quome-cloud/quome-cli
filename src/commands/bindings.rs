@@ -1,7 +1,10 @@
 use clap::{ArgGroup, Parser};
 use uuid::Uuid;
 
-use crate::api::models::{AppBinding, BindingResourceType, CreateBindingRequest};
+use crate::api::models::{
+    AppBinding, BindingResourceType, Cache, CreateBindingRequest, Database, PaginatedResponse,
+    Secret, StorageBucket,
+};
 use crate::client::QuomeClient;
 use crate::config::Config;
 use crate::errors::{QuomeError, Result};
@@ -169,56 +172,55 @@ async fn resolve_resource(
     match parse_resource_ref(value) {
         ResourceRef::Id(id) => Ok((resource_type, id, value.to_string())),
         ResourceRef::Name(name) => {
-            let (found, list_cmd): (Option<Uuid>, &str) = match resource_type {
+            let (found, hint): (Option<Uuid>, &str) = match resource_type {
                 BindingResourceType::Secret => (
                     client
-                        .list_secrets(org_id)
+                        .list_all_pages::<Secret>(&format!("/api/v1/orgs/{}/secrets", org_id))
                         .await?
-                        .data
                         .iter()
                         .find(|s| s.name == name)
                         .map(|s| s.id),
-                    "quome secrets list",
+                    "see `quome secrets list`",
                 ),
                 BindingResourceType::Database => (
                     client
-                        .list_databases(org_id)
+                        .list_all_pages::<Database>(&format!("/api/v1/orgs/{}/dbaas", org_id))
                         .await?
-                        .data
                         .iter()
                         .find(|d| d.name == name)
                         .map(|d| d.id),
-                    "quome databases list",
+                    "see `quome db list`",
                 ),
                 BindingResourceType::Bucket => (
                     client
-                        .list_buckets(org_id)
+                        .list_all_pages::<StorageBucket>(&format!(
+                            "/api/v1/orgs/{}/storage",
+                            org_id
+                        ))
                         .await?
-                        .data
                         .iter()
                         .find(|b| b.name == name)
                         .map(|b| b.id),
-                    "quome storage list",
+                    "see the Storage page in the dashboard",
                 ),
                 BindingResourceType::Cache => (
                     client
-                        .list_caches(org_id)
+                        .list_all_pages::<Cache>(&format!("/api/v1/orgs/{}/caches", org_id))
                         .await?
-                        .data
                         .iter()
                         .find(|c| c.name == name)
                         .map(|c| c.id),
-                    "quome caches list",
+                    "see the Caches page in the dashboard",
                 ),
                 BindingResourceType::EventSubscription => (None, ""),
             };
             match found {
                 Some(id) => Ok((resource_type, id, name)),
                 None => Err(QuomeError::NotFound(format!(
-                    "no {} named '{}' — see `{}`",
+                    "no {} named '{}' — {}",
                     resource_type.as_str(),
                     name,
-                    list_cmd
+                    hint
                 ))),
             }
         }
@@ -238,29 +240,41 @@ async fn resolve_resource_names(
     for t in types {
         match t {
             BindingResourceType::Secret => {
-                if let Ok(resp) = client.list_secrets(org_id).await {
-                    for s in resp.data {
+                if let Ok(all) = client
+                    .list_all_pages::<Secret>(&format!("/api/v1/orgs/{}/secrets", org_id))
+                    .await
+                {
+                    for s in all {
                         names.insert((t, s.id), s.name);
                     }
                 }
             }
             BindingResourceType::Database => {
-                if let Ok(resp) = client.list_databases(org_id).await {
-                    for d in resp.data {
+                if let Ok(all) = client
+                    .list_all_pages::<Database>(&format!("/api/v1/orgs/{}/dbaas", org_id))
+                    .await
+                {
+                    for d in all {
                         names.insert((t, d.id), d.name);
                     }
                 }
             }
             BindingResourceType::Bucket => {
-                if let Ok(resp) = client.list_buckets(org_id).await {
-                    for b in resp.data {
+                if let Ok(all) = client
+                    .list_all_pages::<StorageBucket>(&format!("/api/v1/orgs/{}/storage", org_id))
+                    .await
+                {
+                    for b in all {
                         names.insert((t, b.id), b.name);
                     }
                 }
             }
             BindingResourceType::Cache => {
-                if let Ok(resp) = client.list_caches(org_id).await {
-                    for c in resp.data {
+                if let Ok(all) = client
+                    .list_all_pages::<Cache>(&format!("/api/v1/orgs/{}/caches", org_id))
+                    .await
+                {
+                    for c in all {
                         names.insert((t, c.id), c.name);
                     }
                 }
@@ -295,14 +309,14 @@ async fn resolve_env_names(
     if bindings.iter().all(|b| b.environment_id.is_none()) {
         return map;
     }
-    if let Ok(envs) = client
-        .get::<Vec<serde_json::Value>>(&format!(
+    if let Ok(page) = client
+        .get::<PaginatedResponse<serde_json::Value>>(&format!(
             "/api/v1/orgs/{}/apps/{}/environments",
             org_id, app_id
         ))
         .await
     {
-        for e in envs {
+        for e in page.data {
             if let (Some(id), Some(name)) = (e["id"].as_str(), e["name"].as_str()) {
                 map.insert(id.to_string(), name.to_string());
             }
@@ -330,7 +344,10 @@ pub async fn list(args: BindingsArgs) -> Result<()> {
     let client = QuomeClient::new(Some(&token), None)?;
 
     let sp = ui::spinner("Fetching bindings...");
-    let bindings = client.list_bindings(org_id, app_id).await?;
+    let bindings = client
+        .list_bindings(org_id, app_id)
+        .await
+        .map_err(admin_hint)?;
     let resource_names = resolve_resource_names(&client, org_id, &bindings).await;
     let env_names = resolve_env_names(&client, org_id, app_id, &bindings).await;
     sp.finish_and_clear();
@@ -368,10 +385,10 @@ pub async fn list(args: BindingsArgs) -> Result<()> {
 
 pub async fn bind(args: BindArgs) -> Result<()> {
     if let Err(msg) = validate_env_var_name(&args.env_var) {
-        return Err(QuomeError::ApiError(msg));
+        return Err(QuomeError::Usage(msg));
     }
     if args.preview && args.environment.is_some() {
-        return Err(QuomeError::ApiError(
+        return Err(QuomeError::Usage(
             "--preview is only valid for app-level bindings (drop --environment): \
              env-specific overrides are never injected into previews"
                 .into(),
@@ -465,18 +482,21 @@ pub async fn unbind(args: UnbindArgs) -> Result<()> {
                 1 => matches.into_iter().next().unwrap(),
                 _ => {
                     // Never guess between scopes: list the candidates and stop.
+                    // Environment names may fail to resolve (feature-gated off,
+                    // older control plane) — scope_label falls back to the raw id.
+                    let env_names = resolve_env_names(&client, org_id, app_id, &matches).await;
                     eprintln!("'{}' matches multiple bindings:", name);
                     for b in &matches {
-                        eprintln!("  {}  (scope varies)", b.id);
+                        eprintln!("  {}  ({})", b.id, scope_label(b, &env_names));
                     }
-                    return Err(QuomeError::ApiError(
+                    return Err(QuomeError::Usage(
                         "pass the binding ID to unbind exactly one".into(),
                     ));
                 }
             }
         }
         (None, None) => {
-            return Err(QuomeError::ApiError(
+            return Err(QuomeError::Usage(
                 "pass a binding ID or --env-var NAME".into(),
             ))
         }
@@ -506,7 +526,10 @@ pub async fn unbind(args: UnbindArgs) -> Result<()> {
     sp.finish_and_clear();
 
     if args.json {
-        println!("{}", serde_json::json!({"removed": target.id}));
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({"removed": target.id}))?
+        );
     } else {
         ui::print_success(
             "Removed binding",

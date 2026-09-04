@@ -133,7 +133,7 @@ Deletion tears down the app's infrastructure asynchronously — the app shows `d
 
 ## Bindings
 
-A binding injects a secret, database, storage bucket, or cache into the app as an environment variable. Bindings are managed with `quome apps bind` / `quome apps bindings` / `quome apps unbind`, and are **org-admin gated** server-side on top of ordinary app permissions — an API key without org-admin gets a 403 with a hint to use the dashboard.
+A binding injects a secret, database, storage bucket, or cache into the app as an environment variable. Bindings are managed with `quome apps bind` / `quome apps bindings` / `quome apps unbind`, and are **org-admin gated** server-side on top of ordinary app permissions — an API key without org-admin gets a 403 with the hint "(managing bindings requires org admin)".
 
 ### `quome apps bind`
 
@@ -154,7 +154,7 @@ Options:
       --json                       Output as JSON
 ```
 
-Exactly one resource flag is required (`--secret`, `--database`, `--bucket`, or `--cache`) — they're mutually exclusive. Each accepts a resource name or a UUID; a name is resolved against that resource type's list endpoint, and an unrecognized name errors with the list command to run.
+Exactly one resource flag is required (`--secret`, `--database`, `--bucket`, or `--cache`) — they're mutually exclusive. Each accepts a resource name or a UUID; a name is resolved against that resource type's list endpoint (paginated in full, not just the first page), and an unrecognized name errors with a hint: `quome secrets list` / `quome db list` for secrets and databases, the Storage/Caches page in the dashboard for buckets and caches (those have no CLI list command yet).
 
 ```bash
 quome apps bind --env-var DATABASE_PASSWORD --secret prod-db-password
