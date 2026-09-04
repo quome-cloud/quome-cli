@@ -133,35 +133,11 @@ Deletion tears down the app's infrastructure asynchronously — the app shows `d
 
 ## Environments
 
-`quome apps envs` manages an app's pipeline environments (e.g. dev/staging/prod). Apps that never opted into multiple environments have none — commands that take an environment reference (`--environment`, `envs delete <env>`, `envs create --copy-vars-from <env>`) accept either the environment's name or its UUID, resolved name-first.
-
-```
-Usage: quome apps envs <COMMAND>
-
-Commands:
-  list    List the app's environments (pipeline order)
-  create  Create an environment
-  delete  Delete an environment (tears down its deploy target)
-```
-
-```console
-$ quome apps envs
-NAME     SLUG     DEFAULT  BRANCH   AUTO  STATUS  ID
-prod     prod     yes      main     yes   active  9b2f0a34-...
-staging  staging           staging  yes   active  3c1d2e4f-...
-```
-
-```bash
-quome apps envs create staging --branch staging
-quome apps envs create qa --branch qa --copy-vars-from staging --no-auto-deploy
-quome apps envs delete staging
-```
-
-`envs create --copy-vars-from <name|UUID>` copies that environment's plain env vars (not secrets/bindings) into the new one. `envs delete` refuses the app's default environment, and prompts for confirmation unless `--force` is given — deletion tears down the environment's deploy target and any dedicated resources provisioned for it.
+`quome apps envs` manages an app's pipeline environments (e.g. dev/staging/prod), and `quome apps env-vars` manages plain env vars at app or environment scope. See [Environments](environments.md) for the full command tree, write semantics, and the promotion gate.
 
 ## Bindings
 
-A binding injects a secret, database, storage bucket, or cache into the app as an environment variable. Bindings are managed with `quome apps bind` / `quome apps bindings` / `quome apps unbind`, and are **org-admin gated** server-side on top of ordinary app permissions — an API key without org-admin gets a 403 with the hint "(managing bindings requires org admin)".
+A binding injects a secret, database, storage bucket, or cache into the app as an environment variable. Bindings are managed with `quome apps bind` / `quome apps bindings` / `quome apps unbind`, and are **org-admin gated** server-side on top of ordinary app permissions — an API key without org-admin gets a 403 with the hint "(managing bindings requires org admin)". For *plain* (non-secret) env vars, see [Environments](environments.md#quome-apps-env-vars) instead — this page's `--environment` flags below accept an environment name or UUID, same as everywhere else in the environments tree.
 
 ### `quome apps bind`
 

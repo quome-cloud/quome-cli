@@ -31,6 +31,11 @@ pub enum AppsCommands {
         #[command(subcommand)]
         command: crate::commands::envs::EnvsCommands,
     },
+    /// Manage plain env vars (app or environment scope)
+    EnvVars {
+        #[command(subcommand)]
+        command: crate::commands::env_vars::EnvVarsCommands,
+    },
 }
 
 #[derive(Parser)]
@@ -141,6 +146,7 @@ pub async fn execute(command: AppsCommands) -> Result<()> {
         AppsCommands::Bind(args) => crate::commands::bindings::bind(args).await,
         AppsCommands::Unbind(args) => crate::commands::bindings::unbind(args).await,
         AppsCommands::Envs { command } => crate::commands::envs::execute(command).await,
+        AppsCommands::EnvVars { command } => crate::commands::env_vars::execute(command).await,
     }
 }
 

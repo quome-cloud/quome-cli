@@ -18,7 +18,8 @@ Every command, every flag. All examples assume you've [logged in](../getting-sta
 | [Orgs](orgs.md) | `orgs list`, `orgs create`, `orgs get` |
 | [Members](members.md) | `members list`, `members invite` |
 | [Keys](keys.md) | `keys list`, `keys create`, `keys delete` |
-| [Apps](apps.md) | `apps list`, `apps create`, `apps get`, `apps update`, `apps delete` |
+| [Apps](apps.md) | `apps list`, `apps create`, `apps get`, `apps update`, `apps delete`, `apps bind`, `apps bindings`, `apps unbind` |
+| [Environments](environments.md) | `apps envs list/create/delete/promote/config`, `apps env-vars list/set/unset` |
 | [Deploy](deploy.md) | `deploy` |
 | [Deployments](deployments.md) | `deployments list`, `deployments get`, `deployments create` |
 | [Logs](logs.md) | `logs` |

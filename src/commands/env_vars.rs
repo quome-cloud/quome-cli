@@ -3,11 +3,16 @@
 //! inside an otherwise-opaque spec Value; per-env writes produce exactly one
 //! touched top-level config_overrides key (full sub-map, or Null to drop it).
 
+use clap::{Parser, Subcommand};
+use uuid::Uuid;
+
+use crate::client::QuomeClient;
+use crate::config::Config;
 use crate::errors::{QuomeError, Result};
+use crate::ui::{self, EnvVarRow};
 
 const RESERVED_PREFIX: &str = "QUOME_";
 
-#[allow(dead_code)]
 pub fn validate_key(key: &str) -> std::result::Result<(), String> {
     let mut chars = key.chars();
     let head_ok = matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_');
@@ -27,7 +32,6 @@ pub fn validate_key(key: &str) -> std::result::Result<(), String> {
     Ok(())
 }
 
-#[allow(dead_code)]
 pub fn parse_pairs(raw: &[String]) -> Result<Vec<(String, String)>> {
     raw.iter()
         .map(|pair| {
@@ -42,7 +46,6 @@ pub fn parse_pairs(raw: &[String]) -> Result<Vec<(String, String)>> {
 
 /// Mutate ONLY the env-var map at the requested scope inside an opaque spec.
 /// Returns the changed keys in argument order (set keys, then unset keys).
-#[allow(dead_code)]
 pub fn mutate_spec_env_vars(
     spec: &mut serde_json::Value,
     container: Option<&str>,
@@ -110,7 +113,6 @@ pub fn mutate_spec_env_vars(
 
 /// Produce (touched_top_level_key, full_new_value) for the config_overrides
 /// merge-patch. Value::Null means "drop the key entirely".
-#[allow(dead_code)]
 pub fn merged_overrides_map(
     overrides: &serde_json::Value,
     container: Option<&str>,
@@ -183,7 +185,6 @@ fn apply(
 }
 
 /// Effective (app ∪ env, env wins) rows for the list view, sorted by key.
-#[allow(dead_code)]
 pub fn effective_rows(
     app_env_vars: &serde_json::Value,
     override_env_vars: &serde_json::Value,
@@ -208,6 +209,276 @@ pub fn effective_rows(
         }
     }
     rows.into_iter().map(|(k, (v, s))| (k, v, s)).collect()
+}
+
+#[derive(Subcommand)]
+pub enum EnvVarsCommands {
+    /// List env vars (effective view with --environment)
+    List(EnvVarsListArgs),
+    /// Set env vars (KEY=VALUE ...)
+    Set(EnvVarsSetArgs),
+    /// Remove env vars
+    Unset(EnvVarsUnsetArgs),
+}
+
+#[derive(Parser)]
+pub struct EnvVarsListArgs {
+    #[arg(long)]
+    app: Option<Uuid>,
+    #[arg(long)]
+    org: Option<Uuid>,
+    /// Environment (name or UUID) — shows the effective merged set
+    #[arg(long)]
+    environment: Option<String>,
+    /// Sidecar container name
+    #[arg(long)]
+    container: Option<String>,
+    /// With --environment: show only the environment's own overrides
+    #[arg(long)]
+    overrides_only: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Parser)]
+pub struct EnvVarsSetArgs {
+    /// KEY=VALUE pairs
+    #[arg(required = true)]
+    pairs: Vec<String>,
+    #[arg(long)]
+    environment: Option<String>,
+    #[arg(long)]
+    container: Option<String>,
+    #[arg(long)]
+    app: Option<Uuid>,
+    #[arg(long)]
+    org: Option<Uuid>,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Parser)]
+pub struct EnvVarsUnsetArgs {
+    /// Keys to remove
+    #[arg(required = true)]
+    keys: Vec<String>,
+    #[arg(long)]
+    environment: Option<String>,
+    #[arg(long)]
+    container: Option<String>,
+    #[arg(long)]
+    app: Option<Uuid>,
+    #[arg(long)]
+    org: Option<Uuid>,
+    #[arg(long)]
+    json: bool,
+}
+
+pub async fn execute(command: EnvVarsCommands) -> Result<()> {
+    match command {
+        EnvVarsCommands::List(args) => list(args).await,
+        EnvVarsCommands::Set(args) => set(args).await,
+        EnvVarsCommands::Unset(args) => unset(args).await,
+    }
+}
+
+/// App-level env-var scope: the raw app row and the extracted maps.
+async fn fetch_app_raw(
+    client: &QuomeClient,
+    org_id: Uuid,
+    app_id: Uuid,
+) -> Result<serde_json::Value> {
+    client
+        .get(&format!("/api/v1/orgs/{}/apps/{}", org_id, app_id))
+        .await
+}
+
+fn app_scope_env_vars<'a>(
+    app: &'a serde_json::Value,
+    container: Option<&str>,
+) -> Result<&'a serde_json::Value> {
+    match container {
+        None => Ok(&app["spec"]["env_vars"]),
+        Some(name) => {
+            let sidecars = app["spec"]["sidecars"].as_array();
+            let found =
+                sidecars.and_then(|arr| arr.iter().find(|s| s["name"].as_str() == Some(name)));
+            found
+                .map(|s| &s["env_vars"])
+                .ok_or_else(|| QuomeError::Usage(format!("no sidecar '{}' on this app", name)))
+        }
+    }
+}
+
+pub async fn list(args: EnvVarsListArgs) -> Result<()> {
+    let config = Config::load()?;
+    let token = config.require_token()?;
+    let (org_id, app_id) = crate::commands::envs::resolve_context(args.org, args.app, &config)?;
+    let client = QuomeClient::new(Some(&token), None)?;
+
+    let sp = ui::spinner("Fetching env vars...");
+    let app = fetch_app_raw(&client, org_id, app_id).await?;
+    let app_vars = app_scope_env_vars(&app, args.container.as_deref())?.clone();
+
+    let rows: Vec<(String, String, &'static str)> = match &args.environment {
+        None => effective_rows(&app_vars, &serde_json::Value::Null),
+        Some(env_ref) => {
+            let env = crate::commands::envs::resolve_environment(&client, org_id, app_id, env_ref)
+                .await?;
+            let ov = match args.container.as_deref() {
+                None => env.config_overrides["env_vars"].clone(),
+                Some(c) => env.config_overrides["sidecar_env_vars"][c].clone(),
+            };
+            if args.overrides_only {
+                effective_rows(&serde_json::Value::Null, &ov)
+            } else {
+                effective_rows(&app_vars, &ov)
+            }
+        }
+    };
+    sp.finish_and_clear();
+
+    if args.json {
+        let arr: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|(k, v, s)| serde_json::json!({"key": k, "value": v, "source": s}))
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&arr)?);
+        return Ok(());
+    }
+    if rows.is_empty() {
+        println!("No env vars at this scope.");
+        return Ok(());
+    }
+    ui::print_table(
+        rows.into_iter()
+            .map(|(key, value, source)| EnvVarRow {
+                key,
+                value,
+                source: source.to_string(),
+            })
+            .collect::<Vec<_>>(),
+    );
+    println!(
+        "Secret-shaped values belong in `quome apps bind` (secret-backed vars), not plaintext."
+    );
+    Ok(())
+}
+
+pub async fn set(args: EnvVarsSetArgs) -> Result<()> {
+    let pairs = parse_pairs(&args.pairs)?;
+    write_vars(
+        args.org,
+        args.app,
+        args.environment,
+        args.container,
+        pairs,
+        vec![],
+        args.json,
+    )
+    .await
+}
+
+pub async fn unset(args: EnvVarsUnsetArgs) -> Result<()> {
+    for k in &args.keys {
+        validate_key(k).map_err(QuomeError::Usage)?;
+    }
+    write_vars(
+        args.org,
+        args.app,
+        args.environment,
+        args.container,
+        vec![],
+        args.keys,
+        args.json,
+    )
+    .await
+}
+
+async fn write_vars(
+    org: Option<Uuid>,
+    app: Option<Uuid>,
+    environment: Option<String>,
+    container: Option<String>,
+    set: Vec<(String, String)>,
+    unset: Vec<String>,
+    json: bool,
+) -> Result<()> {
+    let config = Config::load()?;
+    let token = config.require_token()?;
+    let (org_id, app_id) = crate::commands::envs::resolve_context(org, app, &config)?;
+    let client = QuomeClient::new(Some(&token), None)?;
+
+    // Best-effort collision warning: a binding with the same env var name
+    // shadows the plain var at deploy time.
+    if !set.is_empty() {
+        if let Ok(bindings) = client.list_bindings(org_id, app_id).await {
+            for (k, _) in &set {
+                if bindings.iter().any(|b| &b.env_var_name == k) {
+                    eprintln!(
+                        "warning: '{}' is also a resource binding — the binding may shadow \
+                         this value at deploy",
+                        k
+                    );
+                }
+            }
+        }
+    }
+
+    let (changed, scope_name): (Vec<String>, String) = match &environment {
+        None => {
+            let sp = ui::spinner("Updating app env vars...");
+            let mut app_raw = fetch_app_raw(&client, org_id, app_id).await?;
+            let mut spec = app_raw["spec"].take();
+            let changed = mutate_spec_env_vars(&mut spec, container.as_deref(), &set, &unset)?;
+            let _: serde_json::Value = client
+                .put(
+                    &format!("/api/v1/orgs/{}/apps/{}", org_id, app_id),
+                    &serde_json::json!({ "spec": spec }),
+                )
+                .await?;
+            sp.finish_and_clear();
+            (changed, "app".to_string())
+        }
+        Some(env_ref) => {
+            let env = crate::commands::envs::resolve_environment(&client, org_id, app_id, env_ref)
+                .await?;
+            let sp = ui::spinner("Updating environment overrides...");
+            let (key, value) =
+                merged_overrides_map(&env.config_overrides, container.as_deref(), &set, &unset)?;
+            let changed = set
+                .iter()
+                .map(|(k, _)| k.clone())
+                .chain(unset.iter().cloned())
+                .collect();
+            client
+                .update_environment_overrides(
+                    org_id,
+                    app_id,
+                    env.id,
+                    &serde_json::json!({ key: value }),
+                )
+                .await?;
+            sp.finish_and_clear();
+            (changed, format!("environment '{}'", env.name))
+        }
+    };
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "changed": changed, "scope": scope_name
+            }))?
+        );
+    } else {
+        println!(
+            "Updated {} on {} — applies on the next deploy",
+            changed.join(", "),
+            scope_name
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]

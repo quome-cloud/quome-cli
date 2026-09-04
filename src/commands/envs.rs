@@ -127,7 +127,11 @@ pub enum EnvConfigAction {
     Unset { keys: Vec<String> },
 }
 
-fn resolve_context(org: Option<Uuid>, app: Option<Uuid>, config: &Config) -> Result<(Uuid, Uuid)> {
+pub(crate) fn resolve_context(
+    org: Option<Uuid>,
+    app: Option<Uuid>,
+    config: &Config,
+) -> Result<(Uuid, Uuid)> {
     let org_id = match org {
         Some(id) => id,
         None => config.require_linked_org()?,

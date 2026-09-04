@@ -181,6 +181,16 @@ pub struct EnvRow {
 }
 
 #[derive(Tabled)]
+pub struct EnvVarRow {
+    #[tabled(rename = "KEY")]
+    pub key: String,
+    #[tabled(rename = "VALUE")]
+    pub value: String,
+    #[tabled(rename = "SOURCE")]
+    pub source: String,
+}
+
+#[derive(Tabled)]
 pub struct DatabaseRow {
     #[tabled(rename = "ID")]
     pub id: String,
