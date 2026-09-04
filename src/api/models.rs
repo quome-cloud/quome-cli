@@ -435,3 +435,101 @@ pub struct UpdateDatabaseRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ha_enabled: Option<bool>,
 }
+
+// ── App resource bindings ───────────────────────────────────────────────
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingResourceType {
+    Secret,
+    Database,
+    Bucket,
+    Cache,
+    // Created by event flows, never by `quome apps bind` — present so list
+    // rows deserialize.
+    EventSubscription,
+}
+
+impl BindingResourceType {
+    #[allow(dead_code)]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Secret => "secret",
+            Self::Database => "database",
+            Self::Bucket => "bucket",
+            Self::Cache => "cache",
+            Self::EventSubscription => "event_subscription",
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AppBinding {
+    pub id: Uuid,
+    pub app_id: Uuid,
+    pub resource_type: BindingResourceType,
+    pub resource_id: Uuid,
+    pub env_var_name: String,
+    #[serde(default)]
+    pub container_name: Option<String>,
+    #[serde(default)]
+    pub environment_id: Option<String>,
+    #[serde(default)]
+    pub allow_in_preview: bool,
+    #[serde(default)]
+    pub created_at: Option<DateTime<Utc>>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Serialize)]
+pub struct CreateBindingRequest {
+    pub resource_type: BindingResourceType,
+    pub resource_id: Uuid,
+    pub env_var_name: String,
+    pub container_name: Option<String>,
+    pub environment_id: Option<String>,
+    pub allow_in_preview: bool,
+}
+
+#[cfg(test)]
+mod binding_tests {
+    use super::*;
+
+    #[test]
+    fn app_binding_deserializes_api_row() {
+        let row = r#"{
+            "id": "9b2f0a34-1111-2222-3333-444455556666",
+            "app_id": "aaaa0a34-1111-2222-3333-444455556666",
+            "resource_type": "secret",
+            "resource_id": "bbbb0a34-1111-2222-3333-444455556666",
+            "env_var_name": "DATABASE_PASSWORD",
+            "container_name": null,
+            "environment_id": null,
+            "allow_in_preview": false,
+            "created_at": "2026-09-01T00:00:00Z"
+        }"#;
+        let b: AppBinding = serde_json::from_str(row).unwrap();
+        assert_eq!(b.resource_type, BindingResourceType::Secret);
+        assert_eq!(b.env_var_name, "DATABASE_PASSWORD");
+        assert!(b.environment_id.is_none());
+    }
+
+    #[test]
+    fn create_binding_request_serializes_snake_case() {
+        let req = CreateBindingRequest {
+            resource_type: BindingResourceType::Bucket,
+            resource_id: uuid::Uuid::nil(),
+            env_var_name: "ASSETS".into(),
+            container_name: None,
+            environment_id: None,
+            allow_in_preview: true,
+        };
+        let v: serde_json::Value = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["resource_type"], "bucket");
+        assert_eq!(v["allow_in_preview"], true);
+        // None fields serialize as null — the API treats null and absent alike.
+        assert!(v.get("container_name").is_some());
+    }
+}
