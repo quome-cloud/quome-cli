@@ -15,6 +15,25 @@ impl QuomeClient {
             .await
     }
 
+    /// Create a plain static app (`quome deploy --create`'s app-not-found path).
+    /// Reuses `create_app`/`CreateAppRequest` — `AppSource` already models the
+    /// backend's `static` source variant (`app/schemas/source.py::StaticSource`),
+    /// so there's no need for a separate ad hoc request shape.
+    pub async fn create_static_app(&self, org_id: Uuid, name: &str) -> Result<App> {
+        self.create_app(
+            org_id,
+            &CreateAppRequest {
+                name: name.to_string(),
+                description: None,
+                source: AppSource::Static {
+                    framework: "plain".to_string(),
+                },
+                spec: AppSpecCreate::default(),
+            },
+        )
+        .await
+    }
+
     pub async fn get_app(&self, org_id: Uuid, app_id: Uuid) -> Result<App> {
         self.get(&format!("/api/v1/orgs/{}/apps/{}", org_id, app_id))
             .await

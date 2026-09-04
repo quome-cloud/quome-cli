@@ -61,6 +61,8 @@ enum Commands {
         #[command(subcommand)]
         command: commands::deployments::DeploymentsCommands,
     },
+    /// Deploy a directory of static files
+    Deploy(commands::deploy::DeployArgs),
     /// Manage databases
     #[command(name = "db")]
     Databases {
@@ -104,6 +106,7 @@ async fn main() {
         Commands::Members { command } => commands::members::execute(command).await,
         Commands::Apps { command } => commands::apps::execute(command).await,
         Commands::Deployments { command } => commands::deployments::execute(command).await,
+        Commands::Deploy(args) => commands::deploy::execute(args).await,
         Commands::Databases { command } => commands::databases::execute(command).await,
         Commands::Logs(args) => commands::logs::execute(args).await,
         Commands::Secrets { command } => commands::secrets::execute(command).await,

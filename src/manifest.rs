@@ -9,27 +9,22 @@ use std::path::{Path, PathBuf};
 
 use crate::errors::{QuomeError, Result};
 
-#[allow(dead_code)]
 pub const MAX_FILES: usize = 5000;
 
 const JUNK_NAMES: &[&str] = &["__MACOSX", ".DS_Store", "Thumbs.db"];
 const SKIP_DIRS: &[&str] = &[".git", "node_modules"];
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct ManifestEntry {
     /// Forward-slash path relative to the site root.
     pub path: String,
-    #[allow(dead_code)]
     pub size: u64,
-    #[allow(dead_code)]
     pub local: PathBuf,
 }
 
 /// mimetype guessing is table-driven: pin the modern web types a wrong
 /// guess would hurt, fall back to a small extension map, then
 /// octet-stream.
-#[allow(dead_code)]
 pub fn content_type_for(path: &str) -> &'static str {
     let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     match ext.as_str() {
@@ -55,7 +50,6 @@ pub fn content_type_for(path: &str) -> &'static str {
     }
 }
 
-#[allow(dead_code)]
 pub fn build_manifest(root: &Path) -> Result<Vec<ManifestEntry>> {
     let mut entries = Vec::new();
     walk(root, root, &mut entries)?;

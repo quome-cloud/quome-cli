@@ -212,6 +212,10 @@ pub enum AppSource {
         repo_name: String,
         branch: String,
     },
+    /// No container, no build step — files live in a per-app GCS bucket.
+    /// `framework` is a hint only (defaults server-side to "plain").
+    #[serde(rename = "static")]
+    Static { framework: String },
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -237,6 +241,34 @@ pub struct UpdateAppRequest {
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub github_branch: Option<String>,
+}
+
+// ============ Static sites ============
+
+#[derive(Debug, Serialize)]
+pub struct StaticManifestFile {
+    pub path: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateStaticDeploymentRequest {
+    pub source_type: &'static str, // always "api"
+    pub files: Vec<StaticManifestFile>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StaticDeploymentSession {
+    pub deployment_id: Uuid,
+    pub upload_urls: HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StaticDeployment {
+    pub id: Uuid,
+    pub status: String,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 // ============ Deployments ============
@@ -523,6 +555,39 @@ pub struct Cache {
     pub private_ip: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[cfg(test)]
+mod static_site_tests {
+    use super::*;
+
+    #[test]
+    fn static_session_deserializes() {
+        let body = r#"{"deployment_id":"9b2f0a34-1111-2222-3333-444455556666",
+                       "upload_urls":{"index.html":"https://signed"},
+                       "expires_at":"2026-09-04T00:00:00Z"}"#;
+        let s: StaticDeploymentSession = serde_json::from_str(body).unwrap();
+        assert_eq!(s.upload_urls["index.html"], "https://signed");
+    }
+
+    #[test]
+    fn static_deployment_list_page_deserializes() {
+        // The list endpoint's real envelope (confirmed against
+        // `app/api/v1/apps/static_sites.py::list_static_deployments`,
+        // `response_model=PaginatedResponse[StaticDeploymentResponse]`):
+        // `{"data": [...], "meta": {...}}`, not a bare array. Extra
+        // response-only fields (site_id, source_type, ...) are ignored.
+        let body = r#"{
+            "data": [
+                {"id": "9b2f0a34-1111-2222-3333-444455556666", "status": "active", "error": null,
+                 "site_id": "aaaa0a34-1111-2222-3333-444455556666", "source_type": "api"}
+            ],
+            "meta": {"total": 1, "limit": 50, "offset": 0, "has_more": false}
+        }"#;
+        let page: PaginatedResponse<StaticDeployment> = serde_json::from_str(body).unwrap();
+        assert_eq!(page.data.len(), 1);
+        assert_eq!(page.data[0].status, "active");
+    }
 }
 
 #[cfg(test)]
