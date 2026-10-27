@@ -89,6 +89,7 @@ Full walkthrough with expected output: **[Getting started](docs/getting-started.
 | `quome members …` | Members and invites (dashboard-only for API keys) | [Members](docs/reference/members.md) |
 | `quome keys …` | API keys (dashboard-only for API keys) | [Keys](docs/reference/keys.md) |
 | `quome events` | Organization audit trail (dashboard-only for API keys) | [Events](docs/reference/events.md) |
+| `quome fn …` | Functions-as-a-service: Python compiled to WebAssembly, run from a warm sandbox pool | [Functions](docs/reference/functions.md) |
 | `quome host …` | Run a sandbox host on your own computer | [Host](docs/reference/host.md) |
 | `quome upgrade` | Self-update via Homebrew | [Upgrade](docs/reference/upgrade.md) |
 

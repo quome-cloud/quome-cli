@@ -25,5 +25,6 @@ Every command, every flag. All examples assume you've [logged in](../getting-sta
 | [Secrets](secrets.md) | `secrets list`, `secrets set`, `secrets get`, `secrets delete` |
 | [Databases](databases.md) | `db list`, `db create`, `db get`, `db update`, `db delete` |
 | [Events](events.md) | `events` |
+| [Functions](functions.md) | `fn deploy`, `fn invoke`, `fn bench`, `fn ls`, `fn info`, `fn rollback`, `fn rm`, `fn pool up/status/down`, `fn serve` |
 | [Host](host.md) | `host up`, `host enroll`, `host status`, `host logs`, `host update`, `host down`, `host install` |
 | [Upgrade](upgrade.md) | `upgrade` |
