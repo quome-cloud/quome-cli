@@ -21,7 +21,10 @@ pub struct TokenSource {
     kid: String,
     key: AgentKey,
     vrc: String,
-    state: Mutex<State>,
+    state: std::sync::Mutex<State>,
+    /// Serializes exchanges so concurrent callers share one; never held while
+    /// the cache is read on the fast path.
+    exchange: Mutex<()>,
 }
 
 #[derive(Default)]
@@ -30,33 +33,78 @@ struct State {
     cached: Option<(String, Instant)>,
 }
 
+/// Connect timeout for every Quome Cloud request.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Total timeout for ordinary requests.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 impl TokenSource {
     pub fn new(profile: &Profile, key: AgentKey, vrc: String) -> TokenSource {
+        Self::with_timeout(profile, key, vrc, REQUEST_TIMEOUT)
+    }
+
+    pub(crate) fn with_timeout(
+        profile: &Profile,
+        key: AgentKey,
+        vrc: String,
+        timeout: Duration,
+    ) -> TokenSource {
         TokenSource {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .timeout(timeout)
+                .build()
+                .unwrap_or_default(),
             issuer: profile.issuer.trim_end_matches('/').to_string(),
             resource: format!("{}/", profile.api_url.trim_end_matches('/')),
             principal: profile.agent_principal.clone(),
             kid: profile.kid.clone(),
             key,
             vrc,
-            state: Mutex::new(State::default()),
+            state: std::sync::Mutex::new(State::default()),
+            exchange: Mutex::new(()),
+        }
+    }
+
+    fn cached(&self) -> Option<String> {
+        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        match &st.cached {
+            Some((tok, exp)) if Instant::now() < *exp => Some(tok.clone()),
+            _ => None,
+        }
+    }
+
+    /// Drop the cached token if it is still `token` (a newer one stays).
+    pub fn invalidate(&self, token: &str) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(&st.cached, Some((t, _)) if t == token) {
+            st.cached = None;
         }
     }
 
     /// A valid access token, exchanging anew when the cached one is within 30 s of expiry.
     pub async fn access_token(&self) -> Result<String, QuomeError> {
-        let mut st = self.state.lock().await;
-        if let Some((tok, exp)) = &st.cached {
-            if Instant::now() < *exp {
-                return Ok(tok.clone());
-            }
+        if let Some(t) = self.cached() {
+            return Ok(t);
         }
-        let endpoint = match &st.token_endpoint {
-            Some(e) => e.clone(),
+        let _guard = self.exchange.lock().await;
+        if let Some(t) = self.cached() {
+            return Ok(t); // another caller exchanged while we waited
+        }
+        let known = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .token_endpoint
+            .clone();
+        let endpoint = match known {
+            Some(e) => e,
             None => {
                 let e = self.discover().await?;
-                st.token_endpoint = Some(e.clone());
+                self.state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .token_endpoint = Some(e.clone());
                 e
             }
         };
@@ -86,7 +134,8 @@ impl TokenSource {
             .to_string();
         let expires_in = v["expires_in"].as_u64().unwrap_or(0);
         let ttl = Duration::from_secs(expires_in).saturating_sub(SKEW);
-        st.cached = Some((token.clone(), Instant::now() + ttl));
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).cached =
+            Some((token.clone(), Instant::now() + ttl));
         Ok(token)
     }
 
@@ -140,8 +189,8 @@ fn map_exchange_error(status: u16, v: &serde_json::Value) -> QuomeError {
         }
     }
     if status == 400 && v["error"].as_str() == Some("invalid_grant") {
-        // revoked, expired, or the key no longer matches the delegation
-        return QuomeError::CloudDisconnected;
+        // revoked, expired, key mismatch, or a skewed local clock: quauth does not say which
+        return QuomeError::CloudInvalidGrant;
     }
     let err = v["error"].as_str().unwrap_or("unknown_error");
     QuomeError::ApiError(format!(
@@ -299,6 +348,154 @@ pub(crate) mod tests {
             .await;
         let ts = TokenSource::new(&profile(&s.uri()), AgentKey::generate(), "v".into());
         let e = ts.access_token().await.unwrap_err();
-        assert!(matches!(e, QuomeError::CloudDisconnected), "{e}");
+        assert!(matches!(e, QuomeError::CloudInvalidGrant), "{e}");
+        assert!(e.to_string().contains("disconnected"), "{e}");
+        assert!(
+            e.to_string()
+                .contains("check this computer's clock is correct"),
+            "{e}"
+        );
+    }
+
+    fn form_of(r: &wiremock::Request) -> std::collections::HashMap<String, String> {
+        let body = String::from_utf8(r.body.clone()).unwrap();
+        reqwest::Url::parse(&format!("http://x/?{body}"))
+            .unwrap()
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect()
+    }
+
+    fn jti_of(jwt: &str) -> String {
+        let c: serde_json::Value = serde_json::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(jwt.split('.').nth(1).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        c["jti"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn each_exchange_has_a_fresh_jti() {
+        let s = MockServer::start().await;
+        mount_discovery(&s).await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(token_resp(20))
+            .expect(2)
+            .mount(&s)
+            .await;
+        let ts = TokenSource::new(&profile(&s.uri()), AgentKey::generate(), "v".into());
+        ts.access_token().await.unwrap();
+        ts.access_token().await.unwrap();
+        let reqs = s.received_requests().await.unwrap();
+        let jtis: Vec<String> = reqs
+            .iter()
+            .filter(|r| r.url.path() == "/oauth/token")
+            .map(|r| jti_of(&form_of(r)["actor_token"]))
+            .collect();
+        assert_eq!(jtis.len(), 2);
+        assert_ne!(jtis[0], jtis[1]);
+    }
+
+    #[tokio::test]
+    async fn token_just_outside_skew_window_is_cached() {
+        let s = MockServer::start().await;
+        mount_discovery(&s).await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(token_resp(40))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let ts = TokenSource::new(&profile(&s.uri()), AgentKey::generate(), "v".into());
+        ts.access_token().await.unwrap();
+        ts.access_token().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_callers_share_one_exchange() {
+        let s = MockServer::start().await;
+        mount_discovery(&s).await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(token_resp(3600).set_delay(Duration::from_millis(200)))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let ts = TokenSource::new(&profile(&s.uri()), AgentKey::generate(), "v".into());
+        let (a, b, c) = tokio::join!(ts.access_token(), ts.access_token(), ts.access_token());
+        assert_eq!(
+            (a.unwrap(), b.unwrap(), c.unwrap()),
+            ("AT".into(), "AT".into(), "AT".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn invalidate_forces_a_new_exchange() {
+        let s = MockServer::start().await;
+        mount_discovery(&s).await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(token_resp(3600))
+            .expect(2)
+            .mount(&s)
+            .await;
+        let ts = TokenSource::new(&profile(&s.uri()), AgentKey::generate(), "v".into());
+        let t = ts.access_token().await.unwrap();
+        ts.invalidate("some-other-token");
+        ts.access_token().await.unwrap(); // still cached
+        ts.invalidate(&t);
+        ts.access_token().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exchange_401_reasons_map() {
+        for (reason, want_disconnected) in
+            [("delegation_revoked", true), ("agent_not_connected", false)]
+        {
+            let s = MockServer::start().await;
+            mount_discovery(&s).await;
+            Mock::given(method("POST"))
+                .and(path("/oauth/token"))
+                .respond_with(
+                    ResponseTemplate::new(401).set_body_json(
+                        serde_json::json!({"detail":"unauthorized","reason":reason}),
+                    ),
+                )
+                .mount(&s)
+                .await;
+            let ts = TokenSource::new(&profile(&s.uri()), AgentKey::generate(), "v".into());
+            let e = ts.access_token().await.unwrap_err();
+            if want_disconnected {
+                assert!(matches!(e, QuomeError::CloudDisconnected), "{e}");
+            } else {
+                assert!(matches!(e, QuomeError::CloudNotYetConnected), "{e}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn slow_server_times_out() {
+        let s = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(3)))
+            .mount(&s)
+            .await;
+        let ts = TokenSource::with_timeout(
+            &profile(&s.uri()),
+            AgentKey::generate(),
+            "v".into(),
+            Duration::from_millis(200),
+        );
+        let started = Instant::now();
+        let e = ts.access_token().await.unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(
+            matches!(e, QuomeError::Http(ref h) if h.is_timeout()),
+            "{e}"
+        );
     }
 }

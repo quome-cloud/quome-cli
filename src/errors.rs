@@ -47,6 +47,14 @@ pub enum QuomeError {
     #[error("This agent was disconnected from Quome Cloud — run `quome connect` again")]
     CloudDisconnected,
 
+    /// The token exchange was refused with `invalid_grant`: the delegation was revoked or
+    /// expired, the key no longer matches, or the local clock is off.
+    #[error(
+        "This agent was disconnected from Quome Cloud — run `quome connect` again. \
+         If you just reconnected, check this computer's clock is correct."
+    )]
+    CloudInvalidGrant,
+
     /// The user has not finished approving in the browser (401 `agent_not_connected`).
     #[error("Finish approving in the browser, then try again.")]
     CloudNotYetConnected,

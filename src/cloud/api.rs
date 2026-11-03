@@ -1,10 +1,12 @@
 //! Quome Cloud API client: bearer-authenticated calls under `<api_url>/api/v1`.
-use super::auth::TokenSource;
+use super::auth::{TokenSource, CONNECT_TIMEOUT, REQUEST_TIMEOUT};
 use super::state::Profile;
 use crate::errors::QuomeError;
+use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use reqwest::{Method, RequestBuilder, Response};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::time::Duration;
 
 /// Largest body of one upload request.
 pub const UPLOAD_CHUNK: usize = 8 * 1024 * 1024;
@@ -146,21 +148,30 @@ fn check_name_size(name: &str, memory_gb: f64) -> Result<(), QuomeError> {
     Ok(())
 }
 
-/// Turn a non-success response into the right error.
-async fn check(resp: Response) -> Result<Response, QuomeError> {
-    let status = resp.status();
-    if status.is_success() {
-        return Ok(resp);
-    }
-    let text = resp.text().await.unwrap_or_default();
-    let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+/// Per-request timeout for uploads (source tars and file chunks).
+pub const UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Path-segment encoding: everything but unreserved characters (no `.`, so `..` cannot survive).
+const SEGMENT: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'_');
+
+fn enc(s: &str) -> String {
+    utf8_percent_encode(s, SEGMENT).to_string()
+}
+
+fn is_session_reason(reason: &str) -> bool {
+    reason == "delegation_revoked" || reason == "agent_not_connected"
+}
+
+/// Map a non-success status and body to the right error.
+fn map_error(status: u16, text: &str) -> QuomeError {
+    let v: serde_json::Value = serde_json::from_str(text).unwrap_or_default();
     let reason = v["reason"].as_str().unwrap_or("");
     let detail = match &v["detail"] {
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Null => String::new(),
         other => other.to_string(),
     };
-    Err(match status.as_u16() {
+    match status {
         401 if reason == "delegation_revoked" => QuomeError::CloudDisconnected,
         401 if reason == "agent_not_connected" => QuomeError::CloudNotYetConnected,
         404 => QuomeError::NotFound(if reason.is_empty() {
@@ -178,57 +189,98 @@ async fn check(resp: Response) -> Result<Response, QuomeError> {
                 .join(": ");
             QuomeError::ApiError(format!("{code} {msg}").trim().to_string())
         }
-    })
+    }
+}
+
+async fn check(resp: Response) -> Result<Response, QuomeError> {
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp);
+    }
+    let text = resp.text().await.unwrap_or_default();
+    Err(map_error(status.as_u16(), &text))
 }
 
 impl CloudApi {
     pub fn new(profile: &Profile, tokens: TokenSource) -> CloudApi {
+        Self::with_timeout(profile, tokens, REQUEST_TIMEOUT)
+    }
+
+    pub(crate) fn with_timeout(
+        profile: &Profile,
+        tokens: TokenSource,
+        timeout: Duration,
+    ) -> CloudApi {
         CloudApi {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .timeout(timeout)
+                .build()
+                .unwrap_or_default(),
             base: format!("{}/api/v1", profile.api_url.trim_end_matches('/')),
             org: profile.org_id.clone(),
             tokens,
         }
     }
 
-    async fn req(&self, m: Method, path: &str) -> Result<RequestBuilder, QuomeError> {
-        let token = self.tokens.access_token().await?;
-        Ok(self
-            .http
-            .request(m, format!("{}{}", self.base, path))
-            .bearer_auth(token))
+    /// Send an authenticated request. A 401 that is not a known session reason
+    /// drops the cached token, re-exchanges and retries once.
+    async fn send(
+        &self,
+        m: Method,
+        path: &str,
+        build: impl Fn(RequestBuilder) -> RequestBuilder,
+    ) -> Result<Response, QuomeError> {
+        let url = format!("{}{}", self.base, path);
+        let mut retried = false;
+        loop {
+            let token = self.tokens.access_token().await?;
+            let resp = build(self.http.request(m.clone(), &url).bearer_auth(&token))
+                .send()
+                .await?;
+            if resp.status().as_u16() != 401 {
+                return check(resp).await;
+            }
+            let text = resp.text().await.unwrap_or_default();
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+            if retried || is_session_reason(v["reason"].as_str().unwrap_or("")) {
+                return Err(map_error(401, &text));
+            }
+            retried = true;
+            self.tokens.invalidate(&token);
+        }
     }
 
     fn org_path(&self, rest: &str) -> String {
-        format!("/orgs/{}{}", self.org, rest)
+        format!("/orgs/{}{}", enc(&self.org), rest)
     }
 
     async fn json<T: serde::de::DeserializeOwned>(
         &self,
-        b: RequestBuilder,
+        m: Method,
+        path: &str,
+        build: impl Fn(RequestBuilder) -> RequestBuilder,
     ) -> Result<T, QuomeError> {
-        Ok(check(b.send().await?).await?.json().await?)
+        Ok(self.send(m, path, build).await?.json().await?)
     }
 
     pub async fn me(&self) -> Result<Me, QuomeError> {
-        self.json(self.req(Method::GET, "/me").await?).await
+        self.json(Method::GET, "/me", |b| b).await
     }
 
     pub async fn agent_guide(&self) -> Result<String, QuomeError> {
-        let b = self
-            .req(Method::GET, &self.org_path("/agent-guide"))
-            .await?;
-        Ok(check(b.send().await?).await?.text().await?)
+        let p = self.org_path("/agent-guide");
+        Ok(self.send(Method::GET, &p, |b| b).await?.text().await?)
     }
 
     pub async fn list_sandboxes(&self) -> Result<Vec<Sandbox>, QuomeError> {
-        self.json(self.req(Method::GET, &self.org_path("/sandboxes")).await?)
+        self.json(Method::GET, &self.org_path("/sandboxes"), |b| b)
             .await
     }
 
     pub async fn get_sandbox(&self, id: &str) -> Result<Sandbox, QuomeError> {
-        let p = self.org_path(&format!("/sandboxes/{id}"));
-        self.json(self.req(Method::GET, &p).await?).await
+        let p = self.org_path(&format!("/sandboxes/{}", enc(id)));
+        self.json(Method::GET, &p, |b| b).await
     }
 
     pub async fn create_sandbox(
@@ -244,16 +296,16 @@ impl CloudApi {
                 RUNTIMES.join(", ")
             )));
         }
-        let b = self
-            .req(Method::POST, &self.org_path("/sandboxes"))
-            .await?
-            .json(&serde_json::json!({"name": name, "memory_gb": memory_gb, "runtime": runtime}));
-        self.json(b).await
+        let body = serde_json::json!({"name": name, "memory_gb": memory_gb, "runtime": runtime});
+        self.json(Method::POST, &self.org_path("/sandboxes"), |b| {
+            b.json(&body)
+        })
+        .await
     }
 
     pub async fn stop_sandbox(&self, id: &str) -> Result<Sandbox, QuomeError> {
-        let p = self.org_path(&format!("/sandboxes/{id}/stop"));
-        self.json(self.req(Method::POST, &p).await?).await
+        let p = self.org_path(&format!("/sandboxes/{}/stop", enc(id)));
+        self.json(Method::POST, &p, |b| b).await
     }
 
     pub async fn exec(
@@ -267,82 +319,79 @@ impl CloudApi {
                 "Timeout must be 1-{MAX_EXEC_TIMEOUT} seconds."
             )));
         }
-        let p = self.org_path(&format!("/sandboxes/{id}/exec"));
-        let b = self.req(Method::POST, &p).await?.json(
-            &serde_json::json!({"command": command, "timeout": timeout, "working_dir": "/workspace"}),
-        );
-        self.json(b).await
+        let p = self.org_path(&format!("/sandboxes/{}/exec", enc(id)));
+        let body = serde_json::json!({"command": command, "timeout": timeout, "working_dir": "/workspace"});
+        self.json(Method::POST, &p, |b| b.json(&body)).await
     }
 
     pub async fn list_files(&self, id: &str, path: &str) -> Result<FileList, QuomeError> {
-        let p = self.org_path(&format!("/sandboxes/{id}/files/list"));
-        let b = self.req(Method::GET, &p).await?.query(&[("path", path)]);
-        self.json(b).await
+        let p = self.org_path(&format!("/sandboxes/{}/files/list", enc(id)));
+        self.json(Method::GET, &p, |b| b.query(&[("path", path)]))
+            .await
     }
 
     pub async fn download(&self, id: &str, path: &str) -> Result<Vec<u8>, QuomeError> {
-        let p = self.org_path(&format!("/sandboxes/{id}/files/download"));
-        let b = self.req(Method::GET, &p).await?.query(&[("path", path)]);
-        Ok(check(b.send().await?).await?.bytes().await?.to_vec())
+        let p = self.org_path(&format!("/sandboxes/{}/files/download", enc(id)));
+        let r = self
+            .send(Method::GET, &p, |b| b.query(&[("path", path)]))
+            .await?;
+        Ok(r.bytes().await?.to_vec())
     }
 
     /// Upload `bytes` to `path`: one request up to 8 MiB, otherwise sequential
     /// chunks sharing one `upload_id`, the last marked `final=true`.
     pub async fn upload(&self, id: &str, path: &str, bytes: &[u8]) -> Result<(), QuomeError> {
-        let p = self.org_path(&format!("/sandboxes/{id}/workspace-files"));
+        let p = self.org_path(&format!("/sandboxes/{}/workspace-files", enc(id)));
         if bytes.len() <= UPLOAD_CHUNK {
-            let b = self
-                .req(Method::PUT, &p)
-                .await?
-                .query(&[("path", path)])
-                .body(bytes.to_vec());
-            check(b.send().await?).await?;
+            self.send(Method::PUT, &p, |b| {
+                b.query(&[("path", path)])
+                    .timeout(UPLOAD_TIMEOUT)
+                    .body(bytes.to_vec())
+            })
+            .await?;
             return Ok(());
         }
         let upload_id = uuid::Uuid::new_v4().simple().to_string();
         let total = bytes.len().div_ceil(UPLOAD_CHUNK);
         for (i, chunk) in bytes.chunks(UPLOAD_CHUNK).enumerate() {
-            let b = self
-                .req(Method::PUT, &p)
-                .await?
-                .query(&[
+            let offset = (i * UPLOAD_CHUNK).to_string();
+            let last = if i + 1 == total { "true" } else { "false" };
+            self.send(Method::PUT, &p, |b| {
+                b.query(&[
                     ("path", path),
                     ("upload_id", upload_id.as_str()),
-                    ("offset", (i * UPLOAD_CHUNK).to_string().as_str()),
-                    ("final", if i + 1 == total { "true" } else { "false" }),
+                    ("offset", offset.as_str()),
+                    ("final", last),
                 ])
-                .body(chunk.to_vec());
-            check(b.send().await?).await?;
+                .timeout(UPLOAD_TIMEOUT)
+                .body(chunk.to_vec())
+            })
+            .await?;
         }
         Ok(())
     }
 
     pub async fn ports(&self, id: &str) -> Result<Ports, QuomeError> {
-        let p = self.org_path(&format!("/sandboxes/{id}/ports"));
-        self.json(self.req(Method::GET, &p).await?).await
+        let p = self.org_path(&format!("/sandboxes/{}/ports", enc(id)));
+        self.json(Method::GET, &p, |b| b).await
     }
 
     pub async fn expose_port(&self, id: &str, port: u16) -> Result<Port, QuomeError> {
-        let p = self.org_path(&format!("/sandboxes/{id}/ports"));
-        let b = self
-            .req(Method::POST, &p)
-            .await?
-            .json(&serde_json::json!({"port": port}));
-        self.json(b).await
+        let p = self.org_path(&format!("/sandboxes/{}/ports", enc(id)));
+        let body = serde_json::json!({"port": port});
+        self.json(Method::POST, &p, |b| b.json(&body)).await
     }
 
     pub async fn list_services(&self) -> Result<Vec<Service>, QuomeError> {
-        self.json(self.req(Method::GET, &self.org_path("/services")).await?)
+        self.json(Method::GET, &self.org_path("/services"), |b| b)
             .await
     }
 
     pub async fn create_app(&self, name: &str, memory_gb: f64) -> Result<Service, QuomeError> {
         check_name_size(name, memory_gb)?;
-        let b = self
-            .req(Method::POST, &self.org_path("/services"))
-            .await?
-            .json(&serde_json::json!({"kind": "app", "name": name, "memory_gb": memory_gb}));
-        self.json(b).await
+        let body = serde_json::json!({"kind": "app", "name": name, "memory_gb": memory_gb});
+        self.json(Method::POST, &self.org_path("/services"), |b| b.json(&body))
+            .await
     }
 
     pub async fn upload_source(
@@ -350,24 +399,27 @@ impl CloudApi {
         app_id: &str,
         tar_path: &Path,
     ) -> Result<SourceUpload, QuomeError> {
-        let bytes = std::fs::read(tar_path)?;
-        let p = format!("/uploads/orgs/{}/apps/{app_id}/source", self.org);
-        let b = self.req(Method::PUT, &p).await?.body(bytes);
-        self.json(b).await
+        let bytes = tokio::fs::read(tar_path).await?;
+        let p = format!(
+            "/uploads/orgs/{}/apps/{}/source",
+            enc(&self.org),
+            enc(app_id)
+        );
+        self.json(Method::PUT, &p, |b| {
+            b.timeout(UPLOAD_TIMEOUT).body(bytes.clone())
+        })
+        .await
     }
 
     pub async fn deploy(&self, app_id: &str, source_key: &str) -> Result<Deploy, QuomeError> {
-        let p = self.org_path(&format!("/apps/{app_id}/deploy"));
-        let b = self
-            .req(Method::POST, &p)
-            .await?
-            .json(&serde_json::json!({"source_key": source_key}));
-        self.json(b).await
+        let p = self.org_path(&format!("/apps/{}/deploy", enc(app_id)));
+        let body = serde_json::json!({"source_key": source_key});
+        self.json(Method::POST, &p, |b| b.json(&body)).await
     }
 
     pub async fn build(&self, app_id: &str, build_id: &str) -> Result<Build, QuomeError> {
-        let p = self.org_path(&format!("/apps/{app_id}/builds/{build_id}"));
-        self.json(self.req(Method::GET, &p).await?).await
+        let p = self.org_path(&format!("/apps/{}/builds/{}", enc(app_id), enc(build_id)));
+        self.json(Method::GET, &p, |b| b).await
     }
 }
 
@@ -690,5 +742,215 @@ mod tests {
             vec![1, 2, 3]
         );
         assert_eq!(api.list_services().await.unwrap()[0].name, "web");
+    }
+
+    #[tokio::test]
+    async fn sandbox_get_list_stop() {
+        let (s, api) = setup().await;
+        let sb = |st: &str| serde_json::json!({"id":"s1","name":"n","status":st,"runtime":"claude","memory_gb":4.0});
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v1/orgs/{ORG}/sandboxes")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([sb("running")])),
+            )
+            .expect(1)
+            .mount(&s)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v1/orgs/{ORG}/sandboxes/s1")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(sb("running")))
+            .expect(1)
+            .mount(&s)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/api/v1/orgs/{ORG}/sandboxes/s1/stop")))
+            .respond_with(ResponseTemplate::new(202).set_body_json(sb("stopping")))
+            .expect(1)
+            .mount(&s)
+            .await;
+        assert_eq!(api.list_sandboxes().await.unwrap()[0].id, "s1");
+        assert_eq!(api.get_sandbox("s1").await.unwrap().status, "running");
+        assert_eq!(api.stop_sandbox("s1").await.unwrap().status, "stopping");
+    }
+
+    async fn put_count(s: &MockServer) -> Vec<wiremock::Request> {
+        s.received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.method.as_str() == "PUT")
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn upload_exactly_8_mib_is_single_and_one_more_byte_is_chunked() {
+        let (s, api) = setup().await;
+        Mock::given(method("PUT"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"uploaded":true})),
+            )
+            .mount(&s)
+            .await;
+        api.upload("s1", "/workspace/a", &vec![1u8; UPLOAD_CHUNK])
+            .await
+            .unwrap();
+        let puts = put_count(&s).await;
+        assert_eq!(puts.len(), 1);
+        assert!(!puts[0].url.query().unwrap().contains("upload_id"));
+        api.upload("s1", "/workspace/b", &vec![1u8; UPLOAD_CHUNK + 1])
+            .await
+            .unwrap();
+        let puts = put_count(&s).await;
+        assert_eq!(puts.len(), 3);
+        assert!(puts[1].url.query().unwrap().contains("final=false"));
+        assert!(puts[2].url.query().unwrap().contains("final=true"));
+        assert_eq!(puts[2].body.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn revoked_after_exchange_is_not_retried() {
+        let (s, api) = setup().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/me"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(
+                serde_json::json!({"detail":"unauthorized","reason":"delegation_revoked"}),
+            ))
+            .expect(1)
+            .mount(&s)
+            .await;
+        assert!(matches!(
+            api.me().await.unwrap_err(),
+            QuomeError::CloudDisconnected
+        ));
+        let n = s
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() == "/oauth/token")
+            .count();
+        assert_eq!(n, 1);
+    }
+
+    async fn two_token_server() -> (MockServer, CloudApi) {
+        let s = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"token_endpoint": format!("{}/oauth/token", s.uri())}),
+            ))
+            .mount(&s)
+            .await;
+        for tok in ["AT1", "AT2"] {
+            Mock::given(method("POST")).and(path("/oauth/token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"access_token": tok, "token_type":"Bearer","expires_in":3600})))
+                .up_to_n_times(1).mount(&s).await;
+        }
+        let p = profile(&s.uri());
+        let api = CloudApi::new(&p, TokenSource::new(&p, AgentKey::generate(), "vrc".into()));
+        (s, api)
+    }
+
+    #[tokio::test]
+    async fn other_401_refreshes_token_and_retries_once() {
+        let (s, api) = two_token_server().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/orgs/".to_string() + ORG + "/services"))
+            .and(header("authorization", "Bearer AT1"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(
+                serde_json::json!({"detail":"unauthorized","reason":"invalid_token"}),
+            ))
+            .expect(1)
+            .mount(&s)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/orgs/".to_string() + ORG + "/services"))
+            .and(header("authorization", "Bearer AT2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(1)
+            .mount(&s)
+            .await;
+        assert!(api.list_services().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn persistent_401_is_retried_only_once() {
+        let (s, api) = two_token_server().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/me"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(
+                serde_json::json!({"detail":"unauthorized","reason":"invalid_token"}),
+            ))
+            .expect(2)
+            .mount(&s)
+            .await;
+        let e = api.me().await.unwrap_err();
+        assert!(e.to_string().contains("401"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn ids_are_percent_encoded() {
+        let (s, api) = setup().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&s)
+            .await;
+        let _ = api.get_sandbox("../x/a?b#c").await;
+        let _ = api.list_files("s1", "/workspace/a b&c=d").await;
+        let reqs = s.received_requests().await.unwrap();
+        let r = reqs
+            .iter()
+            .find(|r| r.url.path().contains("sandboxes/%"))
+            .expect("encoded segment");
+        assert_eq!(
+            r.url.path(),
+            format!("/api/v1/orgs/{ORG}/sandboxes/%2E%2E%2Fx%2Fa%3Fb%23c")
+        );
+        assert_eq!(r.url.query(), None);
+        let l = reqs
+            .iter()
+            .find(|r| r.url.path().ends_with("/files/list"))
+            .unwrap();
+        let pairs: Vec<_> = l.url.query_pairs().collect();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].1, "/workspace/a b&c=d");
+    }
+
+    #[tokio::test]
+    async fn slow_api_times_out() {
+        let s = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"token_endpoint": format!("{}/oauth/token", s.uri())}),
+            ))
+            .mount(&s)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"access_token":"AT","expires_in":3600})),
+            )
+            .mount(&s)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/me"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(3)))
+            .mount(&s)
+            .await;
+        let p = profile(&s.uri());
+        let api = CloudApi::with_timeout(
+            &p,
+            TokenSource::new(&p, AgentKey::generate(), "v".into()),
+            Duration::from_millis(200),
+        );
+        let started = std::time::Instant::now();
+        let e = api.me().await.unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(
+            matches!(e, QuomeError::Http(ref h) if h.is_timeout()),
+            "{e}"
+        );
     }
 }
