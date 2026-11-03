@@ -47,6 +47,8 @@ tiny_http = "0.12"
 gethostname = "0.5"
 tar = { version = "0.4", default-features = false }
 tempfile = "3"
+rmcp = { version = "2.2", default-features = false, features = ["server", "macros", "transport-io"] }
+schemars = "1"
 
 [dev-dependencies]
 wiremock = "0.6"

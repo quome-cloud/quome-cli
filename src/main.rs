@@ -94,6 +94,13 @@ enum Commands {
     },
     /// Connect this computer to Quome Cloud
     Connect(commands::connect::Args),
+    /// Run the Quome Cloud MCP server (stdio) for Claude Code
+    Mcp(commands::mcp::Args),
+    /// Inspect or drop this computer's Quome Cloud connection
+    Cloud {
+        #[command(subcommand)]
+        command: commands::cloud::CloudCommands,
+    },
     /// Upgrade quome to the latest version
     Upgrade,
 }
@@ -121,6 +128,8 @@ async fn main() {
         Commands::Fn(args) => commands::functions::execute(args).await,
         Commands::Host { command } => commands::host::execute(command).await,
         Commands::Connect(args) => commands::connect::execute(args).await,
+        Commands::Mcp(args) => commands::mcp::execute(args).await,
+        Commands::Cloud { command } => commands::cloud::execute(command).await,
         Commands::Upgrade => commands::upgrade::execute().await,
     };
 
