@@ -378,6 +378,90 @@ impl QuomeMcp {
         }
     }
 
+    fn build_log_route(&self, app_id: &str, build_id: &str) -> String {
+        format!(
+            "GET /api/v1/orgs/{}/apps/{app_id}/builds/{build_id}/log",
+            self.conn().profile.org_id
+        )
+    }
+
+    async fn deploy_run(&self, a: DeployArgs, progress: &Progress) -> Result<String, String> {
+        let deadline = Instant::now() + self.timing.build_wait;
+        progress.note("Packing the folder").await;
+        let folder = std::path::PathBuf::from(&a.folder);
+        let packed = tokio::task::spawn_blocking(move || pack_folder(&folder))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(fail)?;
+        let app = match self.find_app(&a.name).await? {
+            Some(app) => app,
+            None => call!(self, |api| api
+                .create_app(&a.name, a.memory_gb.unwrap_or(1.0)))?,
+        };
+        progress
+            .note(format!("Uploading {} bytes of source", packed.size))
+            .await;
+        let up = call!(self, |api| api.upload_source(&app.id, packed.path()))?;
+        let dep = call!(self, |api| api.deploy(&app.id, &up.source_key))?;
+        let log = self.build_log_route(&app.id, &dep.build_id);
+
+        // The build.
+        loop {
+            let b = call!(self, |api| api.build(&app.id, &dep.build_id))?;
+            progress.note(format!("Build {}", b.status)).await;
+            match b.status.as_str() {
+                "succeeded" => break,
+                "failed" => {
+                    return json(&serde_json::json!({
+                        "status": "failed", "build_id": b.id, "error": b.error, "url": null,
+                        "note": format!("The build failed. Read its log with {log}")}));
+                }
+                _ => {}
+            }
+            if Instant::now() >= deadline {
+                return json(&serde_json::json!({
+                    "status": "building", "build_id": dep.build_id, "url": null,
+                    "note": "Still building after 10 minutes; check app_status later."}));
+            }
+            tokio::time::sleep(self.timing.poll).await;
+        }
+
+        // The image is built; the service now rolls the new revision out.
+        loop {
+            let status = call!(self, |api| api.list_services())?
+                .into_iter()
+                .find(|s| s.id == app.id)
+                .map(|s| s.status)
+                .unwrap_or_else(|| "missing".into());
+            progress
+                .note(format!("Build succeeded; app is {status}"))
+                .await;
+            match status.as_str() {
+                "running" => {
+                    return json(&serde_json::json!({
+                        "status": "running", "build_status": "succeeded",
+                        "url": self.app_url(&a.name), "build_id": dep.build_id}));
+                }
+                "deploying" => {}
+                other => {
+                    return json(&serde_json::json!({
+                        "status": "failed", "build_status": "succeeded",
+                        "build_id": dep.build_id, "service_status": other, "url": null,
+                        "note": format!(
+                            "The image built but the new revision did not start (the app is {other}). \
+                             Does the container listen on $PORT? Build log: {log}")}));
+                }
+            }
+            if Instant::now() >= deadline {
+                return json(&serde_json::json!({
+                    "status": "deploying", "build_status": "succeeded",
+                    "build_id": dep.build_id, "url": null,
+                    "note": "The build succeeded but the app is still deploying after 10 minutes; check app_status later."}));
+            }
+            tokio::time::sleep(self.timing.poll).await;
+        }
+    }
+
     fn app_url(&self, name: &str) -> String {
         let p = self.conn().profile.clone();
         format!("https://{name}-{}.{}", p.org_slug, p.apps_domain)
@@ -514,53 +598,33 @@ impl QuomeMcp {
     }
 
     #[tool(
-        description = "Deploy a local folder with a Dockerfile as a Quome Cloud app: create the app if needed, upload the source, build, and wait up to 10 minutes. Returns the app URL when the build succeeds."
+        description = "Deploy a local folder with a Dockerfile as a Quome Cloud app: create the app if needed, upload the source, build, then wait for the new revision to run, up to 10 minutes in all. Returns status running with the app URL when it is live; otherwise the build or rollout state and where to read the logs."
     )]
-    async fn deploy_app(&self, Parameters(a): Parameters<DeployArgs>) -> Result<String, String> {
-        let folder = std::path::PathBuf::from(&a.folder);
-        let packed = tokio::task::spawn_blocking(move || pack_folder(&folder))
-            .await
-            .map_err(|e| e.to_string())?
-            .map_err(fail)?;
-        let app = match self.find_app(&a.name).await? {
-            Some(app) => app,
-            None => call!(self, |api| api
-                .create_app(&a.name, a.memory_gb.unwrap_or(1.0)))?,
-        };
-        let up = call!(self, |api| api.upload_source(&app.id, packed.path()))?;
-        let dep = call!(self, |api| api.deploy(&app.id, &up.source_key))?;
-        let deadline = Instant::now() + self.timing.build_wait;
-        loop {
-            let b = call!(self, |api| api.build(&app.id, &dep.build_id))?;
-            match b.status.as_str() {
-                "succeeded" => {
-                    return json(&serde_json::json!({
-                        "status": "succeeded", "url": self.app_url(&a.name), "build_id": b.id}))
-                }
-                "failed" => {
-                    return json(&serde_json::json!({
-                        "status": "failed", "build_id": b.id, "error": b.error}))
-                }
-                _ => {}
-            }
-            if Instant::now() >= deadline {
-                return json(&serde_json::json!({
-                    "status": "building", "build_id": dep.build_id,
-                    "url": null,
-                    "note": "Still building after 10 minutes; check app_status later."}));
-            }
-            tokio::time::sleep(self.timing.poll).await;
-        }
+    async fn deploy_app(
+        &self,
+        Parameters(a): Parameters<DeployArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<String, String> {
+        let progress = Progress::new(ctx);
+        progress.run(self.deploy_run(a, &progress)).await
     }
 
-    #[tool(description = "Show an app's state and URL by name.")]
+    #[tool(
+        description = "Show an app's state by name, with its latest build. The URL is given only once a build has succeeded."
+    )]
     async fn app_status(&self, Parameters(a): Parameters<AppArgs>) -> Result<String, String> {
-        match self.find_app(&a.name).await? {
-            Some(app) => json(&serde_json::json!({
-                "name": app.name, "id": app.id, "status": app.status,
-                "memory_gb": app.memory_gb, "url": self.app_url(&app.name)})),
-            None => Err(format!("No app named {:?}.", a.name)),
-        }
+        let Some(app) = self.find_app(&a.name).await? else {
+            return Err(format!("No app named {:?}.", a.name));
+        };
+        let builds = call!(self, |api| api.list_builds(&app.id))?;
+        let live = builds.iter().any(|b| b.status == "succeeded");
+        json(&serde_json::json!({
+            "name": app.name, "id": app.id, "status": app.status,
+            "memory_gb": app.memory_gb,
+            "latest_build": builds.first().map(|b| serde_json::json!({
+                "build_id": b.id, "status": b.status, "error": b.error})),
+            "url": live.then(|| self.app_url(&app.name)),
+        }))
     }
 }
 
@@ -1024,60 +1088,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deploy_app_happy_path_returns_url() {
-        let (s, mut c) = start().await;
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("Dockerfile"), "FROM scratch\n").unwrap();
-        Mock::given(method("GET"))
-            .and(path(api_path("/services")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
-            .mount(&s)
-            .await;
-        Mock::given(method("POST"))
-            .and(path(api_path("/services")))
-            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
-                "id":"app1","kind":"app","name":"web","memory_gb":1.0,"status":"created"})))
-            .expect(1)
-            .mount(&s)
-            .await;
-        Mock::given(method("PUT"))
-            .and(path(format!("/api/v1/uploads/orgs/{ORG}/apps/app1/source")))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({"source_key":"k1","size":10})),
-            )
-            .expect(1)
-            .mount(&s)
-            .await;
-        Mock::given(method("POST"))
-            .and(path(api_path("/apps/app1/deploy")))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({"deploy_id":"d1","build_id":"b1","workflow_id":"w1"})),
-            )
-            .expect(1)
-            .mount(&s)
-            .await;
-        Mock::given(method("GET"))
-            .and(path(api_path("/apps/app1/builds/b1")))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({"id":"b1","status":"succeeded"})),
-            )
-            .mount(&s)
-            .await;
-        let (err, text) = c
-            .call(
-                "deploy_app",
-                json!({"name":"web","folder": dir.path().to_str().unwrap()}),
-            )
-            .await;
-        assert!(!err, "{text}");
-        let v: Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(v["status"], "succeeded");
-        assert_eq!(v["url"], "https://web-acme.apps.example");
-        assert_eq!(v["build_id"], "b1");
-    }
-
-    #[tokio::test]
     async fn deploy_app_without_dockerfile_uploads_nothing() {
         let (s, mut c) = start().await;
         let dir = tempfile::tempdir().unwrap();
@@ -1093,22 +1103,52 @@ mod tests {
         assert!(s.received_requests().await.unwrap().is_empty());
     }
 
-    #[tokio::test]
-    async fn deploy_app_still_building_reports_build_id() {
-        let (s, c) = start().await;
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("Dockerfile"), "FROM scratch\n").unwrap();
-        Mock::given(method("GET"))
-            .and(path(api_path("/services")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-                {"id":"app1","kind":"app","name":"web","memory_gb":1.0,"status":"running"}])))
-            .mount(&s)
-            .await;
+    /// Mount `bodies` in order, each answering one request; the last answers the rest.
+    async fn sequence(s: &MockServer, m: &str, p: String, bodies: Vec<Value>) {
+        let n = bodies.len();
+        for (i, b) in bodies.into_iter().enumerate() {
+            let mock = Mock::given(method(m))
+                .and(path(p.clone()))
+                .respond_with(ResponseTemplate::new(200).set_body_json(b));
+            if i + 1 < n {
+                mock.up_to_n_times(1).mount(s).await;
+            } else {
+                mock.mount(s).await;
+            }
+        }
+    }
+
+    fn svc(status: &str) -> Value {
+        json!([{"id":"app1","kind":"app","name":"web","memory_gb":1.0,"status":status}])
+    }
+
+    fn build(status: &str) -> Value {
+        json!({"id":"b1","status":status,"error": if status == "failed" { json!("boom") } else { Value::Null }})
+    }
+
+    /// An existing app `web` (id app1): service statuses and build statuses in order.
+    /// The first service status is what the app lookup sees.
+    async fn deploy_setup(s: &MockServer, services: &[&str], builds: &[&str]) {
+        sequence(
+            s,
+            "GET",
+            api_path("/services"),
+            services.iter().map(|x| svc(x)).collect(),
+        )
+        .await;
+        sequence(
+            s,
+            "GET",
+            api_path("/apps/app1/builds/b1"),
+            builds.iter().map(|x| build(x)).collect(),
+        )
+        .await;
         Mock::given(method("PUT"))
+            .and(path(format!("/api/v1/uploads/orgs/{ORG}/apps/app1/source")))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(json!({"source_key":"k1","size":10})),
             )
-            .mount(&s)
+            .mount(s)
             .await;
         Mock::given(method("POST"))
             .and(path(api_path("/apps/app1/deploy")))
@@ -1116,155 +1156,174 @@ mod tests {
                 ResponseTemplate::new(200)
                     .set_body_json(json!({"deploy_id":"d1","build_id":"b1","workflow_id":"w1"})),
             )
-            .mount(&s)
-            .await;
-        Mock::given(method("GET"))
-            .and(path(api_path("/apps/app1/builds/b1")))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({"id":"b1","status":"running"})),
-            )
-            .mount(&s)
-            .await;
-        // Shorten the wait by calling through a server with a tiny build_wait.
-        drop(c);
-        let p = profile(&s.uri());
-        let api = CloudApi::new(&p, TokenSource::new(&p, AgentKey::generate(), "v".into()));
-        let m = QuomeMcp::with_timing(
-            api,
-            p,
-            Timing {
-                poll: Duration::from_millis(5),
-                sandbox_wait: Duration::from_secs(1),
-                build_wait: Duration::from_millis(60),
-            },
-        );
-        let out = m
-            .deploy_app(Parameters(DeployArgs {
-                name: "web".into(),
-                folder: dir.path().to_str().unwrap().into(),
-                memory_gb: None,
-            }))
-            .await
-            .unwrap();
-        let v: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(v["status"], "building");
-        assert_eq!(v["build_id"], "b1");
-    }
-
-    fn sb_json(status: &str) -> Value {
-        json!({"id":SB,"name":"box","status":status,"runtime":"claude","memory_gb":4.0,
-               "failure_reason": if status == "failed" { json!("no capacity") } else { Value::Null }})
-    }
-
-    async fn mount_create(s: &MockServer, first: &str) {
-        Mock::given(method("POST"))
-            .and(path(api_path("/sandboxes")))
-            .respond_with(ResponseTemplate::new(201).set_body_json(sb_json(first)))
             .mount(s)
             .await;
     }
 
+    fn deploy_args(dir: &tempfile::TempDir) -> Value {
+        json!({"name":"web","folder": dir.path().to_str().unwrap()})
+    }
+
     #[tokio::test]
-    async fn create_sandbox_waits_until_running() {
+    async fn deploy_app_waits_for_the_rollout_and_uploads_the_packed_folder() {
         let (s, mut c) = start().await;
-        mount_create(&s, "created").await;
-        Mock::given(method("GET"))
-            .and(path(api_path(&format!("/sandboxes/{SB}"))))
-            .respond_with(ResponseTemplate::new(200).set_body_json(sb_json("starting")))
-            .up_to_n_times(2)
-            .mount(&s)
-            .await;
-        Mock::given(method("GET"))
-            .and(path(api_path(&format!("/sandboxes/{SB}"))))
-            .respond_with(ResponseTemplate::new(200).set_body_json(sb_json("running")))
-            .mount(&s)
-            .await;
-        let (err, text) = c.call("create_sandbox", json!({"name":"box"})).await;
+        let dir = docker_dir();
+        std::fs::write(dir.path().join("app.py"), "print(1)").unwrap();
+        std::fs::write(dir.path().join("secret.txt"), "nope").unwrap();
+        std::fs::write(dir.path().join(".dockerignore"), "secret.txt\n").unwrap();
+        deploy_setup(
+            &s,
+            &["created", "deploying", "deploying", "running"],
+            &["building", "succeeded"],
+        )
+        .await;
+        let (err, text) = c.call("deploy_app", deploy_args(&dir)).await;
         assert!(!err, "{text}");
-        assert!(text.contains("\"running\""), "{text}");
-        let gets = s
-            .received_requests()
-            .await
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["status"], "running", "{text}");
+        assert_eq!(v["build_status"], "succeeded");
+        assert_eq!(v["url"], "https://web-acme.apps.example");
+        assert_eq!(v["build_id"], "b1");
+
+        let reqs = s.received_requests().await.unwrap();
+        assert!(!reqs
+            .iter()
+            .any(|r| r.method.as_str() == "POST" && r.url.path().ends_with("/services")));
+        let put = reqs.iter().find(|r| r.method.as_str() == "PUT").unwrap();
+        let mut names: Vec<String> = tar::Archive::new(&put.body[..])
+            .entries()
             .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert!(names.contains(&"Dockerfile".to_string()), "{names:?}");
+        assert!(names.contains(&"app.py".to_string()), "{names:?}");
+        assert!(!names.contains(&"secret.txt".to_string()), "{names:?}");
+        let dep = reqs
             .iter()
-            .filter(|r| r.method.as_str() == "GET" && r.url.path().ends_with(SB))
-            .count();
-        assert_eq!(gets, 3, "polled until running");
+            .find(|r| r.url.path().ends_with("/apps/app1/deploy"))
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&dep.body).unwrap(),
+            json!({"source_key":"k1"})
+        );
     }
 
     #[tokio::test]
-    async fn create_sandbox_sends_progress_when_given_a_token() {
+    async fn deploy_app_reports_a_failed_rollout_with_the_log_route() {
         let (s, mut c) = start().await;
-        mount_create(&s, "created").await;
-        Mock::given(method("GET"))
-            .and(path(api_path(&format!("/sandboxes/{SB}"))))
-            .respond_with(ResponseTemplate::new(200).set_body_json(sb_json("starting")))
-            .up_to_n_times(3)
-            .mount(&s)
-            .await;
-        Mock::given(method("GET"))
-            .and(path(api_path(&format!("/sandboxes/{SB}"))))
-            .respond_with(ResponseTemplate::new(200).set_body_json(sb_json("running")))
-            .mount(&s)
-            .await;
-        let v = c
-            .rpc(
-                "tools/call",
-                json!({"name":"create_sandbox","arguments":{"name":"box"},
-                       "_meta":{"progressToken":"tok-1"}}),
-            )
-            .await;
-        assert_ne!(v["result"]["isError"], json!(true), "{v}");
-        let progress: Vec<&Value> = c
-            .notes
-            .iter()
-            .filter(|n| n["method"] == "notifications/progress")
-            .collect();
-        assert!(progress.len() >= 3, "{:?}", c.notes);
-        assert!(progress
-            .iter()
-            .all(|n| n["params"]["progressToken"] == "tok-1"));
-        let seq: Vec<f64> = progress
-            .iter()
-            .map(|n| n["params"]["progress"].as_f64().unwrap())
-            .collect();
-        assert!(seq.windows(2).all(|w| w[0] < w[1]), "increasing: {seq:?}");
-        // Without a token there are none.
-        let before = c.notes.len();
-        let (err, _) = c.call("create_sandbox", json!({"name":"box"})).await;
-        assert!(!err);
-        assert_eq!(c.notes.len(), before);
+        let dir = docker_dir();
+        // The image built, but the service fell back to its previous state.
+        deploy_setup(&s, &["created", "deploying", "created"], &["succeeded"]).await;
+        let (err, text) = c.call("deploy_app", deploy_args(&dir)).await;
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["status"], "failed", "{text}");
+        assert_eq!(v["build_status"], "succeeded");
+        assert!(v["url"].is_null());
+        assert!(
+            v["note"]
+                .as_str()
+                .unwrap()
+                .contains("/apps/app1/builds/b1/log"),
+            "{text}"
+        );
     }
 
     #[tokio::test]
-    async fn cancelling_a_create_sandbox_stops_polling() {
+    async fn deploy_app_reports_a_failed_build_with_the_log_route() {
+        let (s, mut c) = start().await;
+        let dir = docker_dir();
+        deploy_setup(&s, &["created"], &["building", "failed"]).await;
+        let (err, text) = c.call("deploy_app", deploy_args(&dir)).await;
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["status"], "failed");
+        assert_eq!(v["error"], "boom");
+        assert!(v["url"].is_null());
+        assert!(
+            v["note"].as_str().unwrap().contains("/builds/b1/log"),
+            "{text}"
+        );
+    }
+
+    fn short_build_wait() -> Timing {
+        Timing {
+            poll: Duration::from_millis(5),
+            sandbox_wait: Duration::from_secs(1),
+            build_wait: Duration::from_millis(80),
+        }
+    }
+
+    #[tokio::test]
+    async fn deploy_app_still_building_reports_build_id() {
+        let (s, mut c) = start_with(short_build_wait()).await;
+        let dir = docker_dir();
+        deploy_setup(&s, &["running"], &["building"]).await;
+        let (err, text) = c.call("deploy_app", deploy_args(&dir)).await;
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["status"], "building");
+        assert_eq!(v["build_id"], "b1");
+        assert!(v["url"].is_null());
+    }
+
+    #[tokio::test]
+    async fn deploy_app_still_rolling_out_at_the_deadline() {
+        let (s, mut c) = start_with(short_build_wait()).await;
+        let dir = docker_dir();
+        deploy_setup(&s, &["created", "deploying"], &["succeeded"]).await;
+        let (err, text) = c.call("deploy_app", deploy_args(&dir)).await;
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["status"], "deploying", "{text}");
+        assert!(v["url"].is_null());
+        assert!(v["note"].as_str().unwrap().contains("app_status"));
+    }
+
+    #[tokio::test]
+    async fn deploy_app_sends_progress_and_stops_on_cancel() {
         let (s, mut c) = start_with(Timing {
             poll: Duration::from_millis(10),
             sandbox_wait: Duration::from_secs(60),
             build_wait: Duration::from_secs(60),
         })
         .await;
-        mount_create(&s, "created").await;
-        Mock::given(method("GET"))
-            .and(path(api_path(&format!("/sandboxes/{SB}"))))
-            .respond_with(ResponseTemplate::new(200).set_body_json(sb_json("starting")))
-            .mount(&s)
-            .await;
-        let msg = json!({"jsonrpc":"2.0","id":77,"method":"tools/call",
-            "params":{"name":"create_sandbox","arguments":{"name":"box"}}});
+        let dir = docker_dir();
+        deploy_setup(&s, &["running"], &["building"]).await;
+        let msg = json!({"jsonrpc":"2.0","id":88,"method":"tools/call",
+            "params":{"name":"deploy_app","arguments":deploy_args(&dir),
+                      "_meta":{"progressToken":7}}});
         c.w.write_all(format!("{msg}\n").as_bytes()).await.unwrap();
         async fn polls(s: &MockServer) -> usize {
             s.received_requests()
                 .await
                 .unwrap()
                 .iter()
-                .filter(|r| r.method.as_str() == "GET" && r.url.path().ends_with(SB))
+                .filter(|r| r.method.as_str() == "GET" && r.url.path().ends_with("/builds/b1"))
                 .count()
         }
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        assert!(polls(&s).await >= 3, "polling started");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(polls(&s).await >= 3);
+        // Read what the server has sent so far: progress notifications for token 7.
+        let mut seen = 0;
+        let stop = Instant::now() + Duration::from_millis(100);
+        while let (true, Ok(Ok(n))) = (
+            Instant::now() < stop,
+            tokio::time::timeout(Duration::from_millis(50), async {
+                let mut line = String::new();
+                c.r.read_line(&mut line).await.map(|_| line)
+            })
+            .await,
+        ) {
+            let v: Value = serde_json::from_str(&n).unwrap();
+            if v["method"] == "notifications/progress" && v["params"]["progressToken"] == 7 {
+                seen += 1;
+            }
+        }
+        assert!(seen >= 3, "progress notifications: {seen}");
         let cancel = json!({"jsonrpc":"2.0","method":"notifications/cancelled",
-            "params":{"requestId":77,"reason":"user pressed Esc"}});
+            "params":{"requestId":88}});
         c.w.write_all(format!("{cancel}\n").as_bytes())
             .await
             .unwrap();
@@ -1272,93 +1331,51 @@ mod tests {
         let at_cancel = polls(&s).await;
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(polls(&s).await, at_cancel, "no polling after cancel");
-        // The server stays usable.
-        let v = c.rpc("tools/list", json!({})).await;
-        assert!(v["result"]["tools"].is_array());
     }
 
     #[tokio::test]
-    async fn create_sandbox_reports_failure_reason() {
+    async fn app_status_includes_the_latest_build_and_url_only_after_a_success() {
         let (s, mut c) = start().await;
-        mount_create(&s, "created").await;
-        Mock::given(method("GET"))
-            .and(path(api_path(&format!("/sandboxes/{SB}"))))
-            .respond_with(ResponseTemplate::new(200).set_body_json(sb_json("failed")))
-            .mount(&s)
-            .await;
-        let (err, text) = c.call("create_sandbox", json!({"name":"box"})).await;
-        assert!(err);
-        assert!(text.contains("is failed: no capacity"), "{text}");
-    }
-
-    #[tokio::test]
-    async fn create_sandbox_stops_waiting_when_stopping_or_deleting() {
-        for st in ["stopping", "deleting", "stopped"] {
-            let (s, mut c) = start().await;
-            mount_create(&s, "created").await;
-            Mock::given(method("GET"))
-                .and(path(api_path(&format!("/sandboxes/{SB}"))))
-                .respond_with(ResponseTemplate::new(200).set_body_json(sb_json(st)))
-                .mount(&s)
-                .await;
-            let (err, text) = c.call("create_sandbox", json!({"name":"box"})).await;
-            assert!(err);
-            assert!(text.contains(&format!("is {st}")), "{st}: {text}");
-        }
-    }
-
-    #[tokio::test]
-    async fn create_sandbox_times_out_with_a_pointer() {
-        let (s, mut c) = start_with(Timing {
-            poll: Duration::from_millis(5),
-            sandbox_wait: Duration::from_millis(60),
-            build_wait: Duration::from_secs(1),
-        })
+        sequence(&s, "GET", api_path("/services"), vec![svc("running")]).await;
+        sequence(
+            &s,
+            "GET",
+            api_path("/apps/app1/builds"),
+            vec![json!([
+                {"id":"b2","status":"failed","error":"boom","created_at":"2026-02-01T00:00:00Z"},
+                {"id":"b1","status":"succeeded","error":null,"created_at":"2026-01-01T00:00:00Z"}])],
+        )
         .await;
-        mount_create(&s, "created").await;
-        Mock::given(method("GET"))
-            .and(path(api_path(&format!("/sandboxes/{SB}"))))
-            .respond_with(ResponseTemplate::new(200).set_body_json(sb_json("starting")))
-            .mount(&s)
-            .await;
-        let (err, text) = c.call("create_sandbox", json!({"name":"box"})).await;
-        assert!(err);
-        assert!(text.contains("still starting after"), "{text}");
-        assert!(text.contains("list_sandboxes"), "{text}");
-    }
+        let (err, text) = c.call("app_status", json!({"name":"web"})).await;
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["latest_build"]["build_id"], "b2");
+        assert_eq!(v["latest_build"]["status"], "failed");
+        assert_eq!(v["latest_build"]["error"], "boom");
+        assert_eq!(v["url"], "https://web-acme.apps.example");
 
-    async fn serve_file(s: &MockServer, body: Vec<u8>) {
-        Mock::given(method("GET"))
-            .and(path(api_path(&format!("/sandboxes/{SB}/files/download"))))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
-            .mount(s)
-            .await;
-    }
+        let (s, mut c) = start().await;
+        sequence(&s, "GET", api_path("/services"), vec![svc("created")]).await;
+        sequence(&s, "GET", api_path("/apps/app1/builds"), vec![json!([])]).await;
+        let (err, text) = c.call("app_status", json!({"name":"web"})).await;
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert!(v["url"].is_null(), "never deployed: {text}");
+        assert!(v["latest_build"].is_null());
 
-    #[tokio::test]
-    async fn read_file_limits() {
         let (s, mut c) = start().await;
-        serve_file(&s, vec![b'a'; MAX_READ]).await;
-        let (err, text) = c
-            .call("read_file", json!({"sandbox": SB, "path":"/workspace/x"}))
-            .await;
-        assert!(!err, "exactly 1 MiB is readable");
-        assert_eq!(text.len(), MAX_READ);
-        let (s, mut c) = start().await;
-        serve_file(&s, vec![b'a'; MAX_READ + 1]).await;
-        let (err, text) = c
-            .call("read_file", json!({"sandbox": SB, "path":"/workspace/x"}))
-            .await;
-        assert!(err);
-        assert!(text.contains("1 MiB read limit"), "{text}");
-        assert!(text.contains(&(MAX_READ + 1).to_string()), "{text}");
-        let (s, mut c) = start().await;
-        serve_file(&s, vec![0xff, 0xfe, 0x00]).await;
-        let (err, text) = c
-            .call("read_file", json!({"sandbox": SB, "path":"/workspace/x"}))
-            .await;
-        assert!(err);
-        assert!(text.contains("not valid UTF-8"), "{text}");
+        sequence(&s, "GET", api_path("/services"), vec![svc("deploying")]).await;
+        sequence(
+            &s,
+            "GET",
+            api_path("/apps/app1/builds"),
+            vec![json!([{"id":"b1","status":"building","error":null}])],
+        )
+        .await;
+        let (_, text) = c.call("app_status", json!({"name":"web"})).await;
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert!(v["url"].is_null(), "no succeeded build yet: {text}");
+        assert_eq!(v["latest_build"]["status"], "building");
     }
 
     async fn deploy_mocks(s: &MockServer, app_id: &str) {

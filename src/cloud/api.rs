@@ -442,6 +442,12 @@ impl CloudApi {
         self.json(Method::POST, &p, |b| b.json(&body)).await
     }
 
+    /// An app's builds, newest first (the server returns up to 100).
+    pub async fn list_builds(&self, app_id: &str) -> Result<Vec<Build>, QuomeError> {
+        let p = self.org_path(&format!("/apps/{}/builds", enc(app_id)));
+        self.json(Method::GET, &p, |b| b).await
+    }
+
     pub async fn build(&self, app_id: &str, build_id: &str) -> Result<Build, QuomeError> {
         let p = self.org_path(&format!("/apps/{}/builds/{}", enc(app_id), enc(build_id)));
         self.json(Method::GET, &p, |b| b).await
