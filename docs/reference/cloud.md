@@ -17,6 +17,7 @@ Options:
   -h, --help               Print help
 ```
 
+<!-- e2e: replace with real output -->
 ```console
 $ quome cloud status
 Quome Cloud
@@ -25,6 +26,13 @@ Quome Cloud
   Org:     acme
   Expires: 2027-02-01
   Check:   ok
+```
+
+Not connected (real output, exit code 1):
+
+```console
+$ quome cloud status
+Not connected to Quome Cloud — run `quome connect`
 ```
 
 Exit code `0` when the check passes. It exits `1` when you are not connected ("Not connected to Quome Cloud — run `quome connect`") or the check fails (for example `Check:   failed — This agent was disconnected from Quome Cloud …`). With `--json` the output has `connected`, `profile`, `agent_name`, `agent_principal`, `org_id`, `org_slug`, `expires_at`, `api_url` and `error`.
@@ -47,6 +55,9 @@ Options:
 $ quome cloud disconnect
 Disconnected profile "cloud" from this computer.
 To revoke this agent's access in Quome Cloud, open https://console.quome.cloud/dashboard
+To remove it from Claude Code too: claude mcp remove --scope user quome
 ```
 
-This is local only: it does **not** revoke the agent. Revoke it on the console dashboard so it can no longer be used from anywhere. It also does not unregister the MCP server from Claude Code; run `claude mcp remove --scope user quome` for that.
+<!-- e2e: replace with real output -->
+
+This is local only: it does **not** revoke the agent. Revoke it on the console dashboard so it can no longer be used from anywhere. It also does not unregister the MCP server from Claude Code; the command printed last does that.

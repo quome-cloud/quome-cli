@@ -30,6 +30,7 @@ Options:
 2. **The browser opens for approval.** The CLI prints a `Key fingerprint: SHA256:abcd…wxyz` line and opens the console's connect page. The page shows the same fingerprint; **compare the two before you approve**. If they differ, do not approve.
 3. **You approve; the CLI finishes.** The console hands the grant back to a short-lived listener on `127.0.0.1`. The CLI checks the connection works, saves it, and registers the MCP server.
 
+<!-- e2e: replace with real output -->
 ```console
 $ quome connect
 Key fingerprint: SHA256:q3Zk…Hn8w
@@ -71,9 +72,13 @@ An existing user-scope `quome` server is replaced, so reconnecting updates it. I
 
 Pass `--no-mcp` to skip registration entirely.
 
+### macOS Keychain prompt after an upgrade
+
+On macOS the private key is a Keychain item that only the binary that created it may read without asking. The release binaries are not Developer-ID signed yet, so after a `brew upgrade quome` the first `quome mcp` start (or `quome cloud status`) can show a dialog: "quome wants to use your confidential information stored in "cloud.quome.agent" in your keychain." Choose **Always Allow**. If you choose Deny, or the dialog goes unseen, Claude Code shows the quome MCP server as failed with "Quome Cloud key storage: …"; restart it (`/mcp` in Claude Code) and answer the dialog, or run `quome cloud status` in a terminal to trigger it there.
+
 ### Profiles and reconnecting
 
-Run `quome connect` again at any time to reconnect, for example after the connection expires or you revoke it. The new connection replaces the saved one; the old one stays valid until it expires or you revoke it on the console dashboard, and the CLI reminds you of that. `--profile <name>` saves a second connection under another name; without it the new connection becomes the default.
+Run `quome connect` again at any time to reconnect, for example after the connection expires or you revoke it. A running `quome mcp` picks up the new connection on its next call after a disconnected error; you do not need to restart Claude Code (if it still reports the error, restart the MCP server). The new connection replaces the saved one; the old one stays valid until it expires or you revoke it on the console dashboard, and the CLI reminds you of that. `--profile <name>` saves a second connection under another name; without it the new connection becomes the default.
 
 `--json` prints a result object (`connected`, `profile`, `agent_name`, `org_id`, `org_slug`, `expires_at`, `mcp`) on stdout and sends progress lines to stderr.
 
