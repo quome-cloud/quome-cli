@@ -1,5 +1,5 @@
 //! The `quome mcp` server: Quome Cloud tools for Claude Code over MCP stdio.
-use super::api::{CloudApi, Sandbox, MAX_EXEC_TIMEOUT};
+use super::api::{CloudApi, Download, Sandbox, MAX_EXEC_TIMEOUT};
 use super::pack::pack_folder;
 use super::state::Profile;
 use crate::errors::QuomeError;
@@ -335,14 +335,23 @@ impl QuomeMcp {
     )]
     async fn read_file(&self, Parameters(a): Parameters<PathArgs>) -> Result<String, String> {
         let id = self.sandbox_id(&a.sandbox).await?;
-        let bytes = self.api.download(&id, &a.path).await.map_err(fail)?;
-        if bytes.len() > MAX_READ {
-            return Err(format!(
-                "{} is {} bytes, over the 1 MiB read limit. Use exec (for example `head -c`, `tail` or `base64`) to read part of it.",
-                a.path,
-                bytes.len()
-            ));
-        }
+        let bytes = match self
+            .api
+            .download(&id, &a.path, MAX_READ)
+            .await
+            .map_err(fail)?
+        {
+            Download::Body(b) => b,
+            Download::TooLarge(size) => {
+                let size = size
+                    .map(|n| format!("{n} bytes"))
+                    .unwrap_or_else(|| "more than 1 MiB".into());
+                return Err(format!(
+                    "{} is {size}, over the 1 MiB read limit. Use exec (for example `head -c`, `tail` or `base64`) to read part of it.",
+                    a.path
+                ));
+            }
+        };
         String::from_utf8(bytes).map_err(|_| {
             format!(
                 "{} is not valid UTF-8 text. Use exec (for example `base64 {}`) to read it.",
@@ -890,6 +899,40 @@ mod tests {
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["status"], "building");
         assert_eq!(v["build_id"], "b1");
+    }
+
+    async fn serve_file(s: &MockServer, body: Vec<u8>) {
+        Mock::given(method("GET"))
+            .and(path(api_path(&format!("/sandboxes/{SB}/files/download"))))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(s)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn read_file_limits() {
+        let (s, mut c) = start().await;
+        serve_file(&s, vec![b'a'; MAX_READ]).await;
+        let (err, text) = c
+            .call("read_file", json!({"sandbox": SB, "path":"/workspace/x"}))
+            .await;
+        assert!(!err, "exactly 1 MiB is readable");
+        assert_eq!(text.len(), MAX_READ);
+        let (s, mut c) = start().await;
+        serve_file(&s, vec![b'a'; MAX_READ + 1]).await;
+        let (err, text) = c
+            .call("read_file", json!({"sandbox": SB, "path":"/workspace/x"}))
+            .await;
+        assert!(err);
+        assert!(text.contains("1 MiB read limit"), "{text}");
+        assert!(text.contains(&(MAX_READ + 1).to_string()), "{text}");
+        let (s, mut c) = start().await;
+        serve_file(&s, vec![0xff, 0xfe, 0x00]).await;
+        let (err, text) = c
+            .call("read_file", json!({"sandbox": SB, "path":"/workspace/x"}))
+            .await;
+        assert!(err);
+        assert!(text.contains("not valid UTF-8"), "{text}");
     }
 
     async fn deploy_mocks(s: &MockServer, app_id: &str) {

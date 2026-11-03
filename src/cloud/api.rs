@@ -117,6 +117,14 @@ pub struct Build {
     pub log_url: Option<String>,
 }
 
+/// The result of a size-capped download.
+#[derive(Debug, PartialEq)]
+pub enum Download {
+    Body(Vec<u8>),
+    /// Over the cap; the size when the server declared it.
+    TooLarge(Option<u64>),
+}
+
 pub struct CloudApi {
     http: reqwest::Client,
     base: String,
@@ -332,12 +340,27 @@ impl CloudApi {
             .await
     }
 
-    pub async fn download(&self, id: &str, path: &str) -> Result<Vec<u8>, QuomeError> {
+    /// Download a file, refusing more than `max` bytes. The server sets
+    /// `Content-Length`, so an oversize file is refused before its body is read;
+    /// without one the read stops as soon as it passes `max`.
+    pub async fn download(&self, id: &str, path: &str, max: usize) -> Result<Download, QuomeError> {
         let p = self.org_path(&format!("/sandboxes/{}/files/download", enc(id)));
-        let r = self
+        let mut r = self
             .send(Method::GET, &p, |b| b.query(&[("path", path)]))
             .await?;
-        Ok(r.bytes().await?.to_vec())
+        if let Some(len) = r.content_length() {
+            if len > max as u64 {
+                return Ok(Download::TooLarge(Some(len)));
+            }
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = r.chunk().await? {
+            body.extend_from_slice(&chunk);
+            if body.len() > max {
+                return Ok(Download::TooLarge(None));
+            }
+        }
+        Ok(Download::Body(body))
     }
 
     /// Upload `bytes` to `path`: one request up to 8 MiB, otherwise sequential
@@ -740,8 +763,8 @@ mod tests {
             "a"
         );
         assert_eq!(
-            api.download("s1", "/workspace/a").await.unwrap(),
-            vec![1, 2, 3]
+            api.download("s1", "/workspace/a", 1 << 20).await.unwrap(),
+            Download::Body(vec![1, 2, 3])
         );
         assert_eq!(api.list_services().await.unwrap()[0].name, "web");
     }
@@ -916,6 +939,31 @@ mod tests {
         let pairs: Vec<_> = l.url.query_pairs().collect();
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0].1, "/workspace/a b&c=d");
+    }
+
+    #[tokio::test]
+    async fn download_refuses_on_content_length_without_reading_the_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (s, _) = setup().await;
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut c, _) = l.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = c.read(&mut buf).await;
+            // Declares 100 MiB, sends 10 bytes, then stalls.
+            let _ = c
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 104857600\r\n\r\n0123456789")
+                .await;
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+        let mut p = profile(&s.uri());
+        p.api_url = format!("http://{addr}");
+        let api = CloudApi::new(&p, TokenSource::new(&p, AgentKey::generate(), "v".into()));
+        let started = std::time::Instant::now();
+        let d = api.download("s1", "/workspace/big", 1 << 20).await.unwrap();
+        assert_eq!(d, Download::TooLarge(Some(104857600)));
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 
     #[tokio::test]
