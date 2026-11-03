@@ -42,6 +42,18 @@ impl Default for Timing {
     }
 }
 
+/// What to tell the agent about a failed build.
+fn failed_build_note(has_log: bool, route: &str) -> String {
+    if has_log {
+        format!(
+            "The build failed. log_tail is the end of the build log; the whole log is at {route}"
+        )
+    } else {
+        "The build failed before your Dockerfile ran, so there is no build log; error says why."
+            .to_string()
+    }
+}
+
 /// A user-facing message for an error. The wording lives on the error types.
 pub fn describe(e: &QuomeError) -> String {
     e.to_string()
@@ -378,6 +390,13 @@ impl QuomeMcp {
         }
     }
 
+    /// The end of a failed build's log; `None` when there is none or it
+    /// cannot be read (the failure report must not fail on it).
+    async fn log_tail(&self, app_id: &str, build_id: &str) -> Option<String> {
+        let api = self.conn().api.clone();
+        api.build_log_tail(app_id, build_id).await.ok().flatten()
+    }
+
     fn build_log_route(&self, app_id: &str, build_id: &str) -> String {
         format!(
             "GET /api/v1/orgs/{}/apps/{app_id}/builds/{build_id}/log",
@@ -412,9 +431,11 @@ impl QuomeMcp {
             match b.status.as_str() {
                 "succeeded" => break,
                 "failed" => {
+                    let tail = self.log_tail(&app.id, &b.id).await;
                     return json(&serde_json::json!({
                         "status": "failed", "build_id": b.id, "error": b.error, "url": null,
-                        "note": format!("The build failed. Read its log with {log}")}));
+                        "log_tail": tail,
+                        "note": failed_build_note(tail.is_some(), &log)}));
                 }
                 _ => {}
             }
@@ -628,11 +649,20 @@ impl QuomeMcp {
         };
         let builds = call!(self, |api| api.list_builds(&app.id))?;
         let live = builds.iter().any(|b| b.status == "succeeded");
+        let tail = match builds.first() {
+            Some(b) if b.status == "failed" => self.log_tail(&app.id, &b.id).await,
+            _ => None,
+        };
         json(&serde_json::json!({
             "name": app.name, "id": app.id, "status": app.status,
             "memory_gb": app.memory_gb,
-            "latest_build": builds.first().map(|b| serde_json::json!({
-                "build_id": b.id, "status": b.status, "error": b.error})),
+            "latest_build": builds.first().map(|b| {
+                let mut v = serde_json::json!({"build_id": b.id, "status": b.status, "error": b.error});
+                if b.status == "failed" {
+                    v["log_tail"] = serde_json::json!(tail);
+                }
+                v
+            }),
             "url": live.then(|| self.app_url(&app.name)),
         }))
     }
@@ -1279,6 +1309,35 @@ mod tests {
         assert_eq!(v["status"], "failed");
         assert_eq!(v["error"], "boom");
         assert!(v["url"].is_null());
+        assert!(v["log_tail"].is_null(), "{text}");
+        assert!(
+            v["note"].as_str().unwrap().contains("no build log"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deploy_app_returns_the_end_of_a_failed_build_log() {
+        let (s, mut c) = start().await;
+        let dir = docker_dir();
+        deploy_setup(&s, &["created"], &["building", "failed"]).await;
+        Mock::given(method("GET"))
+            .and(path(api_path("/apps/app1/builds/b1/log")))
+            .and(wiremock::matchers::query_param("tail", "1"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("#5 [2/3] RUN npm ci\nnpm ERR! missing package.json\n"),
+            )
+            .mount(&s)
+            .await;
+        let (err, text) = c.call("deploy_app", deploy_args(&dir)).await;
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["status"], "failed");
+        assert_eq!(
+            v["log_tail"],
+            "#5 [2/3] RUN npm ci\nnpm ERR! missing package.json"
+        );
         assert!(
             v["note"].as_str().unwrap().contains("/builds/b1/log"),
             "{text}"
@@ -1384,12 +1443,18 @@ mod tests {
                 {"id":"b1","status":"succeeded","error":null,"created_at":"2026-01-01T00:00:00Z"}])],
         )
         .await;
+        Mock::given(method("GET"))
+            .and(path(api_path("/apps/app1/builds/b2/log")))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ERROR: no Dockerfile\n"))
+            .mount(&s)
+            .await;
         let (err, text) = c.call("app_status", json!({"name":"web"})).await;
         assert!(!err, "{text}");
         let v: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["latest_build"]["build_id"], "b2");
         assert_eq!(v["latest_build"]["status"], "failed");
         assert_eq!(v["latest_build"]["error"], "boom");
+        assert_eq!(v["latest_build"]["log_tail"], "ERROR: no Dockerfile");
         assert_eq!(v["url"], "https://web-acme.apps.example");
 
         let (s, mut c) = start().await;

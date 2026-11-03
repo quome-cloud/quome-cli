@@ -173,6 +173,26 @@ fn is_session_reason(reason: &str) -> bool {
 }
 
 /// Map a non-success status and body to the right error.
+/// Most of a build log handed to an agent: enough for the failing step.
+pub const LOG_TAIL_MAX: usize = 6 * 1024;
+
+/// The last `max` bytes of `log`, starting at a line boundary when one exists.
+pub fn log_tail(log: &str, max: usize) -> String {
+    let log = log.trim_end();
+    if log.len() <= max {
+        return log.to_string();
+    }
+    let mut start = log.len() - max;
+    while !log.is_char_boundary(start) {
+        start += 1;
+    }
+    let cut = &log[start..];
+    match cut.find('\n') {
+        Some(i) if i + 1 < cut.len() => cut[i + 1..].to_string(),
+        _ => cut.to_string(),
+    }
+}
+
 fn map_error(status: u16, text: &str) -> QuomeError {
     let v: serde_json::Value = serde_json::from_str(text).unwrap_or_default();
     let reason = v["reason"].as_str().unwrap_or("");
@@ -452,10 +472,43 @@ impl CloudApi {
         let p = self.org_path(&format!("/apps/{}/builds/{}", enc(app_id), enc(build_id)));
         self.json(Method::GET, &p, |b| b).await
     }
+
+    /// The end of a build's log (at most `LOG_TAIL_MAX` bytes, cut at a line
+    /// start), or `None` when the build left no log (it failed before running).
+    pub async fn build_log_tail(
+        &self,
+        app_id: &str,
+        build_id: &str,
+    ) -> Result<Option<String>, QuomeError> {
+        let p = self.org_path(&format!(
+            "/apps/{}/builds/{}/log",
+            enc(app_id),
+            enc(build_id)
+        ));
+        match self
+            .send(Method::GET, &p, |b| b.query(&[("tail", "1")]))
+            .await
+        {
+            Ok(r) => Ok(Some(log_tail(&r.text().await?, LOG_TAIL_MAX))),
+            Err(QuomeError::NotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn log_tail_keeps_whole_lines_from_the_end() {
+        assert_eq!(super::log_tail("a\nb\n", 100), "a\nb");
+        let log = "first line\nsecond line\nthird\n";
+        assert_eq!(super::log_tail(log, 14), "third");
+        // One long line is cut mid-line rather than dropped.
+        assert_eq!(super::log_tail("0123456789", 4), "6789");
+        // Never splits a multi-byte character.
+        assert_eq!(super::log_tail("ééé", 3), "é");
+    }
+
     use super::super::auth::tests::profile;
     use super::super::keys::AgentKey;
     use super::*;
