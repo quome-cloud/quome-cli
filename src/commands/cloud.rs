@@ -120,7 +120,8 @@ pub fn disconnect(home: &Path, profile: Option<&str>, store: &dyn KeyStore) -> R
     state.save_to(home)?;
     Ok(format!(
         "Disconnected profile \"{name}\" from this computer.\n\
-         To revoke this agent's access in Quome Cloud, open {}/dashboard",
+         To revoke this agent's access in Quome Cloud, open {}/dashboard\n\
+         To remove it from Claude Code too: claude mcp remove --scope user quome",
         p.console_url.trim_end_matches('/')
     ))
 }
@@ -262,6 +263,10 @@ mod tests {
         let out = disconnect(home.path(), None, &store).unwrap();
         assert!(store.get("cloud").is_err(), "key is gone from the store");
         assert!(out.contains("http://127.0.0.1:9/dashboard"), "{out}");
+        assert!(
+            out.contains("claude mcp remove --scope user quome"),
+            "{out}"
+        );
         assert!(!key_file.exists());
         let st = CloudState::load_from(home.path()).unwrap();
         assert!(st.profiles.is_empty());
