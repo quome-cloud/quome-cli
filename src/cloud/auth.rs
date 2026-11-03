@@ -139,6 +139,10 @@ fn map_exchange_error(status: u16, v: &serde_json::Value) -> QuomeError {
             _ => {}
         }
     }
+    if status == 400 && v["error"].as_str() == Some("invalid_grant") {
+        // revoked, expired, or the key no longer matches the delegation
+        return QuomeError::CloudDisconnected;
+    }
     let err = v["error"].as_str().unwrap_or("unknown_error");
     QuomeError::ApiError(format!(
         "Quome Cloud rejected the token exchange ({status} {err})"
@@ -282,7 +286,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_grant_is_an_error() {
+    async fn invalid_grant_is_disconnected() {
         let s = MockServer::start().await;
         mount_discovery(&s).await;
         Mock::given(method("POST"))
@@ -295,6 +299,6 @@ pub(crate) mod tests {
             .await;
         let ts = TokenSource::new(&profile(&s.uri()), AgentKey::generate(), "v".into());
         let e = ts.access_token().await.unwrap_err();
-        assert!(e.to_string().contains("invalid_grant"), "{e}");
+        assert!(matches!(e, QuomeError::CloudDisconnected), "{e}");
     }
 }
