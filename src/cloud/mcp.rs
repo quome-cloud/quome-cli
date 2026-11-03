@@ -262,7 +262,7 @@ impl QuomeMcp {
         loop {
             match cur.status.as_str() {
                 "running" => return json(&sandbox_json(&cur)),
-                "failed" | "error" | "stopped" => {
+                "failed" | "stopped" | "stopping" | "deleting" => {
                     return Err(format!(
                         "Sandbox {} is {}{}",
                         cur.name,
@@ -502,6 +502,15 @@ mod tests {
     }
 
     async fn start() -> (MockServer, Client) {
+        start_with(Timing {
+            poll: Duration::from_millis(5),
+            sandbox_wait: Duration::from_secs(5),
+            build_wait: Duration::from_secs(5),
+        })
+        .await
+    }
+
+    async fn start_with(timing: Timing) -> (MockServer, Client) {
         let s = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/.well-known/openid-configuration"))
@@ -520,11 +529,6 @@ mod tests {
             .await;
         let p = profile(&s.uri());
         let api = CloudApi::new(&p, TokenSource::new(&p, AgentKey::generate(), "vrc".into()));
-        let timing = Timing {
-            poll: Duration::from_millis(5),
-            sandbox_wait: Duration::from_secs(5),
-            build_wait: Duration::from_secs(5),
-        };
         let server = QuomeMcp::with_timing(api, p, timing);
         let (cw, sr) = tokio::io::duplex(1 << 20);
         let (sw, cr) = tokio::io::duplex(1 << 20);
@@ -899,6 +903,97 @@ mod tests {
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["status"], "building");
         assert_eq!(v["build_id"], "b1");
+    }
+
+    fn sb_json(status: &str) -> Value {
+        json!({"id":SB,"name":"box","status":status,"runtime":"claude","memory_gb":4.0,
+               "failure_reason": if status == "failed" { json!("no capacity") } else { Value::Null }})
+    }
+
+    async fn mount_create(s: &MockServer, first: &str) {
+        Mock::given(method("POST"))
+            .and(path(api_path("/sandboxes")))
+            .respond_with(ResponseTemplate::new(201).set_body_json(sb_json(first)))
+            .mount(s)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_waits_until_running() {
+        let (s, mut c) = start().await;
+        mount_create(&s, "created").await;
+        Mock::given(method("GET"))
+            .and(path(api_path(&format!("/sandboxes/{SB}"))))
+            .respond_with(ResponseTemplate::new(200).set_body_json(sb_json("starting")))
+            .up_to_n_times(2)
+            .mount(&s)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(api_path(&format!("/sandboxes/{SB}"))))
+            .respond_with(ResponseTemplate::new(200).set_body_json(sb_json("running")))
+            .mount(&s)
+            .await;
+        let (err, text) = c.call("create_sandbox", json!({"name":"box"})).await;
+        assert!(!err, "{text}");
+        assert!(text.contains("\"running\""), "{text}");
+        let gets = s
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.method.as_str() == "GET" && r.url.path().ends_with(SB))
+            .count();
+        assert_eq!(gets, 3, "polled until running");
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_reports_failure_reason() {
+        let (s, mut c) = start().await;
+        mount_create(&s, "created").await;
+        Mock::given(method("GET"))
+            .and(path(api_path(&format!("/sandboxes/{SB}"))))
+            .respond_with(ResponseTemplate::new(200).set_body_json(sb_json("failed")))
+            .mount(&s)
+            .await;
+        let (err, text) = c.call("create_sandbox", json!({"name":"box"})).await;
+        assert!(err);
+        assert!(text.contains("is failed: no capacity"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_stops_waiting_when_stopping_or_deleting() {
+        for st in ["stopping", "deleting", "stopped"] {
+            let (s, mut c) = start().await;
+            mount_create(&s, "created").await;
+            Mock::given(method("GET"))
+                .and(path(api_path(&format!("/sandboxes/{SB}"))))
+                .respond_with(ResponseTemplate::new(200).set_body_json(sb_json(st)))
+                .mount(&s)
+                .await;
+            let (err, text) = c.call("create_sandbox", json!({"name":"box"})).await;
+            assert!(err);
+            assert!(text.contains(&format!("is {st}")), "{st}: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_times_out_with_a_pointer() {
+        let (s, mut c) = start_with(Timing {
+            poll: Duration::from_millis(5),
+            sandbox_wait: Duration::from_millis(60),
+            build_wait: Duration::from_secs(1),
+        })
+        .await;
+        mount_create(&s, "created").await;
+        Mock::given(method("GET"))
+            .and(path(api_path(&format!("/sandboxes/{SB}"))))
+            .respond_with(ResponseTemplate::new(200).set_body_json(sb_json("starting")))
+            .mount(&s)
+            .await;
+        let (err, text) = c.call("create_sandbox", json!({"name":"box"})).await;
+        assert!(err);
+        assert!(text.contains("still starting after"), "{text}");
+        assert!(text.contains("list_sandboxes"), "{text}");
     }
 
     async fn serve_file(s: &MockServer, body: Vec<u8>) {
