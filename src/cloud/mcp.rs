@@ -205,13 +205,23 @@ impl QuomeMcp {
     }
 
     async fn find_app(&self, name: &str) -> Result<Option<super::api::Service>, String> {
+        // The services list keeps deleted rows (names can be reused), so skip
+        // them and prefer the newest of what is left.
+        let ts = |s: &super::api::Service| {
+            s.created_at
+                .as_deref()
+                .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        };
         Ok(self
             .api
             .list_services()
             .await
             .map_err(fail)?
             .into_iter()
-            .find(|s| s.kind == "app" && s.name == name))
+            .filter(|s| {
+                s.kind == "app" && s.name == name && s.status != "deleted" && s.status != "deleting"
+            })
+            .max_by_key(|s| ts(s)))
     }
 }
 
@@ -880,5 +890,116 @@ mod tests {
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["status"], "building");
         assert_eq!(v["build_id"], "b1");
+    }
+
+    async fn deploy_mocks(s: &MockServer, app_id: &str) {
+        Mock::given(method("PUT"))
+            .and(path(format!(
+                "/api/v1/uploads/orgs/{ORG}/apps/{app_id}/source"
+            )))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"source_key":"k1","size":10})),
+            )
+            .mount(s)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(api_path(&format!("/apps/{app_id}/deploy"))))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"deploy_id":"d1","build_id":"b1","workflow_id":"w1"})),
+            )
+            .mount(s)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(api_path(&format!("/apps/{app_id}/builds/b1"))))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"id":"b1","status":"failed","error":"x"})),
+            )
+            .mount(s)
+            .await;
+    }
+
+    fn docker_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Dockerfile"), "FROM scratch\n").unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn deploy_skips_deleted_apps_and_prefers_the_newest_live_one() {
+        let (s, mut c) = start().await;
+        let dir = docker_dir();
+        Mock::given(method("GET"))
+            .and(path(api_path("/services")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"id":"dead","kind":"app","name":"web","memory_gb":1.0,"status":"deleted","created_at":"2026-03-01T00:00:00Z"},
+                {"id":"gone","kind":"app","name":"web","memory_gb":1.0,"status":"deleting","created_at":"2026-04-01T00:00:00Z"},
+                {"id":"old","kind":"app","name":"web","memory_gb":1.0,"status":"running","created_at":"2026-01-01T00:00:00Z"},
+                {"id":"live","kind":"app","name":"web","memory_gb":1.0,"status":"running","created_at":"2026-02-01T00:00:00Z"}])))
+            .mount(&s)
+            .await;
+        deploy_mocks(&s, "live").await;
+        let (err, text) = c
+            .call(
+                "deploy_app",
+                json!({"name":"web","folder": dir.path().to_str().unwrap()}),
+            )
+            .await;
+        assert!(!err, "{text}");
+        let posted = s
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.method.as_str() == "POST" && r.url.path().ends_with("/services"));
+        assert!(!posted, "must not create a second app");
+        assert!(s
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.url.path().contains("/apps/live/deploy")));
+    }
+
+    #[tokio::test]
+    async fn deploy_with_only_deleted_rows_creates_a_new_app() {
+        let (s, mut c) = start().await;
+        let dir = docker_dir();
+        Mock::given(method("GET"))
+            .and(path(api_path("/services")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"id":"dead","kind":"app","name":"web","memory_gb":1.0,"status":"deleted"}])))
+            .mount(&s)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(api_path("/services")))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "id":"fresh","kind":"app","name":"web","memory_gb":1.0,"status":"created"})))
+            .expect(1)
+            .mount(&s)
+            .await;
+        deploy_mocks(&s, "fresh").await;
+        let (err, text) = c
+            .call(
+                "deploy_app",
+                json!({"name":"web","folder": dir.path().to_str().unwrap()}),
+            )
+            .await;
+        assert!(!err, "{text}");
+    }
+
+    #[tokio::test]
+    async fn app_status_ignores_deleted_apps() {
+        let (s, mut c) = start().await;
+        Mock::given(method("GET"))
+            .and(path(api_path("/services")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"id":"dead","kind":"app","name":"web","memory_gb":1.0,"status":"deleted"}])))
+            .mount(&s)
+            .await;
+        let (err, text) = c.call("app_status", json!({"name":"web"})).await;
+        assert!(err);
+        assert!(text.contains("No app named"), "{text}");
     }
 }

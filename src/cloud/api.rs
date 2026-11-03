@@ -88,6 +88,8 @@ pub struct Service {
     pub name: String,
     pub memory_gb: f64,
     pub status: String,
+    #[serde(default)]
+    pub created_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
