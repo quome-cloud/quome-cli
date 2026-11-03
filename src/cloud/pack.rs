@@ -3,7 +3,7 @@
 
 use crate::errors::QuomeError;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Component, Path};
 use tempfile::NamedTempFile;
 
@@ -40,14 +40,8 @@ fn pack_with_cap(dir: &Path, cap: u64) -> Result<PackedSource, QuomeError> {
     let skip = |rel: &str| rel != "Dockerfile" && rel != ".dockerignore" && set.ignored(rel);
 
     let mut paths = Vec::new();
-    walk(&root, "", &set, &skip, &mut paths)?;
+    walk(&root, "", &set, &skip, false, &mut paths)?;
     paths.sort();
-    if !paths.iter().any(|p| p == "Dockerfile") {
-        return Err(QuomeError::Usage(
-            "Quome Cloud builds from a Dockerfile: add a Dockerfile at the top of the folder"
-                .into(),
-        ));
-    }
 
     let tmp = tempfile::Builder::new()
         .prefix("quome-src-")
@@ -60,11 +54,13 @@ fn pack_with_cap(dir: &Path, cap: u64) -> Result<PackedSource, QuomeError> {
     });
     let mut warnings = Vec::new();
     let mut count = 0;
+    let mut has_dockerfile = false;
     for rel in &paths {
         let full = root.join(rel);
         let meta = fs::symlink_metadata(&full)?;
         let mut header = tar::Header::new_gnu();
-        header.set_metadata(&meta);
+        header.set_metadata_in_mode(&meta, tar::HeaderMode::Deterministic);
+        header.set_mtime(0);
         if meta.file_type().is_symlink() {
             let link = fs::read_link(&full)?;
             if !inside_root(&root, &full, &link) {
@@ -79,12 +75,27 @@ fn pack_with_cap(dir: &Path, cap: u64) -> Result<PackedSource, QuomeError> {
             builder.append_link(&mut header, rel, &link)
         } else if meta.is_file() {
             header.set_size(meta.len());
-            builder.append_data(&mut header, rel, fs::File::open(&full)?)
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let exec = meta.permissions().mode() & 0o111 != 0;
+                header.set_mode(if exec { 0o755 } else { 0o644 });
+            }
+            // `take` keeps the tar valid if the file grows after the stat.
+            builder.append_data(&mut header, rel, fs::File::open(&full)?.take(meta.len()))
         } else {
             continue;
         }
         .map_err(cap_or_io)?;
+        has_dockerfile |= rel == "Dockerfile";
         count += 1;
+    }
+    if !has_dockerfile {
+        return Err(QuomeError::Usage(
+            "Quome Cloud builds from a Dockerfile: add a regular Dockerfile (not a link to \
+             somewhere outside the folder) at the top of the folder"
+                .into(),
+        ));
     }
     builder.into_inner().map_err(cap_or_io)?.w.flush()?;
     let size = tmp.as_file().metadata()?.len();
@@ -133,16 +144,23 @@ fn walk(
     prefix: &str,
     set: &IgnoreSet,
     skip: &dyn Fn(&str) -> bool,
+    in_ignored: bool,
     out: &mut Vec<String>,
 ) -> Result<(), QuomeError> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
-        let name = entry.file_name().into_string().map_err(|n| {
-            QuomeError::Usage(format!(
+        let Ok(name) = entry.file_name().into_string() else {
+            // A name that is not UTF-8 cannot be matched against the patterns. Inside an
+            // ignored directory (only reached when a negation might re-include something)
+            // it is left out; anywhere else it would be packed, so refuse.
+            if in_ignored {
+                continue;
+            }
+            return Err(QuomeError::Usage(format!(
                 "file name is not valid UTF-8: {}",
-                n.to_string_lossy()
-            ))
-        })?;
+                entry.path().display()
+            )));
+        };
         let rel = if prefix.is_empty() {
             name
         } else {
@@ -153,7 +171,8 @@ fn walk(
             continue;
         }
         if is_dir {
-            walk(&entry.path(), &rel, set, skip, out)?;
+            let ignored = in_ignored || skip(&rel);
+            walk(&entry.path(), &rel, set, skip, ignored, out)?;
         } else {
             out.push(rel);
         }
@@ -243,10 +262,13 @@ impl IgnoreSet {
             }
             let line = line.strip_prefix('/').unwrap_or(line);
             let line = line.strip_suffix('/').unwrap_or(line);
-            if line.is_empty() || line == "." {
+            // Improves on the Go packer: patterns are path-cleaned the way Docker does
+            // (`./x`, `a/../x`, `a//b`, `x/.`), where Go left them as written and so
+            // never matched the file the user meant to exclude.
+            let Some(line) = clean_pattern(line) else {
                 continue;
-            }
-            if let Some(tokens) = compile(line) {
+            };
+            if let Some(tokens) = compile(&line) {
                 rules.push(Rule { tokens, negate });
             }
         }
@@ -274,6 +296,25 @@ impl IgnoreSet {
             }
         }
         out
+    }
+}
+
+/// Lexically cleans a pattern; `None` when nothing is left or it escapes the root.
+fn clean_pattern(p: &str) -> Option<String> {
+    let mut stack: Vec<&str> = Vec::new();
+    for seg in p.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                stack.pop()?;
+            }
+            s => stack.push(s),
+        }
+    }
+    if stack.is_empty() {
+        None
+    } else {
+        Some(stack.join("/"))
     }
 }
 
@@ -436,7 +477,7 @@ mod tests {
         }
     }
 
-    /// Sorted entry names plus symlink targets, read back from the tar.
+    /// Entry names in the tar's own order plus symlink targets, read back from the tar.
     fn entries(src: &PackedSource) -> (Vec<String>, BTreeMap<String, String>) {
         let mut bytes = Vec::new();
         fs::File::open(src.path())
@@ -462,7 +503,6 @@ mod tests {
             }
             names.push(name);
         }
-        names.sort();
         (names, links)
     }
 
@@ -572,5 +612,183 @@ mod tests {
         assert!(p.exists());
         drop(src);
         assert!(!p.exists());
+    }
+
+    #[test]
+    fn entries_are_sorted_in_the_tar_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        write_tree(
+            dir.path(),
+            &[
+                ("zeta", "x"),
+                ("Dockerfile", "x"),
+                ("b", "x"),
+                ("sub/z", "x"),
+                ("a", "x"),
+                ("C", "x"),
+                ("sub/a", "x"),
+            ],
+        );
+        let (names, _) = entries(&pack_folder(dir.path()).unwrap());
+        assert_eq!(
+            names,
+            ["C", "Dockerfile", "a", "b", "sub/a", "sub/z", "zeta"]
+        );
+    }
+
+    // APFS refuses non-UTF-8 names, so this can only run where they can be created.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_utf8_name_in_ignored_dir_is_skipped_elsewhere_refused() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        write_tree(
+            dir.path(),
+            &[
+                ("Dockerfile", "x"),
+                (".dockerignore", "node_modules\n!node_modules/ok.js\n"),
+                ("node_modules/ok.js", "x"),
+            ],
+        );
+        let bad = OsStr::from_bytes(b"bad\xff.js");
+        fs::write(dir.path().join("node_modules").join(bad), "x").unwrap();
+        let (names, _) = entries(&pack_folder(dir.path()).unwrap());
+        assert_eq!(names, [".dockerignore", "Dockerfile", "node_modules/ok.js"]);
+
+        fs::write(dir.path().join(bad), "x").unwrap();
+        let err = pack_folder(dir.path()).err().expect("must fail");
+        assert!(err.to_string().contains("UTF-8"), "{err}");
+    }
+
+    #[test]
+    fn ignore_patterns_are_path_cleaned() {
+        // Improves on the Go packer, whose patterns are not cleaned and so never match.
+        let set = IgnoreSet::parse("./a.env\nb/../c.env\nd//e.pem\n/./f\ng/.\nh/./i/\n");
+        check_ignored(
+            &set,
+            &[
+                ("a.env", true),
+                ("c.env", true),
+                ("d/e.pem", true),
+                ("f", true),
+                ("g", true),
+                ("g/x", true),
+                ("h/i/x", true),
+                ("b/c.env", false),
+                ("other", false),
+            ],
+        );
+        let set = IgnoreSet::parse("../outside\n");
+        check_ignored(&set, &[("outside", false)]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dockerfile_that_is_an_escaping_symlink_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", dir.path().join("Dockerfile")).unwrap();
+        let err = pack_folder(dir.path()).err().expect("must fail");
+        assert!(
+            err.to_string()
+                .contains("Quome Cloud builds from a Dockerfile"),
+            "{err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn headers_are_normalised() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        write_tree(
+            dir.path(),
+            &[("Dockerfile", "x"), ("run.sh", "x"), ("secret", "x")],
+        );
+        let mode = |n: &str, m: u32| {
+            fs::set_permissions(dir.path().join(n), fs::Permissions::from_mode(m)).unwrap()
+        };
+        mode("run.sh", 0o4755);
+        mode("secret", 0o600);
+        std::os::unix::fs::symlink("Dockerfile", dir.path().join("link")).unwrap();
+        let src = pack_folder(dir.path()).unwrap();
+        let mut ar = tar::Archive::new(fs::File::open(src.path()).unwrap());
+        let mut seen = 0;
+        for e in ar.entries().unwrap() {
+            let e = e.unwrap();
+            let h = e.header();
+            let name = e.path().unwrap().to_string_lossy().into_owned();
+            assert_eq!((h.uid().unwrap(), h.gid().unwrap()), (0, 0), "{name}");
+            assert_eq!(h.mtime().unwrap(), 0, "{name}");
+            assert!(h.username_bytes().is_none_or(|u| u.is_empty()), "{name}");
+            assert!(h.groupname_bytes().is_none_or(|u| u.is_empty()), "{name}");
+            let want = match name.as_str() {
+                "run.sh" => Some(0o755),
+                "Dockerfile" | "secret" => Some(0o644),
+                _ => None,
+            };
+            if let Some(w) = want {
+                assert_eq!(h.mode().unwrap(), w, "{name}");
+            }
+            assert_eq!(h.mode().unwrap() & 0o7000, 0, "{name}");
+            seen += 1;
+        }
+        assert_eq!(seen, 4);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_chain_resolving_outside_is_skipped() {
+        let outside = tempfile::tempdir().unwrap();
+        write_tree(outside.path(), &[("secret", "x")]);
+        let dir = tempfile::tempdir().unwrap();
+        write_tree(dir.path(), &[("Dockerfile", "x"), ("sub/f", "x")]);
+        // Lexically inside, but sub/inner points outside, so hop and dirlink escape.
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("sub/inner")).unwrap();
+        std::os::unix::fs::symlink("sub/inner", dir.path().join("hop")).unwrap();
+        std::os::unix::fs::symlink("sub/inner/secret", dir.path().join("file")).unwrap();
+        let src = pack_folder(dir.path()).unwrap();
+        let (names, links) = entries(&src);
+        assert!(links.is_empty(), "{links:?}");
+        assert_eq!(names, ["Dockerfile", "sub/f"]);
+        assert_eq!(src.warnings.len(), 3, "{:?}", src.warnings);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn folder_reached_through_a_symlink_is_packed() {
+        let dir = tempfile::tempdir().unwrap();
+        write_tree(dir.path(), &[("app/Dockerfile", "x"), ("app/a", "x")]);
+        std::os::unix::fs::symlink(dir.path().join("app"), dir.path().join("alias")).unwrap();
+        std::os::unix::fs::symlink("a", dir.path().join("app/rel")).unwrap();
+        let (names, links) = entries(&pack_folder(&dir.path().join("alias")).unwrap());
+        assert_eq!(names, ["Dockerfile", "a", "rel"]);
+        assert_eq!(links["rel"], "a");
+    }
+
+    #[test]
+    fn cap_writer_refuses_before_writing_past_the_cap() {
+        let mut w = CapWriter {
+            w: Vec::new(),
+            n: 0,
+            cap: 250,
+        };
+        w.write_all(&[0; 100]).unwrap();
+        w.write_all(&[0; 100]).unwrap();
+        assert!(w.write_all(&[0; 100]).is_err());
+        assert_eq!(w.w.len(), 200);
+    }
+
+    #[test]
+    fn many_small_files_over_the_cap_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        write_tree(dir.path(), &[("Dockerfile", "x")]);
+        for i in 0..40 {
+            fs::write(dir.path().join(format!("f{i:02}")), "z").unwrap();
+        }
+        // Every file fits on its own; only the running total passes the cap.
+        let err = pack_with_cap(dir.path(), 8192).err().expect("must fail");
+        assert!(err.to_string().contains("source exceeds"), "{err}");
+        assert!(pack_with_cap(dir.path(), 1 << 20).is_ok());
     }
 }
