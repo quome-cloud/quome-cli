@@ -201,6 +201,10 @@ pub fn connect_url(console: &str, name: &str, key: &AgentKey, port: u16, state: 
 }
 
 pub fn mcp_add_args(profile: &str) -> Vec<String> {
+    mcp_add_args_for(&mcp_program(), profile)
+}
+
+pub fn mcp_add_args_for(program: &str, profile: &str) -> Vec<String> {
     [
         "mcp",
         "add",
@@ -208,7 +212,7 @@ pub fn mcp_add_args(profile: &str) -> Vec<String> {
         "user",
         "quome",
         "--",
-        "quome",
+        program,
         "mcp",
         "--profile",
         profile,
@@ -216,6 +220,31 @@ pub fn mcp_add_args(profile: &str) -> Vec<String> {
     .iter()
     .map(|s| s.to_string())
     .collect()
+}
+
+/// The program the MCP client should launch: plain `quome` when that is this
+/// binary on PATH (so a Homebrew upgrade keeps working), otherwise this
+/// binary's absolute path, so an older `quome` earlier on PATH is never used.
+pub fn mcp_program() -> String {
+    let exe = std::env::current_exe().ok();
+    let on_path = std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|d| d.join("quome"))
+            .find(|p| p.is_file())
+    });
+    mcp_program_from(exe.as_deref(), on_path.as_deref())
+}
+
+pub fn mcp_program_from(
+    exe: Option<&std::path::Path>,
+    on_path: Option<&std::path::Path>,
+) -> String {
+    let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    match (exe, on_path) {
+        (Some(e), Some(p)) if canon(e) == canon(p) => "quome".to_string(),
+        (Some(e), _) => canon(e).to_string_lossy().into_owned(),
+        (None, _) => "quome".to_string(),
+    }
 }
 
 pub fn mcp_get_args() -> Vec<String> {
@@ -233,8 +262,12 @@ pub fn mcp_remove_args() -> Vec<String> {
 }
 
 pub fn mcp_config_json(profile: &str) -> String {
+    mcp_config_json_for(&mcp_program(), profile)
+}
+
+pub fn mcp_config_json_for(program: &str, profile: &str) -> String {
     serde_json::json!({"mcpServers": {"quome": {
-        "command": "quome", "args": ["mcp", "--profile", profile]}}})
+        "command": program, "args": ["mcp", "--profile", profile]}}})
     .to_string()
 }
 
@@ -568,13 +601,35 @@ mod tests {
     }
 
     #[test]
+    fn mcp_program_is_plain_quome_only_when_path_resolves_to_this_binary() {
+        let d = tempfile::tempdir().unwrap();
+        let me = d.path().join("quome-built");
+        std::fs::write(&me, b"x").unwrap();
+        let other = d.path().join("quome");
+        std::fs::write(&other, b"y").unwrap();
+        let link = d.path().join("quome-link");
+        std::os::unix::fs::symlink(&me, &link).unwrap();
+        let abs = std::fs::canonicalize(&me)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        // An older quome earlier on PATH: launch this binary by absolute path.
+        assert_eq!(mcp_program_from(Some(&me), Some(&other)), abs);
+        // No quome on PATH at all.
+        assert_eq!(mcp_program_from(Some(&me), None), abs);
+        // PATH's quome is a symlink to this binary (Homebrew): keep the name.
+        assert_eq!(mcp_program_from(Some(&me), Some(&link)), "quome");
+        assert_eq!(mcp_program_from(None, None), "quome");
+    }
+
+    #[test]
     fn mcp_argv_and_config_are_exact() {
         assert_eq!(
-            mcp_add_args("work").join(" "),
+            mcp_add_args_for("quome", "work").join(" "),
             "mcp add --scope user quome -- quome mcp --profile work"
         );
         assert_eq!(
-            mcp_config_json("work"),
+            mcp_config_json_for("quome", "work"),
             r#"{"mcpServers":{"quome":{"args":["mcp","--profile","work"],"command":"quome"}}}"#
         );
     }
