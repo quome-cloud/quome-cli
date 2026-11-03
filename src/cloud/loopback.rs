@@ -18,7 +18,24 @@ pub struct Callback {
     pub vrc: String,
     pub delegation_id: String,
     pub agent_principal: String,
+    /// RFC 3339. quauth sends unix seconds; a string is kept as given.
+    #[serde(deserialize_with = "expiry_rfc3339")]
     pub expires_at: String,
+}
+
+fn expiry_rfc3339<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Expiry {
+        Unix(i64),
+        Text(String),
+    }
+    match Expiry::deserialize(d)? {
+        Expiry::Text(s) => Ok(s),
+        Expiry::Unix(n) => chrono::DateTime::from_timestamp(n, 0)
+            .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+            .ok_or_else(|| serde::de::Error::custom("expires_at out of range")),
+    }
 }
 
 /// Longest a single request may take to arrive in full.
@@ -264,6 +281,24 @@ mod tests {
         let cb = h.join().unwrap().unwrap();
         assert_eq!(cb.delegation_id, "d1");
         assert_eq!(cb.vrc, "V");
+    }
+
+    // quauth's POST /account/delegations returns `expires_at` as unix seconds,
+    // and the connect page forwards it unchanged.
+    #[tokio::test]
+    async fn unix_seconds_expiry_is_accepted_as_rfc3339() {
+        let (port, h) = start(Duration::from_secs(10));
+        let mut body = good();
+        body["expires_at"] = serde_json::json!(1798761600);
+        let r = reqwest::Client::new()
+            .post(url(port))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let cb = h.join().unwrap().unwrap();
+        assert_eq!(cb.expires_at, "2027-01-01T00:00:00Z");
     }
 
     #[tokio::test]
