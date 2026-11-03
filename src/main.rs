@@ -92,6 +92,8 @@ enum Commands {
         #[command(subcommand)]
         command: commands::host::HostCommands,
     },
+    /// Connect this computer to Quome Cloud
+    Connect(commands::connect::Args),
     /// Upgrade quome to the latest version
     Upgrade,
 }
@@ -118,6 +120,7 @@ async fn main() {
         Commands::Events(args) => commands::events::execute(args).await,
         Commands::Fn(args) => commands::functions::execute(args).await,
         Commands::Host { command } => commands::host::execute(command).await,
+        Commands::Connect(args) => commands::connect::execute(args).await,
         Commands::Upgrade => commands::upgrade::execute().await,
     };
 

@@ -1,5 +1,6 @@
 pub mod apps;
 pub mod bindings;
+pub mod connect;
 pub mod databases;
 pub mod deploy;
 pub mod deployments;
