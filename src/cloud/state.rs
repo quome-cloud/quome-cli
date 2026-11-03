@@ -97,7 +97,7 @@ impl CloudState {
             Some(n) => n,
             None if self.default.is_empty() => {
                 return Err(QuomeError::CloudState(
-                    "no agent connected. Run `quome cloud connect` first.".into(),
+                    crate::commands::cloud::NOT_CONNECTED.into(),
                 ))
             }
             None => &self.default,
@@ -194,6 +194,8 @@ mod tests {
         assert_eq!(s.profile(None).unwrap().agent_name, "agent-w");
         assert_eq!(s.profile(Some("home")).unwrap().agent_name, "agent-h");
         assert!(s.profile(Some("nope")).is_err());
-        assert!(CloudState::default().profile(None).is_err());
+        let e = CloudState::default().profile(None).unwrap_err().to_string();
+        assert!(e.contains("`quome connect`"), "{e}");
+        assert!(!e.contains("cloud connect"), "{e}");
     }
 }

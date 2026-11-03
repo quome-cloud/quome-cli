@@ -593,8 +593,18 @@ impl QuomeMcp {
         if let Some(p) = ports.exposed.iter().find(|p| p.port == a.port) {
             return json(&serde_json::json!({"url": p.url}));
         }
-        let p = call!(self, |api| api.expose_port(&id, a.port))?;
-        json(&serde_json::json!({"url": p.url}))
+        match call!(self, |api| api.expose_port(&id, a.port)) {
+            Ok(p) => json(&serde_json::json!({"url": p.url})),
+            // Exposed between our read and the POST (a console click): use that URL.
+            Err(e) if e.contains("already_exposed") => {
+                let ports = call!(self, |api| api.ports(&id))?;
+                match ports.exposed.iter().find(|p| p.port == a.port) {
+                    Some(p) => json(&serde_json::json!({"url": p.url})),
+                    None => Err(e),
+                }
+            }
+            Err(e) => Err(e),
+        }
     }
 
     #[tool(
@@ -853,6 +863,34 @@ mod tests {
             .await;
         assert!(!err, "{text}");
         assert!(text.contains("https://p8080.example"));
+    }
+
+    #[tokio::test]
+    async fn preview_returns_the_url_when_the_port_was_exposed_meanwhile() {
+        let (s, mut c) = start().await;
+        sequence(
+            &s,
+            "GET",
+            api_path(&format!("/sandboxes/{SB}/ports")),
+            vec![
+                json!({"detected":[8080],"exposed":[]}),
+                json!({"detected":[8080],"exposed":[{"port":8080,"url":"https://p8080.example"}]}),
+            ],
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path(api_path(&format!("/sandboxes/{SB}/ports"))))
+            .respond_with(
+                ResponseTemplate::new(409)
+                    .set_body_json(json!({"detail":"conflict","reason":"already_exposed"})),
+            )
+            .mount(&s)
+            .await;
+        let (err, text) = c
+            .call("preview", json!({"sandbox": SB, "port": 8080}))
+            .await;
+        assert!(!err, "{text}");
+        assert!(text.contains("https://p8080.example"), "{text}");
     }
 
     #[tokio::test]

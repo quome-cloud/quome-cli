@@ -30,7 +30,7 @@ pub async fn execute(args: Args) -> Result<()> {
         Ok(p) => p.clone(),
         Err(_) if state.profiles.is_empty() => {
             return Err(QuomeError::CloudState(
-                "Not connected to Quome Cloud — run `quome connect`".into(),
+                crate::commands::cloud::NOT_CONNECTED.into(),
             ))
         }
         Err(e) => return Err(e),

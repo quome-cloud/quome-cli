@@ -33,6 +33,12 @@ pub fn pack_folder(dir: &Path) -> Result<PackedSource, QuomeError> {
 fn pack_with_cap(dir: &Path, cap: u64) -> Result<PackedSource, QuomeError> {
     let root = fs::canonicalize(dir)
         .map_err(|e| QuomeError::Usage(format!("cannot read {}: {e}", dir.display())))?;
+    // Before walking anything: a folder without a Dockerfile (a home directory,
+    // say) should fail at once, not after reading every file in it.
+    match fs::symlink_metadata(root.join("Dockerfile")) {
+        Ok(m) if m.is_file() || m.file_type().is_symlink() => {}
+        _ => return Err(no_dockerfile()),
+    }
     let set = match fs::read_to_string(root.join(".dockerignore")) {
         Ok(text) => IgnoreSet::parse(&text),
         Err(_) => IgnoreSet::default(),
@@ -91,11 +97,7 @@ fn pack_with_cap(dir: &Path, cap: u64) -> Result<PackedSource, QuomeError> {
         count += 1;
     }
     if !has_dockerfile {
-        return Err(QuomeError::Usage(
-            "Quome Cloud builds from a Dockerfile: add a regular Dockerfile (not a link to \
-             somewhere outside the folder) at the top of the folder"
-                .into(),
-        ));
+        return Err(no_dockerfile());
     }
     builder.into_inner().map_err(cap_or_io)?.w.flush()?;
     let size = tmp.as_file().metadata()?.len();
@@ -105,6 +107,14 @@ fn pack_with_cap(dir: &Path, cap: u64) -> Result<PackedSource, QuomeError> {
         count,
         warnings,
     })
+}
+
+fn no_dockerfile() -> QuomeError {
+    QuomeError::Usage(
+        "Quome Cloud builds from a Dockerfile: add a regular Dockerfile (not a link to \
+         somewhere outside the folder) at the top of the folder"
+            .into(),
+    )
 }
 
 fn cap_or_io(e: io::Error) -> QuomeError {
@@ -590,6 +600,23 @@ mod tests {
         assert!(err
             .to_string()
             .contains("Quome Cloud builds from a Dockerfile"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_dockerfile_is_refused_before_walking() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        write_tree(dir.path(), &[("sub/x", "x")]);
+        let sub = dir.path().join("sub");
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let err = pack_folder(dir.path()).err().expect("must fail");
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            err.to_string()
+                .contains("Quome Cloud builds from a Dockerfile"),
+            "an unreadable directory must not be reached: {err}"
+        );
     }
 
     #[test]
