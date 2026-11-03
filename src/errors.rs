@@ -35,6 +35,18 @@ pub enum QuomeError {
     #[error("Invalid response from server")]
     InvalidResponse,
 
+    /// Quome Cloud agent state (`~/.quome/cloud.json`) problems.
+    #[error("Quome Cloud: {0}")]
+    CloudState(String),
+
+    /// Quome Cloud agent key storage problems.
+    #[error("Quome Cloud key storage: {0}")]
+    CloudKey(String),
+
+    #[allow(dead_code)] // constructed on Windows builds only
+    #[error("Quome Cloud is not supported on this platform yet.")]
+    CloudUnsupported,
+
     #[error(transparent)]
     Http(#[from] reqwest::Error),
 

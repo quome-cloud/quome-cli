@@ -1,5 +1,6 @@
 mod api;
 mod client;
+mod cloud;
 mod commands;
 mod config;
 mod errors;
