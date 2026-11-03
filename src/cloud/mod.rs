@@ -6,4 +6,5 @@ pub mod api;
 pub mod auth;
 pub mod keys;
 pub mod loopback;
+pub mod pack;
 pub mod state;
