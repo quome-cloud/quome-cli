@@ -21,9 +21,13 @@ pub struct Callback {
     pub expires_at: String,
 }
 
+/// Longest a single request may take to arrive in full.
+pub const REQUEST_DEADLINE: Duration = Duration::from_secs(5);
+
 pub struct Listener {
     server: Server,
     port: u16,
+    request_deadline: Duration,
 }
 
 /// `scheme://host[:port]` of a URL, the value of the CORS allow-origin header.
@@ -55,7 +59,16 @@ impl Listener {
             .to_ip()
             .map(|a| a.port())
             .ok_or_else(|| QuomeError::CloudState("cannot listen on loopback".into()))?;
-        Ok(Listener { server, port })
+        Ok(Listener {
+            server,
+            port,
+            request_deadline: REQUEST_DEADLINE,
+        })
+    }
+
+    pub fn with_request_deadline(mut self, d: Duration) -> Listener {
+        self.request_deadline = d;
+        self
     }
 
     pub fn port(&self) -> u16 {
@@ -63,7 +76,9 @@ impl Listener {
     }
 
     /// Serve until one good `POST /callback` arrives or `timeout` passes. Bad
-    /// requests are refused and the wait goes on. Blocking.
+    /// requests are refused and the wait goes on. Each request is handled on
+    /// its own thread with a read deadline, so a stalled client cannot block
+    /// the others or the overall timeout. Blocking.
     pub fn wait(
         &self,
         state: &str,
@@ -71,18 +86,31 @@ impl Listener {
         timeout: Duration,
     ) -> Result<Callback, QuomeError> {
         let deadline = Instant::now() + timeout;
+        let (tx, rx) = std::sync::mpsc::channel();
         loop {
+            if let Ok(cb) = rx.try_recv() {
+                return Ok(cb);
+            }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 return Err(timed_out());
             }
-            let req = match self.server.recv_timeout(left) {
-                Ok(Some(r)) => r,
-                Ok(None) => return Err(timed_out()),
+            match self
+                .server
+                .recv_timeout(left.min(Duration::from_millis(50)))
+            {
+                Ok(Some(req)) => {
+                    let (tx, state, origin) =
+                        (tx.clone(), state.to_string(), issuer_origin.to_string());
+                    let limit = self.request_deadline;
+                    std::thread::spawn(move || {
+                        if let Some(cb) = handle(req, &state, &origin, Instant::now() + limit) {
+                            let _ = tx.send(cb);
+                        }
+                    });
+                }
+                Ok(None) => {}
                 Err(e) => return Err(QuomeError::CloudState(format!("loopback listener: {e}"))),
-            };
-            if let Some(cb) = handle(req, state, issuer_origin) {
-                return Ok(cb);
             }
         }
     }
@@ -93,7 +121,7 @@ fn timed_out() -> QuomeError {
 }
 
 /// Answer one request; `Some` only for the accepted callback.
-fn handle(mut req: Request, state: &str, origin: &str) -> Option<Callback> {
+fn handle(mut req: Request, state: &str, origin: &str, by: Instant) -> Option<Callback> {
     let path = req.url().split('?').next().unwrap_or("").to_string();
     if path != "/callback" {
         reply(req, 404, origin, None);
@@ -137,6 +165,9 @@ fn handle(mut req: Request, state: &str, origin: &str) -> Option<Callback> {
                 .as_reader()
                 .take(MAX_BODY as u64 + 1)
                 .read_to_end(&mut body);
+            if Instant::now() > by {
+                return None; // too slow: drop the request unanswered
+            }
             if read.is_err() {
                 reply(req, 400, origin, None);
                 return None;
@@ -296,5 +327,64 @@ mod tests {
             "https://auth.quome.cloud"
         );
         assert_eq!(origin_of("http://127.0.0.1:8080"), "http://127.0.0.1:8080");
+    }
+
+    fn stalled(port: u16, declared: usize, sent: &str) -> std::net::TcpStream {
+        use std::io::Write;
+        let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_nodelay(true).unwrap();
+        let head = format!(
+            "POST /callback HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {declared}\r\n\r\n{sent}"
+        );
+        c.write_all(head.as_bytes()).unwrap();
+        c.flush().unwrap();
+        c
+    }
+
+    #[tokio::test]
+    async fn a_stalled_request_does_not_wedge_the_listener() {
+        let (port, h) = start(Duration::from_secs(10));
+        // over 1024 bytes tiny_http leaves the body to us, so this is the wedging case
+        let _stall = stalled(port, 5000, "{\"state\":");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let r = reqwest::Client::new()
+            .post(url(port))
+            .json(&good())
+            .timeout(Duration::from_secs(3))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        assert_eq!(h.join().unwrap().unwrap().delegation_id, "d1");
+    }
+
+    #[tokio::test]
+    async fn a_request_finishing_after_its_deadline_is_dropped() {
+        use std::io::Write;
+        let l = Listener::bind()
+            .unwrap()
+            .with_request_deadline(Duration::from_millis(300));
+        let port = l.port();
+        let h = std::thread::spawn(move || l.wait("abc123", ORIGIN, Duration::from_secs(10)));
+        let late =
+            serde_json::json!({"state":"abc123","vrc":"V".repeat(2000),"delegation_id":"late",
+            "agent_principal":"p","expires_at":"e"})
+            .to_string();
+        let (a, b) = late.split_at(10);
+        let mut s = stalled(port, late.len(), a);
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        s.write_all(b.as_bytes()).unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        if h.is_finished() {
+            panic!("finished: {:?}", h.join().unwrap());
+        }
+        let r = reqwest::Client::new()
+            .post(url(port))
+            .json(&good())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        assert_eq!(h.join().unwrap().unwrap().delegation_id, "d1");
     }
 }

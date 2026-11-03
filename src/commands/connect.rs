@@ -46,24 +46,33 @@ pub struct Args {
 }
 
 /// What happened to the MCP registration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClaudeResult {
     /// `claude` is not on PATH.
     NotFound,
-    /// `claude` ran; true when it exited successfully.
-    Ran(bool),
+    /// `claude` ran; its stdout is discarded, its stderr kept for failures.
+    Ran { ok: bool, stderr: String },
 }
 
 pub trait ClaudeRunner {
     fn run(&self, args: &[String]) -> ClaudeResult;
 }
 
-struct RealClaude;
+struct RealClaude {
+    program: String,
+}
 
 impl ClaudeRunner for RealClaude {
     fn run(&self, args: &[String]) -> ClaudeResult {
-        match std::process::Command::new("claude").args(args).status() {
-            Ok(s) => ClaudeResult::Ran(s.success()),
+        let out = std::process::Command::new(&self.program)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output();
+        match out {
+            Ok(o) => ClaudeResult::Ran {
+                ok: o.status.success(),
+                stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
+            },
             Err(_) => ClaudeResult::NotFound,
         }
     }
@@ -124,11 +133,43 @@ pub fn issuer_url(api_url: &str, over: Option<&str>) -> String {
         .unwrap_or_else(|| swap_host(api_url, "auth"))
 }
 
+/// Unicode format characters (`\p{Cf}`); control characters are `char::is_control`.
+fn is_format(c: char) -> bool {
+    matches!(c as u32,
+        0xAD | 0x600..=0x605 | 0x61C | 0x6DD | 0x70F | 0x890..=0x891 | 0x8E2 | 0x180E
+        | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0x2066..=0x206F | 0xFEFF
+        | 0xFFF9..=0xFFFB | 0x110BD | 0x110CD | 0x13430..=0x1343F | 0x1BCA0..=0x1BCA3
+        | 0x1D173..=0x1D17A | 0xE0001 | 0xE0020..=0xE007F)
+}
+
+fn clean(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control() && !is_format(*c))
+        .collect()
+}
+
+/// The agent's display name: control and format characters removed, at most
+/// 64 UTF-16 code units (the console's `name.length`), cut on a character boundary.
 pub fn agent_name(given: Option<&str>, hostname: &str) -> String {
-    let n = given
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("Claude Code on {hostname}"));
-    n.chars().take(MAX_NAME).collect()
+    let given = given.map(clean).filter(|n| !n.trim().is_empty());
+    let n = given.unwrap_or_else(|| {
+        let host = clean(hostname);
+        if host.trim().is_empty() {
+            "Claude Code".to_string()
+        } else {
+            format!("Claude Code on {host}")
+        }
+    });
+    let mut units = 0;
+    let mut out = String::new();
+    for c in n.chars() {
+        units += c.len_utf16();
+        if units > MAX_NAME {
+            break;
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// `SHA256:<first 4>…<last 4>` of the key thumbprint.
@@ -175,6 +216,20 @@ pub fn mcp_add_args(profile: &str) -> Vec<String> {
     .iter()
     .map(|s| s.to_string())
     .collect()
+}
+
+pub fn mcp_get_args() -> Vec<String> {
+    ["mcp", "get", "quome"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+pub fn mcp_remove_args() -> Vec<String> {
+    ["mcp", "remove", "--scope", "user", "quome"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 pub fn mcp_config_json(profile: &str) -> String {
@@ -304,19 +359,7 @@ pub async fn run(opts: Options, deps: &Deps<'_>) -> Result<Outcome> {
     let mcp = if opts.no_mcp {
         "skipped"
     } else {
-        match deps.claude.run(&mcp_add_args(&profile_name)) {
-            ClaudeResult::Ran(true) => "added",
-            ClaudeResult::Ran(false) => {
-                (deps.say)("`claude mcp add` failed; add this to your MCP config instead:");
-                (deps.say)(&mcp_config_json(&profile_name));
-                "printed"
-            }
-            ClaudeResult::NotFound => {
-                (deps.say)("Add this to your MCP client config:");
-                (deps.say)(&mcp_config_json(&profile_name));
-                "printed"
-            }
-        }
+        register_mcp(deps, &profile_name)
     };
 
     if previous {
@@ -329,6 +372,45 @@ pub async fn run(opts: Options, deps: &Deps<'_>) -> Result<Outcome> {
         profile,
         mcp,
     })
+}
+
+/// Point Claude Code's user-scope `quome` MCP server at `profile`, replacing an
+/// existing one. Returns "added", "updated" or "manual".
+fn register_mcp(deps: &Deps<'_>, profile: &str) -> &'static str {
+    let manual = |why: Option<&str>| {
+        if let Some(w) = why {
+            (deps.say)(w);
+        }
+        (deps.say)("Add this to your MCP client config:");
+        (deps.say)(&mcp_config_json(profile));
+        "manual"
+    };
+    let exists = match deps.claude.run(&mcp_get_args()) {
+        ClaudeResult::NotFound => return manual(None),
+        ClaudeResult::Ran { ok, .. } => ok,
+    };
+    if exists {
+        let _ = deps.claude.run(&mcp_remove_args());
+    }
+    match deps.claude.run(&mcp_add_args(profile)) {
+        ClaudeResult::Ran { ok: true, .. } if exists => {
+            (deps.say)(&format!(
+                "Updated the quome MCP server in Claude Code (profile {profile})."
+            ));
+            "updated"
+        }
+        ClaudeResult::Ran { ok: true, .. } => {
+            (deps.say)(&format!(
+                "Registered the quome MCP server with Claude Code (profile {profile})."
+            ));
+            "added"
+        }
+        ClaudeResult::Ran { stderr, .. } => {
+            let why = format!("`claude mcp add` failed: {}", stderr.trim());
+            manual(Some(&why))
+        }
+        ClaudeResult::NotFound => manual(None),
+    }
 }
 
 fn expiry_date(expires_at: &str) -> String {
@@ -360,7 +442,9 @@ pub async fn execute(args: Args) -> Result<()> {
         home,
         store: store.as_ref(),
         open: &open_browser,
-        claude: &RealClaude,
+        claude: &RealClaude {
+            program: "claude".into(),
+        },
         say: &say,
         hostname: gethostname::gethostname().to_string_lossy().into_owned(),
         listen_timeout: loopback::TIMEOUT,
@@ -491,14 +575,30 @@ mod tests {
         );
     }
 
+    fn ran(ok: bool) -> ClaudeResult {
+        ClaudeResult::Ran {
+            ok,
+            stderr: if ok {
+                String::new()
+            } else {
+                "boom: nope\n".into()
+            },
+        }
+    }
+
+    /// Answers `mcp get` from `exists`; everything else with `result`.
     struct FakeClaude {
         calls: Mutex<Vec<Vec<String>>>,
         result: ClaudeResult,
+        exists: Mutex<bool>,
     }
     impl ClaudeRunner for FakeClaude {
         fn run(&self, args: &[String]) -> ClaudeResult {
             self.calls.lock().unwrap().push(args.to_vec());
-            self.result
+            if args.get(1).map(String::as_str) == Some("get") {
+                return ran(*self.exists.lock().unwrap());
+            }
+            self.result.clone()
         }
     }
 
@@ -605,6 +705,7 @@ mod tests {
                 claude: FakeClaude {
                     calls: Mutex::new(vec![]),
                     result,
+                    exists: Mutex::new(false),
                 },
                 opened: RefCell::new(vec![]),
                 log: Arc::new(Mutex::new(vec![])),
@@ -647,7 +748,7 @@ mod tests {
         let s = MockServer::start().await;
         mount_auth(&s).await;
         mount_me(&s, 2).await;
-        let h = Harness::new(ClaudeResult::Ran(true));
+        let h = Harness::new(ran(true));
         let host = "h".repeat(70);
         let out = h
             .connect(opts(&s, "work"), "del-1", &host, Duration::from_millis(20))
@@ -693,8 +794,11 @@ mod tests {
 
         assert_eq!(
             h.claude.calls.lock().unwrap().as_slice(),
-            [mcp_add_args("work")]
+            [mcp_get_args(), mcp_add_args("work")]
         );
+        assert_eq!(out.mcp, "added");
+        let said = h.said.borrow().join("\n");
+        assert!(said.contains("Registered the quome MCP server"), "{said}");
         let said = h.said.borrow().join("\n");
         assert!(said.contains("SHA256:"));
         assert!(
@@ -709,7 +813,7 @@ mod tests {
         let s = MockServer::start().await;
         mount_auth(&s).await;
         mount_me(&s, 1000).await;
-        let h = Harness::new(ClaudeResult::Ran(true));
+        let h = Harness::new(ran(true));
         let mut store_dir = FileStore {
             dir: h.home.path().join(".quome"),
         };
@@ -750,7 +854,7 @@ mod tests {
         let s = MockServer::start().await;
         mount_auth(&s).await;
         mount_me(&s, 0).await;
-        let h = Harness::new(ClaudeResult::Ran(true));
+        let h = Harness::new(ran(true));
         let old = h
             .connect(
                 opts(&s, "work"),
@@ -830,7 +934,7 @@ mod tests {
         ));
         // no claude on PATH: the JSON config is printed instead
         assert!(said.contains(&mcp_config_json("work")));
-        assert_eq!(second.mcp, "printed");
+        assert_eq!(second.mcp, "manual");
     }
 
     #[tokio::test]
@@ -838,7 +942,7 @@ mod tests {
         let s = MockServer::start().await;
         mount_auth(&s).await;
         mount_me(&s, 0).await;
-        let h = Harness::new(ClaudeResult::Ran(true));
+        let h = Harness::new(ran(true));
         let mut o = opts(&s, "work");
         o.no_mcp = true;
         let out = h
@@ -854,5 +958,101 @@ mod tests {
     fn expiry_date_formats() {
         assert_eq!(expiry_date("2027-01-02T03:04:05Z"), "2027-01-02");
         assert_eq!(expiry_date("soon"), "soon");
+    }
+
+    #[tokio::test]
+    async fn existing_quome_server_is_removed_then_added_and_reported_updated() {
+        let s = MockServer::start().await;
+        mount_auth(&s).await;
+        mount_me(&s, 0).await;
+        let h = Harness::new(ran(true));
+        *h.claude.exists.lock().unwrap() = true;
+        let out = h
+            .connect(opts(&s, "work2"), "d", "mac", Duration::from_millis(10))
+            .await
+            .unwrap();
+        assert_eq!(
+            h.claude.calls.lock().unwrap().as_slice(),
+            [mcp_get_args(), mcp_remove_args(), mcp_add_args("work2")]
+        );
+        assert_eq!(out.mcp, "updated");
+        assert!(h
+            .said
+            .borrow()
+            .join("\n")
+            .contains("Updated the quome MCP server"));
+    }
+
+    #[tokio::test]
+    async fn claude_stderr_is_shown_only_on_failure() {
+        let s = MockServer::start().await;
+        mount_auth(&s).await;
+        mount_me(&s, 0).await;
+        let h = Harness::new(ran(false));
+        let out = h
+            .connect(opts(&s, "work"), "d", "mac", Duration::from_millis(10))
+            .await
+            .unwrap();
+        let said = h.said.borrow().join("\n");
+        assert!(said.contains("boom: nope"), "{said}");
+        assert!(said.contains(&mcp_config_json("work")));
+        assert_eq!(out.mcp, "manual");
+
+        let h = Harness::new(ran(true));
+        h.connect(opts(&s, "work"), "d", "mac", Duration::from_millis(10))
+            .await
+            .unwrap();
+        assert!(!h.said.borrow().join("\n").contains("boom"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_runner_captures_output_instead_of_inheriting() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("fakeclaude");
+        std::fs::write(
+            &bin,
+            "#!/bin/sh\necho OUT-NOISE\necho \"ERR $*\" >&2\nexit 3\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let r = RealClaude {
+            program: bin.to_string_lossy().into_owned(),
+        };
+        assert_eq!(
+            r.run(&mcp_add_args("p")),
+            ClaudeResult::Ran {
+                ok: false,
+                stderr: format!("ERR {}\n", mcp_add_args("p").join(" "))
+            }
+        );
+        let missing = RealClaude {
+            program: dir.path().join("nope").to_string_lossy().into_owned(),
+        };
+        assert_eq!(missing.run(&[]), ClaudeResult::NotFound);
+    }
+
+    #[test]
+    fn name_counts_utf16_units_and_cuts_on_char_boundaries() {
+        let n = agent_name(None, &"😀".repeat(40));
+        assert!(n.encode_utf16().count() <= 64);
+        // 15 prefix units + 24 emoji * 2 = 63; a 25th would make 65
+        assert_eq!(n.encode_utf16().count(), 63);
+        assert!(n.starts_with("Claude Code on 😀"));
+        // one unit of room cannot hold an emoji
+        let n = agent_name(Some(&format!("{}😀", "a".repeat(63))), "h");
+        assert_eq!(n, "a".repeat(63));
+    }
+
+    #[test]
+    fn name_strips_control_and_format_characters() {
+        assert_eq!(
+            agent_name(None, "ev\u{202E}il\u{0007}\u{200B}\u{FEFF}"),
+            "Claude Code on evil"
+        );
+        assert_eq!(agent_name(Some("a\u{0}b\tc\u{7f}"), "h"), "abc");
+        assert_eq!(agent_name(Some("\u{202E}"), "h"), "Claude Code on h");
+        assert_eq!(agent_name(None, "\u{202E}"), "Claude Code");
     }
 }
