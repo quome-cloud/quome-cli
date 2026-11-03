@@ -2,5 +2,7 @@
 //! enterprise `config`/`settings` modules.
 #![allow(dead_code)]
 
+pub mod api;
+pub mod auth;
 pub mod keys;
 pub mod state;

@@ -43,6 +43,14 @@ pub enum QuomeError {
     #[error("Quome Cloud key storage: {0}")]
     CloudKey(String),
 
+    /// The delegation was revoked (401 `delegation_revoked`).
+    #[error("This agent was disconnected from Quome Cloud — run `quome connect` again")]
+    CloudDisconnected,
+
+    /// The user has not finished approving in the browser (401 `agent_not_connected`).
+    #[error("Finish approving in the browser, then try again.")]
+    CloudNotYetConnected,
+
     #[allow(dead_code)] // constructed on Windows builds only
     #[error("Quome Cloud is not supported on this platform yet.")]
     CloudUnsupported,
