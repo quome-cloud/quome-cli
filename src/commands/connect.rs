@@ -197,6 +197,25 @@ fn open_browser(url: &str) -> std::io::Result<()> {
         .map(|_| ())
 }
 
+/// A throwaway in-memory store, used to hand the new key to `TokenSource`.
+#[derive(Default)]
+struct MemStore(std::sync::Mutex<std::collections::HashMap<String, String>>);
+
+impl KeyStore for MemStore {
+    fn put(&self, profile: &str, secret: &str) -> Result<()> {
+        self.0.lock().unwrap().insert(profile.into(), secret.into());
+        Ok(())
+    }
+    fn get(&self, profile: &str) -> Result<String> {
+        self.0
+            .lock()
+            .unwrap()
+            .get(profile)
+            .cloned()
+            .ok_or_else(|| QuomeError::CloudKey("no key".into()))
+    }
+}
+
 /// `/me`, retried while the console has not yet recorded the delegation.
 async fn me_with_retry(
     api: &CloudApi,
@@ -260,9 +279,11 @@ pub async fn run(opts: Options, deps: &Deps<'_>) -> Result<Outcome> {
         apps_domain: String::new(),
     };
 
-    key.store_in(deps.store, &profile_name, &cb.vrc)?;
-    let (key, vrc) = AgentKey::load_from(deps.store, &profile_name)?;
-    let api = CloudApi::new(&profile, TokenSource::new(&profile, key, vrc));
+    // Authenticate from memory; nothing is persisted until /me succeeds.
+    let mem = MemStore::default();
+    key.store_in(&mem, &profile_name, &cb.vrc)?;
+    let (tmp_key, vrc) = AgentKey::load_from(&mem, &profile_name)?;
+    let api = CloudApi::new(&profile, TokenSource::new(&profile, tmp_key, vrc));
     let me = me_with_retry(&api, deps.retry_interval, deps.retry_total).await?;
     let org = me
         .orgs
@@ -272,6 +293,7 @@ pub async fn run(opts: Options, deps: &Deps<'_>) -> Result<Outcome> {
     profile.org_slug = org.slug.clone();
     profile.apps_domain = me.apps_domain;
 
+    key.store_in(deps.store, &profile_name, &cb.vrc)?;
     let mut st = CloudState::load_from(&deps.home)?;
     st.profiles.insert(profile_name.clone(), profile.clone());
     if st.default.is_empty() || !opts.profile_given {
@@ -721,6 +743,58 @@ mod tests {
             .profiles
             .is_empty());
         assert!(h.claude.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_connect_leaves_old_connection_untouched() {
+        let s = MockServer::start().await;
+        mount_auth(&s).await;
+        mount_me(&s, 0).await;
+        let h = Harness::new(ClaudeResult::Ran(true));
+        let old = h
+            .connect(
+                opts(&s, "work"),
+                "del-old",
+                "mac",
+                Duration::from_millis(10),
+            )
+            .await
+            .unwrap();
+        let state_path = h.home.path().join(".quome/cloud.json");
+        let key_path = h.home.path().join(".quome/cloud-work.key");
+        let (state_before, key_before) = (
+            std::fs::read(&state_path).unwrap(),
+            std::fs::read(&key_path).unwrap(),
+        );
+
+        let s2 = MockServer::start().await;
+        mount_auth(&s2).await;
+        mount_me(&s2, 100_000).await;
+        let store = FileStore {
+            dir: h.home.path().join(".quome"),
+        };
+        let say = |_: &str| {};
+        let open = |u: &str| {
+            page(u, "del-new", h.log.clone());
+            Ok(())
+        };
+        let deps = Deps {
+            home: h.home.path().to_path_buf(),
+            store: &store,
+            open: &open,
+            claude: &h.claude,
+            say: &say,
+            hostname: "mac".into(),
+            listen_timeout: Duration::from_secs(20),
+            retry_interval: Duration::from_millis(20),
+            retry_total: Duration::from_millis(100),
+        };
+        let err = run(opts(&s2, "work"), &deps).await.unwrap_err();
+        assert!(matches!(err, QuomeError::CloudNotYetConnected));
+        assert_eq!(std::fs::read(&state_path).unwrap(), state_before);
+        assert_eq!(std::fs::read(&key_path).unwrap(), key_before);
+        let st = CloudState::load_from(h.home.path()).unwrap();
+        assert_eq!(st.profiles["work"], old.profile);
     }
 
     #[tokio::test]
