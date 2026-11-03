@@ -14,7 +14,7 @@ pub struct AgentKey {
 
 /// Where the private key and VRC live. Injected so tests never touch the
 /// real Keychain or `~/.quome`.
-pub trait KeyStore {
+pub trait KeyStore: Send + Sync {
     fn put(&self, profile: &str, secret: &str) -> Result<(), QuomeError>;
     fn get(&self, profile: &str) -> Result<String, QuomeError>;
     /// Remove the stored key; an absent key is fine.

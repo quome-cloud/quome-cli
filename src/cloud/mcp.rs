@@ -1,7 +1,9 @@
 //! The `quome mcp` server: Quome Cloud tools for Claude Code over MCP stdio.
 use super::api::{CloudApi, Download, Sandbox, MAX_EXEC_TIMEOUT};
+use super::auth::TokenSource;
+use super::keys::{AgentKey, KeyStore};
 use super::pack::pack_folder;
-use super::state::Profile;
+use super::state::{CloudState, Profile};
 use crate::errors::QuomeError;
 use base64::Engine;
 use rmcp::{
@@ -13,8 +15,10 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-pub const DISCONNECTED: &str =
-    "This agent was disconnected from Quome Cloud — run `quome connect` again";
+/// Appended to a session error the server could not recover from by reloading
+/// the stored connection.
+pub const RESTART_HINT: &str =
+    "then restart the MCP server (or Claude Code) if this keeps happening";
 /// `read_file` returns text up to this size.
 pub const MAX_READ: usize = 1 << 20;
 
@@ -36,22 +40,49 @@ impl Default for Timing {
     }
 }
 
-/// A user-facing message for an error; session errors get the reconnect sentence.
+/// A user-facing message for an error. The wording lives on the error types.
 pub fn describe(e: &QuomeError) -> String {
-    match e {
-        QuomeError::CloudDisconnected => DISCONNECTED.to_string(),
-        QuomeError::CloudInvalidGrant => format!(
-            "{DISCONNECTED}. If you just reconnected, check this computer's clock is correct."
-        ),
-        QuomeError::CloudNotYetConnected => {
-            "Finish approving in the browser, then try again".into()
-        }
-        other => other.to_string(),
+    e.to_string()
+}
+
+fn is_session_error(e: &QuomeError) -> bool {
+    matches!(
+        e,
+        QuomeError::CloudDisconnected | QuomeError::CloudInvalidGrant
+    )
+}
+
+/// The message for a tool call that failed; session errors that a reload could
+/// not fix also say to restart.
+fn fail(e: QuomeError) -> String {
+    let m = describe(&e);
+    if !is_session_error(&e) {
+        return m;
+    }
+    if m.ends_with('.') {
+        format!("{m} Then {RESTART_HINT}.")
+    } else {
+        format!("{m}, {RESTART_HINT}")
     }
 }
 
-fn fail(e: QuomeError) -> String {
-    describe(&e)
+/// Run an API call; on a session error (revoked or invalid delegation), reload
+/// the stored connection, and when it changed (the user ran `quome connect`
+/// again) retry once with the new one. Evaluates to `Result<T, String>`.
+macro_rules! call {
+    ($self:expr, |$api:ident| $e:expr) => {{
+        let mut retried = false;
+        loop {
+            let $api = $self.conn().api.clone();
+            match $e.await {
+                Ok(v) => break Ok(v),
+                Err(err) if !retried && is_session_error(&err) && $self.refresh(&$api).await => {
+                    retried = true;
+                }
+                Err(err) => break Err(fail(err)),
+            }
+        }
+    }};
 }
 
 fn json<T: Serialize>(v: &T) -> Result<String, String> {
@@ -70,10 +101,33 @@ pub fn check_workspace_path(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[derive(Clone)]
-pub struct QuomeMcp {
+/// Loads the current stored connection (profile, key and VRC) afresh.
+pub type Reloader = Arc<dyn Fn() -> Result<(CloudApi, Profile), QuomeError> + Send + Sync>;
+
+/// The reloader for `quome mcp`: re-reads `cloud.json` and the key store.
+pub fn stored_reloader(
+    home: std::path::PathBuf,
+    store: Arc<dyn KeyStore>,
+    profile: String,
+) -> Reloader {
+    Arc::new(move || {
+        let state = CloudState::load_from(&home)?;
+        let p = state.profile(Some(&profile))?.clone();
+        let (key, vrc) = AgentKey::load_from(store.as_ref(), &profile)?;
+        Ok((CloudApi::new(&p, TokenSource::new(&p, key, vrc)), p))
+    })
+}
+
+struct Conn {
     api: Arc<CloudApi>,
     profile: Arc<Profile>,
+}
+
+#[derive(Clone)]
+pub struct QuomeMcp {
+    conn: Arc<std::sync::RwLock<Arc<Conn>>>,
+    reload: Option<Reloader>,
+    refreshing: Arc<tokio::sync::Mutex<()>>,
     timing: Timing,
     tool_router: ToolRouter<Self>,
 }
@@ -163,11 +217,49 @@ impl QuomeMcp {
 
     pub fn with_timing(api: CloudApi, profile: Profile, timing: Timing) -> QuomeMcp {
         QuomeMcp {
-            api: Arc::new(api),
-            profile: Arc::new(profile),
+            conn: Arc::new(std::sync::RwLock::new(Arc::new(Conn {
+                api: Arc::new(api),
+                profile: Arc::new(profile),
+            }))),
+            reload: None,
+            refreshing: Arc::new(tokio::sync::Mutex::new(())),
             timing,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Let the server pick up a re-run of `quome connect` without a restart.
+    pub fn with_reloader(mut self, reload: Reloader) -> QuomeMcp {
+        self.reload = Some(reload);
+        self
+    }
+
+    fn conn(&self) -> Arc<Conn> {
+        self.conn.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// After a session error on `old`: true when a different connection is now
+    /// in place (swapped here or by a concurrent call), so the call may retry.
+    async fn refresh(&self, old: &Arc<CloudApi>) -> bool {
+        let _guard = self.refreshing.lock().await;
+        let cur = self.conn();
+        if !Arc::ptr_eq(&cur.api, old) {
+            return true;
+        }
+        let Some(reload) = self.reload.clone() else {
+            return false;
+        };
+        let Ok(Ok((api, profile))) = tokio::task::spawn_blocking(move || reload()).await else {
+            return false;
+        };
+        if profile.jkt == cur.profile.jkt && profile.delegation_id == cur.profile.delegation_id {
+            return false;
+        }
+        *self.conn.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(Conn {
+            api: Arc::new(api),
+            profile: Arc::new(profile),
+        });
+        true
     }
 
     /// Serve MCP over any reader/writer pair until the client disconnects.
@@ -190,7 +282,7 @@ impl QuomeMcp {
         if uuid::Uuid::parse_str(sandbox).is_ok() {
             return Ok(sandbox.to_string());
         }
-        let all = self.api.list_sandboxes().await.map_err(fail)?;
+        let all = call!(self, |api| api.list_sandboxes())?;
         all.into_iter()
             .find(|s| s.name == sandbox)
             .map(|s| s.id)
@@ -198,10 +290,8 @@ impl QuomeMcp {
     }
 
     fn app_url(&self, name: &str) -> String {
-        format!(
-            "https://{name}-{}.{}",
-            self.profile.org_slug, self.profile.apps_domain
-        )
+        let p = self.conn().profile.clone();
+        format!("https://{name}-{}.{}", p.org_slug, p.apps_domain)
     }
 
     async fn find_app(&self, name: &str) -> Result<Option<super::api::Service>, String> {
@@ -212,11 +302,7 @@ impl QuomeMcp {
                 .as_deref()
                 .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
         };
-        Ok(self
-            .api
-            .list_services()
-            .await
-            .map_err(fail)?
+        Ok(call!(self, |api| api.list_services())?
             .into_iter()
             .filter(|s| {
                 s.kind == "app" && s.name == name && s.status != "deleted" && s.status != "deleting"
@@ -235,7 +321,7 @@ impl QuomeMcp {
         description = "Read the Quome Cloud agent guide: how sandboxes, previews and app deploys work. Read it first."
     )]
     async fn guide(&self) -> Result<String, String> {
-        self.api.agent_guide().await.map_err(fail)
+        call!(self, |api| api.agent_guide())
     }
 
     #[tool(
@@ -248,15 +334,11 @@ impl QuomeMcp {
         let name = a.name.unwrap_or_else(|| {
             format!("agent-{}", &uuid::Uuid::new_v4().simple().to_string()[..6])
         });
-        let sb = self
-            .api
-            .create_sandbox(
-                &name,
-                a.memory_gb.unwrap_or(4.0),
-                a.runtime.as_deref().unwrap_or("claude"),
-            )
-            .await
-            .map_err(fail)?;
+        let sb = call!(self, |api| api.create_sandbox(
+            &name,
+            a.memory_gb.unwrap_or(4.0),
+            a.runtime.as_deref().unwrap_or("claude"),
+        ))?;
         let deadline = Instant::now() + self.timing.sandbox_wait;
         let mut cur = sb;
         loop {
@@ -284,19 +366,19 @@ impl QuomeMcp {
                 ));
             }
             tokio::time::sleep(self.timing.poll).await;
-            cur = self.api.get_sandbox(&cur.id).await.map_err(fail)?;
+            cur = call!(self, |api| api.get_sandbox(&cur.id))?;
         }
     }
 
     #[tool(description = "List this organization's sandboxes.")]
     async fn list_sandboxes(&self) -> Result<String, String> {
-        json(&self.api.list_sandboxes().await.map_err(fail)?)
+        json(&call!(self, |api| api.list_sandboxes())?)
     }
 
     #[tool(description = "Stop a sandbox (by name or id).")]
     async fn stop_sandbox(&self, Parameters(a): Parameters<SandboxArgs>) -> Result<String, String> {
         let id = self.sandbox_id(&a.sandbox).await?;
-        let sb = self.api.stop_sandbox(&id).await.map_err(fail)?;
+        let sb = call!(self, |api| api.stop_sandbox(&id))?;
         json(&sandbox_json(&sb))
     }
 
@@ -309,7 +391,7 @@ impl QuomeMcp {
             .timeout_s
             .unwrap_or(MAX_EXEC_TIMEOUT)
             .clamp(1, MAX_EXEC_TIMEOUT);
-        let r = self.api.exec(&id, &a.command, t).await.map_err(fail)?;
+        let r = call!(self, |api| api.exec(&id, &a.command, t))?;
         json(&r)
     }
 
@@ -326,7 +408,7 @@ impl QuomeMcp {
             _ => return Err("Give exactly one of `content` and `content_base64`.".into()),
         };
         let id = self.sandbox_id(&a.sandbox).await?;
-        self.api.upload(&id, &a.path, &bytes).await.map_err(fail)?;
+        call!(self, |api| api.upload(&id, &a.path, &bytes))?;
         json(&serde_json::json!({"path": a.path, "bytes": bytes.len()}))
     }
 
@@ -335,12 +417,7 @@ impl QuomeMcp {
     )]
     async fn read_file(&self, Parameters(a): Parameters<PathArgs>) -> Result<String, String> {
         let id = self.sandbox_id(&a.sandbox).await?;
-        let bytes = match self
-            .api
-            .download(&id, &a.path, MAX_READ)
-            .await
-            .map_err(fail)?
-        {
+        let bytes = match call!(self, |api| api.download(&id, &a.path, MAX_READ))? {
             Download::Body(b) => b,
             Download::TooLarge(size) => {
                 let size = size
@@ -363,11 +440,8 @@ impl QuomeMcp {
     #[tool(description = "List a directory in a sandbox (default /workspace).")]
     async fn list_files(&self, Parameters(a): Parameters<ListFilesArgs>) -> Result<String, String> {
         let id = self.sandbox_id(&a.sandbox).await?;
-        let l = self
-            .api
-            .list_files(&id, a.path.as_deref().unwrap_or("/workspace"))
-            .await
-            .map_err(fail)?;
+        let l = call!(self, |api| api
+            .list_files(&id, a.path.as_deref().unwrap_or("/workspace")))?;
         json(&l)
     }
 
@@ -376,11 +450,11 @@ impl QuomeMcp {
     )]
     async fn preview(&self, Parameters(a): Parameters<PreviewArgs>) -> Result<String, String> {
         let id = self.sandbox_id(&a.sandbox).await?;
-        let ports = self.api.ports(&id).await.map_err(fail)?;
+        let ports = call!(self, |api| api.ports(&id))?;
         if let Some(p) = ports.exposed.iter().find(|p| p.port == a.port) {
             return json(&serde_json::json!({"url": p.url}));
         }
-        let p = self.api.expose_port(&id, a.port).await.map_err(fail)?;
+        let p = call!(self, |api| api.expose_port(&id, a.port))?;
         json(&serde_json::json!({"url": p.url}))
     }
 
@@ -395,25 +469,14 @@ impl QuomeMcp {
             .map_err(fail)?;
         let app = match self.find_app(&a.name).await? {
             Some(app) => app,
-            None => self
-                .api
-                .create_app(&a.name, a.memory_gb.unwrap_or(1.0))
-                .await
-                .map_err(fail)?,
+            None => call!(self, |api| api
+                .create_app(&a.name, a.memory_gb.unwrap_or(1.0)))?,
         };
-        let up = self
-            .api
-            .upload_source(&app.id, packed.path())
-            .await
-            .map_err(fail)?;
-        let dep = self
-            .api
-            .deploy(&app.id, &up.source_key)
-            .await
-            .map_err(fail)?;
+        let up = call!(self, |api| api.upload_source(&app.id, packed.path()))?;
+        let dep = call!(self, |api| api.deploy(&app.id, &up.source_key))?;
         let deadline = Instant::now() + self.timing.build_wait;
         loop {
-            let b = self.api.build(&app.id, &dep.build_id).await.map_err(fail)?;
+            let b = call!(self, |api| api.build(&app.id, &dep.build_id))?;
             match b.status.as_str() {
                 "succeeded" => {
                     return json(&serde_json::json!({
@@ -763,17 +826,140 @@ mod tests {
             .await;
         let (err, text) = c.call("list_sandboxes", json!({})).await;
         assert!(err);
-        assert_eq!(text, DISCONNECTED);
+        let sentence = QuomeError::CloudDisconnected.to_string();
+        assert!(text.starts_with(&sentence), "{text}");
+        assert!(text.contains(RESTART_HINT), "no reload possible: {text}");
+    }
+
+    fn cloud_home(
+        server: &str,
+        jkt: &str,
+        del: &str,
+        key: &AgentKey,
+    ) -> (tempfile::TempDir, Reloader) {
+        let home = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(super::super::keys::FileStore {
+            dir: home.path().to_path_buf(),
+        });
+        let r = stored_reloader(home.path().to_path_buf(), store, "cloud".into());
+        write_connection(home.path(), server, jkt, del, key);
+        (home, r)
+    }
+
+    fn write_connection(
+        home: &std::path::Path,
+        server: &str,
+        jkt: &str,
+        del: &str,
+        key: &AgentKey,
+    ) {
+        let mut p = profile(server);
+        p.jkt = jkt.into();
+        p.delegation_id = del.into();
+        let mut st = CloudState {
+            default: "cloud".into(),
+            ..Default::default()
+        };
+        st.profiles.insert("cloud".into(), p);
+        st.save_to(home).unwrap();
+        let store = super::super::keys::FileStore {
+            dir: home.to_path_buf(),
+        };
+        key.store_in(&store, "cloud", "vrc").unwrap();
+    }
+
+    /// Token endpoint hands out OLD once, then NEW; the API revokes OLD.
+    async fn revoking_server() -> MockServer {
+        let s = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"token_endpoint": format!("{}/oauth/token", s.uri())})),
+            )
+            .mount(&s)
+            .await;
+        for (tok, n) in [("OLD", 1u64), ("NEW", 100)] {
+            Mock::given(method("POST"))
+                .and(path("/oauth/token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    json!({"access_token":tok,"token_type":"Bearer","expires_in":3600}),
+                ))
+                .up_to_n_times(n)
+                .mount(&s)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path(api_path("/sandboxes")))
+            .and(wiremock::matchers::header("authorization", "Bearer OLD"))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .set_body_json(json!({"detail":"unauthorized","reason":"delegation_revoked"})),
+            )
+            .mount(&s)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(api_path("/sandboxes")))
+            .and(wiremock::matchers::header("authorization", "Bearer NEW"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&s)
+            .await;
+        s
+    }
+
+    async fn client_for(server: QuomeMcp) -> Client {
+        let (cw, sr) = tokio::io::duplex(1 << 20);
+        let (sw, cr) = tokio::io::duplex(1 << 20);
+        tokio::spawn(server.serve_io(sr, sw));
+        let mut c = Client {
+            w: cw,
+            r: BufReader::new(cr),
+            id: 0,
+        };
+        c.rpc(
+            "initialize",
+            json!({"protocolVersion":"2025-06-18","capabilities":{},
+                   "clientInfo":{"name":"t","version":"0"}}),
+        )
+        .await;
+        c.w.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+            .await
+            .unwrap();
+        c
+    }
+
+    #[tokio::test]
+    async fn reconnect_is_picked_up_without_restarting_the_server() {
+        let s = revoking_server().await;
+        let old = AgentKey::generate();
+        let (home, reload) = cloud_home(&s.uri(), "j", "d", &old);
+        let p = profile(&s.uri());
+        let api = CloudApi::new(&p, TokenSource::new(&p, old, "vrc".into()));
+        let mut c = client_for(QuomeMcp::new(api, p).with_reloader(reload)).await;
+
+        // Revoked, and nothing new has been stored: the sentence plus restart hint.
+        let (err, text) = c.call("list_sandboxes", json!({})).await;
+        assert!(err);
+        assert!(
+            text.contains("quome connect") && text.contains(RESTART_HINT),
+            "{text}"
+        );
+
+        // The user runs `quome connect` again: a new key, jkt and delegation.
+        write_connection(home.path(), &s.uri(), "j2", "d2", &AgentKey::generate());
+        let (err, text) = c.call("list_sandboxes", json!({})).await;
+        assert!(!err, "{text}");
+        assert_eq!(text.trim(), "[]");
     }
 
     #[test]
     fn invalid_grant_keeps_clock_hint() {
         let m = describe(&QuomeError::CloudInvalidGrant);
-        assert!(m.starts_with(DISCONNECTED));
+        assert!(m.starts_with(&QuomeError::CloudDisconnected.to_string()));
         assert!(m.contains("clock"));
         assert_eq!(
             describe(&QuomeError::CloudNotYetConnected),
-            "Finish approving in the browser, then try again"
+            "Finish approving in the browser, then try again."
         );
     }
 

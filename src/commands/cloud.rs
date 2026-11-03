@@ -243,7 +243,10 @@ mod tests {
         save(home.path(), &s.uri(), &store);
         let (out, code) = status(home.path(), None, false, &store).await.unwrap();
         assert_eq!(code, 1);
-        assert!(out.contains(crate::cloud::mcp::DISCONNECTED), "{out}");
+        assert!(
+            out.contains(&QuomeError::CloudDisconnected.to_string()),
+            "{out}"
+        );
     }
 
     #[test]
