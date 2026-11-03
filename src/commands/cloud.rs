@@ -104,19 +104,15 @@ pub async fn status(
     Ok((out, if ok { 0 } else { 1 }))
 }
 
-/// Delete the profile (and its key via `delete_key`); returns the text to print.
-pub fn disconnect(
-    home: &Path,
-    profile: Option<&str>,
-    delete_key: &dyn Fn(&str) -> Result<()>,
-) -> Result<String> {
+/// Delete the profile (and its key from `store`); returns the text to print.
+pub fn disconnect(home: &Path, profile: Option<&str>, store: &dyn KeyStore) -> Result<String> {
     let mut state = CloudState::load_from(home)?;
     if state.profiles.is_empty() {
         return Ok(NOT_CONNECTED.to_string());
     }
     let name = profile.unwrap_or(&state.default).to_string();
     let p = state.profile(Some(&name))?.clone();
-    delete_key(&name)?;
+    store.delete(&name)?;
     state.profiles.remove(&name);
     if state.default == name {
         state.default = state.profiles.keys().next().cloned().unwrap_or_default();
@@ -127,40 +123,6 @@ pub fn disconnect(
          To revoke this agent's access in Quome Cloud, open {}/dashboard",
         p.console_url.trim_end_matches('/')
     ))
-}
-
-/// Remove the stored key for `profile` from the platform backend; absent is fine.
-fn delete_platform_key(profile: &str) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        let e = keyring::Entry::new(crate::cloud::keys::KEYCHAIN_SERVICE, profile)
-            .map_err(|e| QuomeError::CloudKey(e.to_string()))?;
-        match e.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(e) => Err(QuomeError::CloudKey(e.to_string())),
-        }
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        if profile.is_empty() || profile.contains('/') || profile.starts_with('.') {
-            return Err(QuomeError::CloudKey(format!(
-                "invalid profile name \"{profile}\""
-            )));
-        }
-        let home = dirs::home_dir()
-            .ok_or_else(|| QuomeError::CloudKey("cannot find home directory".into()))?;
-        let path = crate::cloud::state::quome_dir(&home).join(format!("cloud-{profile}.key"));
-        match std::fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e.into()),
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = profile;
-        Err(QuomeError::CloudUnsupported)
-    }
 }
 
 pub async fn execute(command: CloudCommands) -> Result<()> {
@@ -183,10 +145,10 @@ pub async fn execute(command: CloudCommands) -> Result<()> {
             }
         }
         CloudCommands::Disconnect(a) => {
+            let store = platform_store().map_err(unsupported)?;
             println!(
                 "{}",
-                disconnect(&home, a.profile.as_deref(), &delete_platform_key)
-                    .map_err(unsupported)?
+                disconnect(&home, a.profile.as_deref(), store.as_ref())?
             );
         }
     }
@@ -292,12 +254,10 @@ mod tests {
         };
         save(home.path(), "http://127.0.0.1:9", &store);
         let key_file = home.path().join("cloud-cloud.key");
-        std::fs::write(&key_file, "x").unwrap();
-        let del = |n: &str| -> Result<()> {
-            std::fs::remove_file(home.path().join(format!("cloud-{n}.key")))?;
-            Ok(())
-        };
-        let out = disconnect(home.path(), None, &del).unwrap();
+        assert!(key_file.exists(), "save() stored a key");
+        assert!(store.get("cloud").is_ok());
+        let out = disconnect(home.path(), None, &store).unwrap();
+        assert!(store.get("cloud").is_err(), "key is gone from the store");
         assert!(out.contains("http://127.0.0.1:9/dashboard"), "{out}");
         assert!(!key_file.exists());
         let st = CloudState::load_from(home.path()).unwrap();

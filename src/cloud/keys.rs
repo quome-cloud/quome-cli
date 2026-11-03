@@ -17,6 +17,8 @@ pub struct AgentKey {
 pub trait KeyStore {
     fn put(&self, profile: &str, secret: &str) -> Result<(), QuomeError>;
     fn get(&self, profile: &str) -> Result<String, QuomeError>;
+    /// Remove the stored key; an absent key is fine.
+    fn delete(&self, profile: &str) -> Result<(), QuomeError>;
 }
 
 /// `<dir>/cloud-<profile>.key`, mode 0600 (the Linux backend).
@@ -48,6 +50,13 @@ impl KeyStore for FileStore {
         std::fs::read_to_string(self.path(profile)?)
             .map_err(|e| QuomeError::CloudKey(format!("cannot read key for \"{profile}\": {e}")))
     }
+    fn delete(&self, profile: &str) -> Result<(), QuomeError> {
+        match std::fs::remove_file(self.path(profile)?) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -72,6 +81,12 @@ impl KeyStore for KeychainStore {
         Self::entry(profile)?
             .get_password()
             .map_err(|e| QuomeError::CloudKey(format!("no key for \"{profile}\": {e}")))
+    }
+    fn delete(&self, profile: &str) -> Result<(), QuomeError> {
+        match Self::entry(profile)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(QuomeError::CloudKey(e.to_string())),
+        }
     }
 }
 
@@ -158,6 +173,21 @@ impl AgentKey {
 mod tests {
     use super::*;
     use base64::Engine;
+
+    #[test]
+    fn file_store_delete_removes_the_key_and_tolerates_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = FileStore {
+            dir: dir.path().to_path_buf(),
+        };
+        st.put("p", "secret").unwrap();
+        assert_eq!(st.get("p").unwrap(), "secret");
+        st.delete("p").unwrap();
+        assert!(st.get("p").is_err());
+        assert!(!dir.path().join("cloud-p.key").exists());
+        st.delete("p").unwrap();
+        assert!(st.delete("../x").is_err());
+    }
 
     fn b64(s: &str) -> Vec<u8> {
         base64::engine::general_purpose::URL_SAFE_NO_PAD

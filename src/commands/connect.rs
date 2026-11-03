@@ -269,6 +269,10 @@ impl KeyStore for MemStore {
             .cloned()
             .ok_or_else(|| QuomeError::CloudKey("no key".into()))
     }
+    fn delete(&self, profile: &str) -> Result<()> {
+        self.0.lock().unwrap().remove(profile);
+        Ok(())
+    }
 }
 
 /// `/me`, retried while the console has not yet recorded the delegation.
