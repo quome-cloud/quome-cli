@@ -8,7 +8,9 @@ use crate::errors::QuomeError;
 use base64::Engine;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    tool, tool_handler, tool_router, ServiceExt,
+    model::ProgressNotificationParam,
+    service::RequestContext,
+    tool, tool_handler, tool_router, RoleServer, ServiceExt,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -63,6 +65,45 @@ fn fail(e: QuomeError) -> String {
         format!("{m} Then {RESTART_HINT}.")
     } else {
         format!("{m}, {RESTART_HINT}")
+    }
+}
+
+/// A long-running tool call's request context: progress notifications when the
+/// client gave a progress token, and cancellation when it sends
+/// `notifications/cancelled`.
+struct Progress {
+    ctx: RequestContext<RoleServer>,
+    step: std::sync::atomic::AtomicU32,
+}
+
+impl Progress {
+    fn new(ctx: RequestContext<RoleServer>) -> Progress {
+        Progress {
+            ctx,
+            step: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    /// Tell the client we are still working (no-op without a progress token).
+    async fn note(&self, message: impl Into<String>) {
+        let Some(token) = self.ctx.meta.get_progress_token() else {
+            return;
+        };
+        let n = self.step.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let mut p = ProgressNotificationParam::new(token, f64::from(n));
+        p.message = Some(message.into());
+        let _ = self.ctx.peer.notify_progress(p).await;
+    }
+
+    /// Run `fut`, dropping it (and so every request and sleep in it) on cancellation.
+    async fn run<T>(
+        &self,
+        fut: impl std::future::Future<Output = Result<T, String>>,
+    ) -> Result<T, String> {
+        tokio::select! {
+            r = fut => r,
+            _ = self.ctx.ct.cancelled() => Err("Cancelled.".into()),
+        }
     }
 }
 
@@ -289,6 +330,54 @@ impl QuomeMcp {
             .ok_or_else(|| format!("No sandbox named {sandbox:?}. Use list_sandboxes to see them."))
     }
 
+    async fn create_sandbox_wait(
+        &self,
+        a: CreateSandboxArgs,
+        progress: &Progress,
+    ) -> Result<String, String> {
+        let name = a.name.unwrap_or_else(|| {
+            format!("agent-{}", &uuid::Uuid::new_v4().simple().to_string()[..6])
+        });
+        let sb = call!(self, |api| api.create_sandbox(
+            &name,
+            a.memory_gb.unwrap_or(4.0),
+            a.runtime.as_deref().unwrap_or("claude"),
+        ))?;
+        progress.note(format!("Created sandbox {name}")).await;
+        let deadline = Instant::now() + self.timing.sandbox_wait;
+        let mut cur = sb;
+        loop {
+            match cur.status.as_str() {
+                "running" => return json(&sandbox_json(&cur)),
+                "failed" | "stopped" | "stopping" | "deleting" => {
+                    return Err(format!(
+                        "Sandbox {} is {}{}",
+                        cur.name,
+                        cur.status,
+                        cur.failure_reason
+                            .as_deref()
+                            .map(|r| format!(": {r}"))
+                            .unwrap_or_default()
+                    ))
+                }
+                _ => {}
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "Sandbox {} is still {} after {} seconds; check list_sandboxes later.",
+                    cur.name,
+                    cur.status,
+                    self.timing.sandbox_wait.as_secs()
+                ));
+            }
+            progress
+                .note(format!("Sandbox {} is {}", cur.name, cur.status))
+                .await;
+            tokio::time::sleep(self.timing.poll).await;
+            cur = call!(self, |api| api.get_sandbox(&cur.id))?;
+        }
+    }
+
     fn app_url(&self, name: &str) -> String {
         let p = self.conn().profile.clone();
         format!("https://{name}-{}.{}", p.org_slug, p.apps_domain)
@@ -330,44 +419,10 @@ impl QuomeMcp {
     async fn create_sandbox(
         &self,
         Parameters(a): Parameters<CreateSandboxArgs>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<String, String> {
-        let name = a.name.unwrap_or_else(|| {
-            format!("agent-{}", &uuid::Uuid::new_v4().simple().to_string()[..6])
-        });
-        let sb = call!(self, |api| api.create_sandbox(
-            &name,
-            a.memory_gb.unwrap_or(4.0),
-            a.runtime.as_deref().unwrap_or("claude"),
-        ))?;
-        let deadline = Instant::now() + self.timing.sandbox_wait;
-        let mut cur = sb;
-        loop {
-            match cur.status.as_str() {
-                "running" => return json(&sandbox_json(&cur)),
-                "failed" | "stopped" | "stopping" | "deleting" => {
-                    return Err(format!(
-                        "Sandbox {} is {}{}",
-                        cur.name,
-                        cur.status,
-                        cur.failure_reason
-                            .as_deref()
-                            .map(|r| format!(": {r}"))
-                            .unwrap_or_default()
-                    ))
-                }
-                _ => {}
-            }
-            if Instant::now() >= deadline {
-                return Err(format!(
-                    "Sandbox {} is still {} after {} seconds; check list_sandboxes later.",
-                    cur.name,
-                    cur.status,
-                    self.timing.sandbox_wait.as_secs()
-                ));
-            }
-            tokio::time::sleep(self.timing.poll).await;
-            cur = call!(self, |api| api.get_sandbox(&cur.id))?;
-        }
+        let progress = Progress::new(ctx);
+        progress.run(self.create_sandbox_wait(a, &progress)).await
     }
 
     #[tool(description = "List this organization's sandboxes.")]
@@ -533,6 +588,8 @@ mod tests {
         w: tokio::io::DuplexStream,
         r: BufReader<tokio::io::DuplexStream>,
         id: u64,
+        /// Messages that were not the response awaited (notifications).
+        notes: Vec<Value>,
     }
 
     impl Client {
@@ -550,6 +607,7 @@ mod tests {
                 if v["id"] == json!(self.id) {
                     return v;
                 }
+                self.notes.push(v);
             }
         }
         async fn call(&mut self, tool: &str, args: Value) -> (bool, String) {
@@ -600,6 +658,7 @@ mod tests {
             w: cw,
             r: BufReader::new(cr),
             id: 0,
+            notes: vec![],
         };
         c.rpc(
             "initialize",
@@ -915,6 +974,7 @@ mod tests {
             w: cw,
             r: BufReader::new(cr),
             id: 0,
+            notes: vec![],
         };
         c.rpc(
             "initialize",
@@ -1130,6 +1190,91 @@ mod tests {
             .filter(|r| r.method.as_str() == "GET" && r.url.path().ends_with(SB))
             .count();
         assert_eq!(gets, 3, "polled until running");
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_sends_progress_when_given_a_token() {
+        let (s, mut c) = start().await;
+        mount_create(&s, "created").await;
+        Mock::given(method("GET"))
+            .and(path(api_path(&format!("/sandboxes/{SB}"))))
+            .respond_with(ResponseTemplate::new(200).set_body_json(sb_json("starting")))
+            .up_to_n_times(3)
+            .mount(&s)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(api_path(&format!("/sandboxes/{SB}"))))
+            .respond_with(ResponseTemplate::new(200).set_body_json(sb_json("running")))
+            .mount(&s)
+            .await;
+        let v = c
+            .rpc(
+                "tools/call",
+                json!({"name":"create_sandbox","arguments":{"name":"box"},
+                       "_meta":{"progressToken":"tok-1"}}),
+            )
+            .await;
+        assert_ne!(v["result"]["isError"], json!(true), "{v}");
+        let progress: Vec<&Value> = c
+            .notes
+            .iter()
+            .filter(|n| n["method"] == "notifications/progress")
+            .collect();
+        assert!(progress.len() >= 3, "{:?}", c.notes);
+        assert!(progress
+            .iter()
+            .all(|n| n["params"]["progressToken"] == "tok-1"));
+        let seq: Vec<f64> = progress
+            .iter()
+            .map(|n| n["params"]["progress"].as_f64().unwrap())
+            .collect();
+        assert!(seq.windows(2).all(|w| w[0] < w[1]), "increasing: {seq:?}");
+        // Without a token there are none.
+        let before = c.notes.len();
+        let (err, _) = c.call("create_sandbox", json!({"name":"box"})).await;
+        assert!(!err);
+        assert_eq!(c.notes.len(), before);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_create_sandbox_stops_polling() {
+        let (s, mut c) = start_with(Timing {
+            poll: Duration::from_millis(10),
+            sandbox_wait: Duration::from_secs(60),
+            build_wait: Duration::from_secs(60),
+        })
+        .await;
+        mount_create(&s, "created").await;
+        Mock::given(method("GET"))
+            .and(path(api_path(&format!("/sandboxes/{SB}"))))
+            .respond_with(ResponseTemplate::new(200).set_body_json(sb_json("starting")))
+            .mount(&s)
+            .await;
+        let msg = json!({"jsonrpc":"2.0","id":77,"method":"tools/call",
+            "params":{"name":"create_sandbox","arguments":{"name":"box"}}});
+        c.w.write_all(format!("{msg}\n").as_bytes()).await.unwrap();
+        async fn polls(s: &MockServer) -> usize {
+            s.received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| r.method.as_str() == "GET" && r.url.path().ends_with(SB))
+                .count()
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(polls(&s).await >= 3, "polling started");
+        let cancel = json!({"jsonrpc":"2.0","method":"notifications/cancelled",
+            "params":{"requestId":77,"reason":"user pressed Esc"}});
+        c.w.write_all(format!("{cancel}\n").as_bytes())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let at_cancel = polls(&s).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(polls(&s).await, at_cancel, "no polling after cancel");
+        // The server stays usable.
+        let v = c.rpc("tools/list", json!({})).await;
+        assert!(v["result"]["tools"].is_array());
     }
 
     #[tokio::test]
