@@ -543,8 +543,8 @@ mod tests {
             "https://auth.quome.cloud"
         );
         assert_eq!(
-            console_url("https://api.dev.quome.cloud", None),
-            "https://console.dev.quome.cloud"
+            console_url("https://api.staging.example.com", None),
+            "https://console.staging.example.com"
         );
         assert_eq!(
             console_url("http://127.0.0.1:9", None),
