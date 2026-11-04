@@ -521,7 +521,12 @@ impl CloudApi {
     pub async fn app_launch_url(&self, slug: &str) -> Result<String, QuomeError> {
         let p = self.org_path(&format!("/app-installs/{}/launch-url", enc(slug)));
         let v: serde_json::Value = self.json(Method::GET, &p, |b| b).await?;
-        Ok(v["url"].as_str().unwrap_or_default().to_string())
+        match v["url"].as_str() {
+            Some(u) if !u.is_empty() => Ok(u.to_string()),
+            _ => Err(QuomeError::ApiError(
+                "the launch-url response had no url".into(),
+            )),
+        }
     }
 
     pub async fn find_app_tools(
@@ -1328,5 +1333,18 @@ mod tests {
             api.delete_app_data("sales").await.unwrap().status,
             "deleting_data"
         );
+    }
+
+    #[tokio::test]
+    async fn launch_url_without_url_is_an_error() {
+        let (s, api) = setup().await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/api/v1/orgs/{ORG}/app-installs/sales/launch-url"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&s)
+            .await;
+        assert!(api.app_launch_url("sales").await.is_err());
     }
 }

@@ -498,6 +498,18 @@ impl QuomeMcp {
         )
     }
 
+    /// The app's display name for a preview: one read-only catalog GET, the slug if it fails.
+    async fn app_name(&self, slug: &str) -> String {
+        match call!(self, |api| api.app_catalog()) {
+            Ok(apps) => apps
+                .into_iter()
+                .find(|a| a.slug == slug)
+                .map(|a| a.name)
+                .unwrap_or_else(|| slug.to_string()),
+            Err(_) => slug.to_string(),
+        }
+    }
+
     async fn install_run(&self, app: String, progress: &Progress) -> Result<String, String> {
         let deadline = Instant::now() + self.timing.build_wait;
         let mut cur =
@@ -807,9 +819,10 @@ impl QuomeMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<String, String> {
         if a.confirm != Some(true) {
+            let name = self.app_name(&a.app).await;
             return json(&serde_json::json!({
                 "app": a.app, "installed": false,
-                "billing": "standard app billing: compute, database and storage usage",
+                "billing": format!("Quome {name} uses standard app billing: compute, database and storage usage. Nothing extra per app."),
                 "next": "Ask the user, then call install_app again with confirm: true."}));
         }
         let progress = Progress::new(ctx);
@@ -883,8 +896,14 @@ impl QuomeMcp {
 
     #[tool(description = "Set an app key (write-only; the value is stored and never shown again).")]
     async fn set_app_key(&self, Parameters(a): Parameters<SetKeyArgs>) -> Result<String, String> {
-        call!(self, |api| api.set_app_key(&a.app, &a.key, &a.value))
-            .map_err(|e| app_hint(e.replace(&a.value, "[redacted]"), "set app keys"))?;
+        call!(self, |api| api.set_app_key(&a.app, &a.key, &a.value)).map_err(|e| {
+            let e = if a.value.is_empty() {
+                e
+            } else {
+                e.replace(&a.value, "[redacted]")
+            };
+            app_hint(e, "set app keys")
+        })?;
         json(&serde_json::json!({"key": a.key, "set": true}))
     }
 
@@ -898,7 +917,8 @@ impl QuomeMcp {
         if a.confirm != Some(true) {
             return json(&serde_json::json!({
                 "app": a.app, "uninstalled": false,
-                "next": "This stops the app and removes its service; its database, storage and keys are kept. Ask the user, then call uninstall_app again with confirm: true."}));
+                "data": "Data is kept and still bills for storage.",
+                "next": "This stops the app and removes its service. Ask the user, then call uninstall_app again with confirm: true."}));
         }
         json(
             &call!(self, |api| api.uninstall_app(&a.app))
@@ -914,9 +934,11 @@ impl QuomeMcp {
         Parameters(a): Parameters<AppConfirmArgs>,
     ) -> Result<String, String> {
         if a.confirm != Some(true) {
+            let name = self.app_name(&a.app).await;
             return json(&serde_json::json!({
                 "app": a.app, "deleted": false,
-                "next": "This permanently deletes the app's data and cannot be undone. Ask the user, then call delete_app_data again with confirm: true."}));
+                "warning": format!("This permanently deletes {name}'s data. It cannot be undone."),
+                "next": "Ask the user, then call delete_app_data again with confirm: true."}));
         }
         json(
             &call!(self, |api| api.delete_app_data(&a.app))
@@ -1860,6 +1882,37 @@ mod tests {
         assert!(text.contains("No app named"), "{text}");
     }
 
+    async fn catalog(s: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path(api_path("/app-catalog")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"slug":"sales","name":"Sales","summary":"s","available":true,"installed_status":null}
+            ])))
+            .mount(s)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn set_app_key_empty_value_does_not_mangle_errors() {
+        let (s, mut c) = start().await;
+        Mock::given(method("PUT"))
+            .and(path(api_path("/app-installs/sales/keys/k")))
+            .respond_with(
+                ResponseTemplate::new(422)
+                    .set_body_json(json!({"detail":"invalid","reason":"invalid_value"})),
+            )
+            .mount(&s)
+            .await;
+        let (err, text) = c
+            .call("set_app_key", json!({"app":"sales","key":"k","value":""}))
+            .await;
+        assert!(err);
+        assert!(
+            text.contains("invalid_value") && !text.contains("[redacted]"),
+            "{text}"
+        );
+    }
+
     fn inst(status: &str) -> Value {
         json!({"slug":"sales","name":"Sales","status":status,
                "url": if status == "running" { json!("https://sales.example") } else { Value::Null },
@@ -1876,10 +1929,21 @@ mod tests {
             .expect(0)
             .mount(&s)
             .await;
+        catalog(&s).await;
         let (err, text) = c.call("install_app", json!({"app":"sales"})).await;
         assert!(!err, "{text}");
-        assert!(text.contains("standard app billing"), "{text}");
+        assert!(text.contains(
+            "Quome Sales uses standard app billing: compute, database and storage usage. Nothing extra per app."
+        ), "{text}");
         assert!(text.contains("confirm"), "{text}");
+        // A failing catalog read falls back to the slug.
+        let (_s2, mut c2) = start().await;
+        let (err, text) = c2.call("install_app", json!({"app":"sales"})).await;
+        assert!(!err, "{text}");
+        assert!(
+            text.contains("Quome sales uses standard app billing"),
+            "{text}"
+        );
     }
 
     #[tokio::test]
@@ -2030,11 +2094,14 @@ mod tests {
             .expect(0)
             .mount(&s)
             .await;
+        catalog(&s).await;
         let (err, text) = c.call("delete_app_data", json!({"app":"sales"})).await;
         assert!(!err, "{text}");
+        assert!(text.contains("This permanently deletes Sales's data. It cannot be undone."));
         assert!(text.contains("confirm"));
         let (err, text) = c.call("uninstall_app", json!({"app":"sales"})).await;
         assert!(!err, "{text}");
+        assert!(text.contains("Data is kept and still bills for storage."));
         assert!(text.contains("confirm"));
     }
 
