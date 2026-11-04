@@ -1,5 +1,5 @@
 //! The loopback listener `quome connect` opens for the console's connect page.
-//! Contract (quauth "Connect page"): `OPTIONS /callback` preflight, then one
+//! Contract (the console's connect page): `OPTIONS /callback` preflight, then one
 //! `POST /callback` with the matching `state`, answered with a `state` echo.
 use crate::errors::QuomeError;
 use serde::Deserialize;
@@ -18,7 +18,7 @@ pub struct Callback {
     pub vrc: String,
     pub delegation_id: String,
     pub agent_principal: String,
-    /// RFC 3339. quauth sends unix seconds; a string is kept as given.
+    /// RFC 3339. The connect page sends unix seconds; a string is kept as given.
     #[serde(deserialize_with = "expiry_rfc3339")]
     pub expires_at: String,
 }
@@ -283,7 +283,7 @@ mod tests {
         assert_eq!(cb.vrc, "V");
     }
 
-    // quauth's POST /account/delegations returns `expires_at` as unix seconds,
+    // The identity service returns a delegation's `expires_at` as unix seconds,
     // and the connect page forwards it unchanged.
     #[tokio::test]
     async fn unix_seconds_expiry_is_accepted_as_rfc3339() {

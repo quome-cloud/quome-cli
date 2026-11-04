@@ -1,5 +1,5 @@
 //! Packing an app folder into the uncompressed tar Quome Cloud builds from.
-//! Ported from quome-mac's Go deploy packer (`buildTar`, `ignore.go`).
+//! The same packing rules as Quome Cloud's own deploy tooling.
 
 use crate::errors::QuomeError;
 use std::fs;

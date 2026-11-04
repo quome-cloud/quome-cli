@@ -1472,7 +1472,7 @@ dependencies = [
 
 [[package]]
 name = "quome-cli"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "base64",
  "chrono",
