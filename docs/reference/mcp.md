@@ -48,6 +48,7 @@ Sandbox and app arguments marked "name or id" accept either. Email `address` arg
 | `email_list_addresses` | none | Lists your email addresses (yours and those of sandboxes you can use), with status and last message time. |
 | `email_list_messages` | `address`, `since?`, `limit?` | Lists an address's messages (full address or id), newest first: id, sender, subject, received time, risk and whether it is quarantined. `since`: only messages after this time (RFC 3339), for example a previous `email_wait` `now`. `limit`: clamped to 1-100; default 20. The result adds a `note` that subjects and sender names come from outside senders. |
 | `email_read` | `message_id` | Reads one message as an untrusted envelope: the text between `<<<EMAIL nonce>>>` markers, likely verification `codes` and `links`, and attachments. When `quarantined` is true the content is withheld until the person releases it in the console. |
+| `email_wait` | `address`, `from_contains?`, `subject_contains?`, `timeout_s?` | Waits for mail at an address (full address or id) and returns the first message newer than the call (or the last minute) that matches the optional case-insensitive sender and subject filters, in the same envelope as `email_read`. `timeout_s`: total wait, clamped to 1-120; default 60. |
 | `email_disable` | `address` | Disables an address (full address or id) for good: it never receives mail again. Messages already received stay readable. Disabling an address that is already disabled succeeds. |
 
 ### Long-running commands
@@ -84,11 +85,13 @@ Connections made before email existed have no email access: run `quome connect` 
 
 `email_read` returns the envelope exactly as the server sent it: the CLI does not parse, trim or re-wrap the body or its markers. Agents never get HTML, only the text body.
 
+`email_wait` repeats short server waits of up to 25 s until `timeout_s` runs out, passing each response's `now` on as the next `since`, so no mail that arrives in between is missed. When the server is busy (at most 5 waits at once per agent) or the edge times out, it backs off (1, 2, 4, then 8 s) and retries with the same cursor. When nothing matched in time it returns `{"message": null, "timed_out": true, ...}` with a `next` hint; if the server stayed busy the whole time it returns an error naming the 5-wait limit.
+
 Limits: 50 signup addresses per person and 20 per sandbox. Disabled addresses do not count; `email_disable` frees a slot.
 
 ### Progress and cancelling
 
-`create_sandbox` and `deploy_app` send MCP progress notifications while they wait, when the client asks for them, and stop when the client cancels the call (in Claude Code, press Esc). Claude Code allows long tool calls; clients that time out requests after about 60 seconds reset that timer on each progress notification. Where a client still gives up early, raise its tool timeout (in Claude Code, the `MCP_TOOL_TIMEOUT` environment variable, in milliseconds). The work continues on the server either way, so `list_sandboxes` or `app_status` shows the outcome.
+`create_sandbox`, `deploy_app` and `email_wait` send MCP progress notifications while they wait, when the client asks for them, and stop when the client cancels the call (in Claude Code, press Esc). Claude Code allows long tool calls; clients that time out requests after about 60 seconds reset that timer on each progress notification. Where a client still gives up early, raise its tool timeout (in Claude Code, the `MCP_TOOL_TIMEOUT` environment variable, in milliseconds). The work continues on the server either way, so `list_sandboxes` or `app_status` shows the outcome.
 
 ## Messages
 
