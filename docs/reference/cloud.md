@@ -17,12 +17,11 @@ Options:
   -h, --help               Print help
 ```
 
-<!-- e2e: replace with real output -->
 ```console
 $ quome cloud status
 Quome Cloud
   Profile: cloud
-  Agent:   Claude Code on laptop (agent-3f9c…)
+  Agent:   Claude Code on laptop (agent:acme/6)
   Org:     acme
   Expires: 2027-02-01
   Check:   ok
@@ -57,7 +56,5 @@ Disconnected profile "cloud" from this computer.
 To revoke this agent's access in Quome Cloud, open https://console.quome.cloud/dashboard
 To remove it from Claude Code too: claude mcp remove --scope user quome
 ```
-
-<!-- e2e: replace with real output -->
 
 This is local only: it does **not** revoke the agent. Revoke it on the console dashboard so it can no longer be used from anywhere. It also does not unregister the MCP server from Claude Code; the command printed last does that.

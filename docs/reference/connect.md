@@ -30,7 +30,6 @@ Options:
 2. **The browser opens for approval.** The CLI prints a `Key fingerprint: SHA256:abcd…wxyz` line and opens the console's connect page. The page shows the same fingerprint; **compare the two before you approve**. If they differ, do not approve.
 3. **You approve; the CLI finishes.** The console hands the grant back to a short-lived listener on `127.0.0.1`. The CLI checks the connection works, saves it, and registers the MCP server.
 
-<!-- e2e: replace with real output -->
 ```console
 $ quome connect
 Key fingerprint: SHA256:q3Zk…Hn8w
