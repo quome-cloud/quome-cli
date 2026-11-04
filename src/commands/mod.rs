@@ -1,5 +1,7 @@
 pub mod apps;
 pub mod bindings;
+pub mod cloud;
+pub mod connect;
 pub mod databases;
 pub mod deploy;
 pub mod deployments;
@@ -11,6 +13,7 @@ pub mod link;
 pub mod login;
 pub mod logout;
 pub mod logs;
+pub mod mcp;
 pub mod members;
 pub mod orgs;
 pub mod secrets;
