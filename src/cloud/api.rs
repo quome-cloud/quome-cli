@@ -140,6 +140,9 @@ pub struct AppInstall {
     /// Billing note, present on the install response only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub billing: Option<String>,
+    /// The server's note (for example on uninstall: data is kept).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -274,7 +277,8 @@ fn map_error(status: u16, text: &str) -> QuomeError {
         }),
         429 => QuomeError::RateLimited,
         code => {
-            let msg = [detail.as_str(), reason]
+            let message = v["message"].as_str().unwrap_or("");
+            let msg = [detail.as_str(), reason, message]
                 .iter()
                 .filter(|s| !s.is_empty())
                 .copied()
@@ -576,11 +580,17 @@ impl CloudApi {
         self.json(Method::GET, &p, |b| b).await
     }
 
-    pub async fn set_app_key(&self, slug: &str, key: &str, value: &str) -> Result<(), QuomeError> {
+    /// Stores the key; returns whether the server is delivering it to the running app.
+    pub async fn set_app_key(
+        &self,
+        slug: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<bool, QuomeError> {
         let p = self.org_path(&format!("/app-installs/{}/keys/{}", enc(slug), enc(key)));
         let body = serde_json::json!({"value": value});
-        self.send(Method::PUT, &p, |b| b.json(&body)).await?;
-        Ok(())
+        let v: serde_json::Value = self.json(Method::PUT, &p, |b| b.json(&body)).await?;
+        Ok(v["delivering"].as_bool().unwrap_or(false))
     }
 
     pub async fn uninstall_app(&self, slug: &str) -> Result<AppInstall, QuomeError> {
@@ -1346,5 +1356,34 @@ mod tests {
             .mount(&s)
             .await;
         assert!(api.app_launch_url("sales").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn api_error_includes_server_message() {
+        let (s, api) = setup().await;
+        Mock::given(method("POST"))
+            .and(path(format!("/api/v1/orgs/{ORG}/app-installs/sales/tools/t/call")))
+            .respond_with(ResponseTemplate::new(502).set_body_json(
+                serde_json::json!({"detail":"bad_gateway","reason":"app_error","message":"key missing"}),
+            ))
+            .mount(&s)
+            .await;
+        let e = api
+            .call_app_tool("sales", "t", &serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "API error: 502 bad_gateway: app_error: key missing"
+        );
+    }
+
+    #[test]
+    fn app_install_keeps_note() {
+        let i: AppInstall = serde_json::from_value(serde_json::json!({
+            "slug":"a","name":"A","status":"uninstalling","url":null,"agents_enabled":true,
+            "error":null,"note":"data kept"}))
+        .unwrap();
+        assert_eq!(serde_json::to_value(&i).unwrap()["note"], "data kept");
     }
 }

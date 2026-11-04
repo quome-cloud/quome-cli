@@ -273,7 +273,7 @@ pub struct AppConfirmArgs {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct FindToolsArgs {
-    /// Words describing what you want to do.
+    /// One word or short phrase matched against tool names and descriptions, e.g. `email`. Omit to list all.
     query: Option<String>,
     /// Limit the search to one app slug.
     app: Option<String>,
@@ -339,6 +339,18 @@ fn app_hint(e: String, action: &str) -> String {
         "That app has no such tool; use find_app_tools to search.".into()
     } else if has("not_available_to_agents") {
         "That app is not open to agents; ask the user to enable agent access in the app.".into()
+    } else if has("deleting_data") {
+        "That app's data is being deleted; check list_installed_apps.".into()
+    } else if has("unknown_key") {
+        "That app has no such key; list_app_keys shows its keys.".into()
+    } else if has("unknown_app") {
+        "There is no such app; list_app_catalog shows the apps.".into()
+    } else if has("not_uninstallable") {
+        "That app is mid-operation or already uninstalled; check list_installed_apps.".into()
+    } else if has("app_unreachable") {
+        "The app is not responding; try again shortly.".into()
+    } else if has("app_managed") {
+        "That is managed by the app's install; use install_app (retries or redeploys a failed app), set_app_key or uninstall_app.".into()
     } else if has("not_installed") {
         "That app is not installed; install_app installs it.".into()
     } else if has("not_uninstalled") {
@@ -521,7 +533,7 @@ impl QuomeMcp {
             match cur.status.as_str() {
                 "running" => {
                     return json(&serde_json::json!({
-                        "status": "running", "url": cur.url,
+                        "status": "running", "url": cur.url, "billing": cur.billing,
                         "next": "open_app gives the sign-in link"}))
                 }
                 "failed" => {
@@ -811,7 +823,7 @@ impl QuomeMcp {
     }
 
     #[tool(
-        description = "Install a first-party Quome app. Without confirm: true it only previews the billing; with it, installs and waits until the app runs."
+        description = "Install a first-party Quome app (standard app billing: compute, database and storage usage). Without confirm: true it only previews; with it, installs and waits until the app runs."
     )]
     async fn install_app(
         &self,
@@ -857,6 +869,9 @@ impl QuomeMcp {
         if r.truncated {
             out.push_str("\nNarrow the query to see more.");
         }
+        if r.results.is_empty() {
+            out.push_str("\nNo matches: try a single word, or omit query to list all.");
+        }
         Ok(out)
     }
 
@@ -896,15 +911,23 @@ impl QuomeMcp {
 
     #[tool(description = "Set an app key (write-only; the value is stored and never shown again).")]
     async fn set_app_key(&self, Parameters(a): Parameters<SetKeyArgs>) -> Result<String, String> {
-        call!(self, |api| api.set_app_key(&a.app, &a.key, &a.value)).map_err(|e| {
-            let e = if a.value.is_empty() {
-                e
-            } else {
-                e.replace(&a.value, "[redacted]")
-            };
-            app_hint(e, "set app keys")
-        })?;
-        json(&serde_json::json!({"key": a.key, "set": true}))
+        let delivering =
+            call!(self, |api| api.set_app_key(&a.app, &a.key, &a.value)).map_err(|e| {
+                let e = if a.value.is_empty() {
+                    e
+                } else {
+                    e.replace(&a.value, "[redacted]")
+                };
+                app_hint(e, "set app keys")
+            })?;
+        let note = if delivering {
+            "The app picks up the key in a moment (it may restart)."
+        } else {
+            "It will be delivered when the app is running."
+        };
+        json(
+            &serde_json::json!({"key": a.key, "set": true, "delivering": delivering, "note": note}),
+        )
     }
 
     #[tool(
@@ -2033,7 +2056,7 @@ mod tests {
         assert!(!text.contains("SG.secret"));
         assert_eq!(
             serde_json::from_str::<Value>(&text).unwrap(),
-            json!({"key":"other","set":true})
+            json!({"key":"other","set":true,"delivering":false,"note":"It will be delivered when the app is running."})
         );
     }
 
@@ -2129,5 +2152,107 @@ mod tests {
             serde_json::from_str::<Value>(&text).unwrap(),
             json!({"url":"https://c/sales/launch"})
         );
+    }
+
+    #[tokio::test]
+    async fn call_app_tool_shows_the_apps_error_message() {
+        let (s, mut c) = start().await;
+        Mock::given(method("POST"))
+            .and(path(api_path("/app-installs/sales/tools/t/call")))
+            .respond_with(ResponseTemplate::new(502).set_body_json(
+                json!({"detail":"bad_gateway","reason":"app_error","message":"SENDGRID key missing"}),
+            ))
+            .mount(&s)
+            .await;
+        let (err, text) = c
+            .call(
+                "call_app_tool",
+                json!({"app":"sales","tool":"t","arguments":{}}),
+            )
+            .await;
+        assert!(err);
+        assert!(text.contains("SENDGRID key missing"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn find_app_tools_empty_results_hint() {
+        let (s, mut c) = start().await;
+        Mock::given(method("GET"))
+            .and(path(api_path("/app-installs/tools")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"results":[],"truncated":false})),
+            )
+            .mount(&s)
+            .await;
+        let (_, text) = c.call("find_app_tools", json!({"query":"zzz"})).await;
+        assert!(
+            text.contains("No matches: try a single word, or omit query to list all."),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_app_key_delivering_note() {
+        let (s, mut c) = start().await;
+        Mock::given(method("PUT"))
+            .and(path(api_path("/app-installs/sales/keys/k")))
+            .respond_with(
+                ResponseTemplate::new(202)
+                    .set_body_json(json!({"key":"k","set":true,"delivering":true})),
+            )
+            .mount(&s)
+            .await;
+        let (_, text) = c
+            .call("set_app_key", json!({"app":"sales","key":"k","value":"v"}))
+            .await;
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["delivering"], true);
+        assert!(v["note"].as_str().unwrap().contains("picks up the key"));
+    }
+
+    #[tokio::test]
+    async fn new_reason_hints() {
+        let (s, mut c) = start().await;
+        for (reason, want) in [
+            ("unknown_key", "list_app_keys"),
+            ("unknown_app", "list_app_catalog"),
+            ("not_uninstallable", "list_installed_apps"),
+            ("app_managed", "install_app"),
+            ("deleting_data", "list_installed_apps"),
+            ("app_unreachable", "try again"),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(api_path(&format!("/app-installs/{reason}/keys"))))
+                .respond_with(
+                    ResponseTemplate::new(409)
+                        .set_body_json(json!({"detail":"conflict","reason":reason})),
+                )
+                .mount(&s)
+                .await;
+            let (err, text) = c.call("list_app_keys", json!({"app": reason})).await;
+            assert!(err);
+            assert!(text.contains(want), "{reason}: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn confirmed_install_result_carries_billing() {
+        let (s, mut c) = start().await;
+        let mut r = inst("running");
+        r["billing"] = json!("standard app billing: compute, database and storage usage");
+        Mock::given(method("POST"))
+            .and(path(api_path("/app-installs")))
+            .respond_with(ResponseTemplate::new(202).set_body_json(r.clone()))
+            .mount(&s)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(api_path("/app-installs/sales")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(r))
+            .mount(&s)
+            .await;
+        let (_, text) = c
+            .call("install_app", json!({"app":"sales","confirm":true}))
+            .await;
+        assert!(text.contains("standard app billing"), "{text}");
     }
 }
