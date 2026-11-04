@@ -1,4 +1,4 @@
-//! RFC 8693 token exchange with quauth: the agent signs a short-lived actor
+//! RFC 8693 token exchange with the Quome Cloud identity service: the agent signs a short-lived actor
 //! token with its key and trades it, plus the VRC, for a plain bearer token.
 use super::keys::AgentKey;
 use super::state::Profile;
@@ -189,7 +189,7 @@ fn map_exchange_error(status: u16, v: &serde_json::Value) -> QuomeError {
         }
     }
     if status == 400 && v["error"].as_str() == Some("invalid_grant") {
-        // revoked, expired, key mismatch, or a skewed local clock: quauth does not say which
+        // revoked, expired, key mismatch, or a skewed local clock: the identity service does not say which
         return QuomeError::CloudInvalidGrant;
     }
     let err = v["error"].as_str().unwrap_or("unknown_error");

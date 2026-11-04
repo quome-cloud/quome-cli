@@ -15,7 +15,7 @@ use crate::errors::{QuomeError, Result};
 
 pub const DEFAULT_API_URL: &str = "https://api.quome.cloud";
 pub const DEFAULT_PROFILE: &str = "cloud";
-/// quauth's limit on an agent's display name.
+/// The identity service's limit on an agent's display name.
 pub const MAX_NAME: usize = 64;
 const RETRY_INTERVAL: Duration = Duration::from_secs(2);
 const RETRY_TOTAL: Duration = Duration::from_secs(60);
