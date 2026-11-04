@@ -185,9 +185,9 @@ pub struct AppKeys {
 
 /// Longest single server wait for mail (the edge cuts requests at 30 s).
 pub const MAX_EMAIL_WAIT: u32 = 25;
-/// Per-request HTTP timeout for mail waits: longer than the edge's 30 s cut,
-/// so that cut shows up as a 504 before this client gives up.
-pub const EMAIL_WAIT_HTTP_TIMEOUT: Duration = Duration::from_secs(40);
+/// A mail wait's HTTP timeout is the server wait plus this slack, so a slow
+/// answer is retried soon and `email_wait` keeps close to its total timeout.
+pub const EMAIL_WAIT_HTTP_SLACK: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct EmailAddress {
@@ -213,8 +213,12 @@ pub struct EmailAddress {
 /// One short server wait for mail.
 #[derive(Debug)]
 pub enum WaitStep {
-    /// A matching message: the server's envelope, unchanged.
-    Message(serde_json::Value),
+    /// A matching message: the server's envelope, unchanged, and the cursor
+    /// (`now`) to pass as the next `since`.
+    Message {
+        message: serde_json::Value,
+        now: String,
+    },
     /// Nothing matched; pass `now` as the next `since`.
     NoMatch { now: String },
     /// The server (or the edge) was busy; retry with the same cursor.
@@ -264,6 +268,7 @@ pub struct CloudApi {
     base: String,
     org: String,
     tokens: TokenSource,
+    email_wait_slack: Duration,
 }
 
 fn valid_name(name: &str) -> bool {
@@ -385,7 +390,14 @@ impl CloudApi {
             base: format!("{}/api/v1", profile.api_url.trim_end_matches('/')),
             org: profile.org_id.clone(),
             tokens,
+            email_wait_slack: EMAIL_WAIT_HTTP_SLACK,
         }
+    }
+
+    /// Change the slack added to each mail wait's HTTP timeout (tests).
+    pub(crate) fn with_email_wait_slack(mut self, slack: Duration) -> CloudApi {
+        self.email_wait_slack = slack;
+        self
     }
 
     /// Send an authenticated request. A 401 that is not a known session reason
@@ -749,6 +761,7 @@ impl CloudApi {
         }
         let p = self.org_path(&format!("/email/addresses/{}/wait", enc(id)));
         let t = timeout_s.to_string();
+        let http_timeout = Duration::from_secs(timeout_s.into()) + self.email_wait_slack;
         let mut query: Vec<(&str, &str)> = vec![("timeout_s", t.as_str())];
         for (k, v) in [
             ("since", since),
@@ -760,11 +773,9 @@ impl CloudApi {
             }
         }
         let resp = self
-            .send(Method::GET, &p, |b| {
-                b.query(&query).timeout(EMAIL_WAIT_HTTP_TIMEOUT)
-            })
+            .send(Method::GET, &p, |b| b.query(&query).timeout(http_timeout))
             .await;
-        let v: serde_json::Value = match resp {
+        let mut v: serde_json::Value = match resp {
             Ok(r) => match r.json().await {
                 Ok(v) => v,
                 Err(e) if e.is_timeout() => return Ok(WaitStep::Busy),
@@ -773,12 +784,12 @@ impl CloudApi {
             Err(e) if wait_busy(&e) => return Ok(WaitStep::Busy),
             Err(e) => return Err(e),
         };
-        if !v["message"].is_null() {
-            return Ok(WaitStep::Message(v["message"].clone()));
-        }
-        match v["now"].as_str() {
-            Some(now) => Ok(WaitStep::NoMatch { now: now.into() }),
-            None => Err(QuomeError::InvalidResponse),
+        let Some(now) = v["now"].as_str().map(String::from) else {
+            return Err(QuomeError::InvalidResponse);
+        };
+        match v.get_mut("message").map(serde_json::Value::take) {
+            Some(message) if !message.is_null() => Ok(WaitStep::Message { message, now }),
+            _ => Ok(WaitStep::NoMatch { now }),
         }
     }
 
@@ -1753,5 +1764,44 @@ mod tests {
             WaitStep::NoMatch { now } => assert_eq!(now, "T"),
             _ => panic!("want NoMatch"),
         }
+    }
+
+    #[tokio::test]
+    async fn email_wait_match_carries_now() {
+        let (s, api) = setup().await;
+        Mock::given(method("GET"))
+            .and(path(wait_path()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"message": {"id": "m1"}, "now": "T2"})),
+            )
+            .mount(&s)
+            .await;
+        match api.email_wait(ADDR, None, None, None, 5).await.unwrap() {
+            WaitStep::Message { message, now } => {
+                assert_eq!(message, serde_json::json!({"id": "m1"}));
+                assert_eq!(now, "T2");
+            }
+            _ => panic!("want Message"),
+        }
+    }
+
+    #[tokio::test]
+    async fn email_wait_client_timeout_is_busy() {
+        let (s, api) = setup().await;
+        let api = api.with_email_wait_slack(Duration::from_millis(100));
+        Mock::given(method("GET"))
+            .and(path(wait_path()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"message":null,"now":"T"}))
+                    .set_delay(Duration::from_secs(5)),
+            )
+            .mount(&s)
+            .await;
+        let started = std::time::Instant::now();
+        let step = api.email_wait(ADDR, None, None, None, 1).await.unwrap();
+        assert!(matches!(step, WaitStep::Busy), "{step:?}");
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 }

@@ -49,7 +49,7 @@ pub struct AddressArgs {
 pub struct ListMessagesArgs {
     /// The full address (`name@…`) or its id, from email_list_addresses.
     pub(crate) address: String,
-    /// Only messages that arrived after this time (RFC 3339), e.g. a previous email_wait `now`.
+    /// Only messages that arrived after this time (RFC 3339), e.g. a previous email_wait `cursor`.
     pub(crate) since: Option<String>,
     /// 1-100. Default 20.
     pub(crate) limit: Option<u32>,
@@ -65,6 +65,8 @@ pub struct ReadArgs {
 pub struct WaitArgs {
     /// The full address (`name@…`) or its id, from email_list_addresses.
     pub(crate) address: String,
+    /// Only mail newer than this: pass the previous email_wait result's `cursor` to get only newer mail. Omitted: the last cursor from this session's email_wait calls for the address, else the last minute.
+    pub(crate) since: Option<String>,
     /// Case-insensitive substring the sender must contain.
     pub(crate) from_contains: Option<String>,
     /// Case-insensitive substring the subject must contain.
