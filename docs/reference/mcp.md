@@ -33,6 +33,17 @@ Sandbox and app arguments marked "name or id" accept either.
 | `preview` | `sandbox`, `port` | Returns a public preview URL for a port the sandbox is serving. |
 | `deploy_app` | `name`, `folder`, `memory_gb?` | Deploys a local folder containing a Dockerfile as a Quome Cloud app and waits for it to run. `memory_gb` as above; default 1. |
 | `app_status` | `name` | Shows an app's state by name, with its latest build (`build_id`, `status`, `error`). The `url` is given only once a build has succeeded. |
+| `list_app_catalog` | | Lists the first-party Quome apps you can install, with install status. |
+| `install_app` | `app`, `confirm?` | Without `confirm: true`, previews the billing and changes nothing. With it, installs the app and waits (up to 10 minutes) until it runs; returns `status`, `url` and `next`. |
+| `list_installed_apps` | | Lists this org's installed apps and their status. |
+| `open_app` | `app` | Returns `{url}`, for an installed app, a link that opens it already signed in (no second login). |
+| `find_app_tools` | `query?`, `app?` | Searches the tools of installed apps and returns short hits. Apps' tools are never separate MCP servers, so this tool list stays fixed. |
+| `describe_app_tool` | `app`, `tool` | Shows one app tool's description and input schema. |
+| `call_app_tool` | `app`, `tool`, `arguments` | Calls an app tool; `arguments` go through unchanged. Destructive tools need an org owner or admin. |
+| `list_app_keys` | `app` | Lists the keys an app can use and whether each is set (never the values). |
+| `set_app_key` | `app`, `key`, `value` | Sets an app key. Write-only: the value is never returned or echoed. Needs an org owner or admin, and the "Store secrets" permission (`quome connect`). The result says whether the app is picking the key up (`delivering`). |
+| `uninstall_app` | `app`, `confirm?` | Without `confirm: true`, previews. With it, removes the app's service; its data is kept. |
+| `delete_app_data` | `app`, `confirm?` | Without `confirm: true`, previews. With it, permanently deletes an uninstalled app's database, storage and keys. |
 
 ### Long-running commands
 

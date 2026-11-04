@@ -117,6 +117,72 @@ pub struct Build {
     pub log_url: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct CatalogApp {
+    pub slug: String,
+    pub name: String,
+    pub summary: String,
+    pub available: bool,
+    #[serde(default)]
+    pub installed_status: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct AppInstall {
+    pub slug: String,
+    pub name: String,
+    pub status: String,
+    #[serde(default)]
+    pub url: Option<String>,
+    pub agents_enabled: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+    /// Billing note, present on the install response only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing: Option<String>,
+    /// The server's note (for example on uninstall: data is kept).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct ToolHit {
+    pub app: String,
+    pub tool: String,
+    pub summary: String,
+    pub destructive: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct ToolSearch {
+    pub results: Vec<ToolHit>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct ToolDetail {
+    pub app: String,
+    pub tool: String,
+    pub description: String,
+    pub input_schema: serde_json::Value,
+    pub destructive: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct AppKeyStatus {
+    pub key: String,
+    pub label: String,
+    pub unlocks: String,
+    pub set: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct AppKeys {
+    pub keys: Vec<AppKeyStatus>,
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
 /// The result of a size-capped download.
 #[derive(Debug, PartialEq)]
 pub enum Download {
@@ -211,7 +277,8 @@ fn map_error(status: u16, text: &str) -> QuomeError {
         }),
         429 => QuomeError::RateLimited,
         code => {
-            let msg = [detail.as_str(), reason]
+            let message = v["message"].as_str().unwrap_or("");
+            let msg = [detail.as_str(), reason, message]
                 .iter()
                 .filter(|s| !s.is_empty())
                 .copied()
@@ -430,6 +497,112 @@ impl CloudApi {
     pub async fn list_services(&self) -> Result<Vec<Service>, QuomeError> {
         self.json(Method::GET, &self.org_path("/services"), |b| b)
             .await
+    }
+
+    pub async fn app_catalog(&self) -> Result<Vec<CatalogApp>, QuomeError> {
+        self.json(Method::GET, &self.org_path("/app-catalog"), |b| b)
+            .await
+    }
+
+    pub async fn install_app(&self, slug: &str) -> Result<AppInstall, QuomeError> {
+        let body = serde_json::json!({"slug": slug, "accept_billing": true});
+        self.json(Method::POST, &self.org_path("/app-installs"), |b| {
+            b.json(&body)
+        })
+        .await
+    }
+
+    pub async fn list_app_installs(&self) -> Result<Vec<AppInstall>, QuomeError> {
+        self.json(Method::GET, &self.org_path("/app-installs"), |b| b)
+            .await
+    }
+
+    pub async fn app_install(&self, slug: &str) -> Result<AppInstall, QuomeError> {
+        let p = self.org_path(&format!("/app-installs/{}", enc(slug)));
+        self.json(Method::GET, &p, |b| b).await
+    }
+
+    pub async fn app_launch_url(&self, slug: &str) -> Result<String, QuomeError> {
+        let p = self.org_path(&format!("/app-installs/{}/launch-url", enc(slug)));
+        let v: serde_json::Value = self.json(Method::GET, &p, |b| b).await?;
+        match v["url"].as_str() {
+            Some(u) if !u.is_empty() => Ok(u.to_string()),
+            _ => Err(QuomeError::ApiError(
+                "the launch-url response had no url".into(),
+            )),
+        }
+    }
+
+    pub async fn find_app_tools(
+        &self,
+        q: Option<&str>,
+        app: Option<&str>,
+    ) -> Result<ToolSearch, QuomeError> {
+        let mut query: Vec<(&str, &str)> = Vec::new();
+        if let Some(q) = q {
+            query.push(("q", q));
+        }
+        if let Some(app) = app {
+            query.push(("app", app));
+        }
+        self.json(Method::GET, &self.org_path("/app-installs/tools"), |b| {
+            b.query(&query)
+        })
+        .await
+    }
+
+    pub async fn describe_app_tool(
+        &self,
+        slug: &str,
+        tool: &str,
+    ) -> Result<ToolDetail, QuomeError> {
+        let p = self.org_path(&format!("/app-installs/{}/tools/{}", enc(slug), enc(tool)));
+        self.json(Method::GET, &p, |b| b).await
+    }
+
+    pub async fn call_app_tool(
+        &self,
+        slug: &str,
+        tool: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<serde_json::Value, QuomeError> {
+        let p = self.org_path(&format!(
+            "/app-installs/{}/tools/{}/call",
+            enc(slug),
+            enc(tool)
+        ));
+        let body = serde_json::json!({"arguments": arguments});
+        self.json(Method::POST, &p, |b| b.json(&body)).await
+    }
+
+    pub async fn app_keys(&self, slug: &str) -> Result<AppKeys, QuomeError> {
+        let p = self.org_path(&format!("/app-installs/{}/keys", enc(slug)));
+        self.json(Method::GET, &p, |b| b).await
+    }
+
+    /// Stores the key; returns whether the server is delivering it to the running app.
+    pub async fn set_app_key(
+        &self,
+        slug: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<bool, QuomeError> {
+        let p = self.org_path(&format!("/app-installs/{}/keys/{}", enc(slug), enc(key)));
+        let body = serde_json::json!({"value": value});
+        let v: serde_json::Value = self.json(Method::PUT, &p, |b| b.json(&body)).await?;
+        Ok(v["delivering"].as_bool().unwrap_or(false))
+    }
+
+    pub async fn uninstall_app(&self, slug: &str) -> Result<AppInstall, QuomeError> {
+        let p = self.org_path(&format!("/app-installs/{}", enc(slug)));
+        let body = serde_json::json!({"confirm": true});
+        self.json(Method::DELETE, &p, |b| b.json(&body)).await
+    }
+
+    pub async fn delete_app_data(&self, slug: &str) -> Result<AppInstall, QuomeError> {
+        let p = self.org_path(&format!("/app-installs/{}/delete-data", enc(slug)));
+        let body = serde_json::json!({"confirm": true, "slug": slug});
+        self.json(Method::POST, &p, |b| b.json(&body)).await
     }
 
     pub async fn create_app(&self, name: &str, memory_gb: f64) -> Result<Service, QuomeError> {
@@ -1061,5 +1234,156 @@ mod tests {
             matches!(e, QuomeError::Http(ref h) if h.is_timeout()),
             "{e}"
         );
+    }
+
+    #[tokio::test]
+    async fn install_app_sends_accept_billing() {
+        let (s, api) = setup().await;
+        Mock::given(method("POST"))
+            .and(path(format!("/api/v1/orgs/{ORG}/app-installs")))
+            .and(wiremock::matchers::body_json(
+                serde_json::json!({"slug":"sales","accept_billing":true}),
+            ))
+            .respond_with(ResponseTemplate::new(202).set_body_json(serde_json::json!({
+                "slug":"sales","name":"Sales","status":"installing","url":null,
+                "agents_enabled":true,"error":null,"billing":"standard app billing"
+            })))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let i = api.install_app("sales").await.unwrap();
+        assert_eq!(i.status, "installing");
+        assert_eq!(i.name, "Sales");
+    }
+
+    #[tokio::test]
+    async fn find_app_tools_encodes_query() {
+        let (s, api) = setup().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v1/orgs/{ORG}/app-installs/tools")))
+            .and(query_param("q", "send & more"))
+            .and(query_param("app", "sales"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results":[{"app":"sales","tool":"send_email","summary":"s","destructive":true}],
+                "truncated":false
+            })))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let r = api
+            .find_app_tools(Some("send & more"), Some("sales"))
+            .await
+            .unwrap();
+        assert_eq!(r.results[0].tool, "send_email");
+    }
+
+    #[tokio::test]
+    async fn set_app_key_puts_value() {
+        let (s, api) = setup().await;
+        Mock::given(method("PUT"))
+            .and(path(format!(
+                "/api/v1/orgs/{ORG}/app-installs/sales/keys/sendgrid"
+            )))
+            .and(wiremock::matchers::body_json(
+                serde_json::json!({"value":"SG.x"}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(202).set_body_json(
+                    serde_json::json!({"key":"sendgrid","set":true,"delivering":false}),
+                ),
+            )
+            .expect(1)
+            .mount(&s)
+            .await;
+        api.set_app_key("sales", "sendgrid", "SG.x").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn launch_url_uninstall_and_delete_data_shapes() {
+        let (s, api) = setup().await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/api/v1/orgs/{ORG}/app-installs/sales/launch-url"
+            )))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"url":"https://c/sales/launch"})),
+            )
+            .mount(&s)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(format!("/api/v1/orgs/{ORG}/app-installs/sales")))
+            .and(wiremock::matchers::body_json(serde_json::json!({"confirm":true})))
+            .respond_with(ResponseTemplate::new(202).set_body_json(serde_json::json!({
+                "slug":"sales","name":"Sales","status":"uninstalling","url":null,"agents_enabled":true,"error":null
+            })))
+            .expect(1)
+            .mount(&s)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/api/v1/orgs/{ORG}/app-installs/sales/delete-data")))
+            .and(wiremock::matchers::body_json(
+                serde_json::json!({"confirm":true,"slug":"sales"}),
+            ))
+            .respond_with(ResponseTemplate::new(202).set_body_json(serde_json::json!({
+                "slug":"sales","name":"Sales","status":"deleting_data","url":null,"agents_enabled":true,"error":null
+            })))
+            .expect(1)
+            .mount(&s)
+            .await;
+        assert_eq!(
+            api.app_launch_url("sales").await.unwrap(),
+            "https://c/sales/launch"
+        );
+        assert_eq!(
+            api.uninstall_app("sales").await.unwrap().status,
+            "uninstalling"
+        );
+        assert_eq!(
+            api.delete_app_data("sales").await.unwrap().status,
+            "deleting_data"
+        );
+    }
+
+    #[tokio::test]
+    async fn launch_url_without_url_is_an_error() {
+        let (s, api) = setup().await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/api/v1/orgs/{ORG}/app-installs/sales/launch-url"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&s)
+            .await;
+        assert!(api.app_launch_url("sales").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn api_error_includes_server_message() {
+        let (s, api) = setup().await;
+        Mock::given(method("POST"))
+            .and(path(format!("/api/v1/orgs/{ORG}/app-installs/sales/tools/t/call")))
+            .respond_with(ResponseTemplate::new(502).set_body_json(
+                serde_json::json!({"detail":"bad_gateway","reason":"app_error","message":"key missing"}),
+            ))
+            .mount(&s)
+            .await;
+        let e = api
+            .call_app_tool("sales", "t", &serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "API error: 502 bad_gateway: app_error: key missing"
+        );
+    }
+
+    #[test]
+    fn app_install_keeps_note() {
+        let i: AppInstall = serde_json::from_value(serde_json::json!({
+            "slug":"a","name":"A","status":"uninstalling","url":null,"agents_enabled":true,
+            "error":null,"note":"data kept"}))
+        .unwrap();
+        assert_eq!(serde_json::to_value(&i).unwrap()["note"], "data kept");
     }
 }
