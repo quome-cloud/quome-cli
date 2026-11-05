@@ -1,7 +1,9 @@
 //! The `quome mcp` server: Quome Cloud tools for Claude Code over MCP stdio.
 use super::api::{CloudApi, Download, Sandbox, WaitStep, MAX_EMAIL_WAIT, MAX_EXEC_TIMEOUT};
 use super::auth::TokenSource;
-use super::auth_instance::{AuthCallError, AuthInstances, Scope};
+use super::auth_instance::{
+    auth_hint, check_env, AuthCallError, AuthInstances, Scope, NOT_STARTED,
+};
 use super::email::{
     backoff, email_hint, normalize_address, AddressArgs, AddressKind, CreateAddressArgs,
     ListMessagesArgs, ReadArgs, WaitArgs, LIST_NOTE,
@@ -434,6 +436,89 @@ fn app_hint(e: String, action: &str) -> String {
 pub struct AppArgs {
     /// App name.
     name: String,
+}
+
+#[derive(Deserialize, JsonSchema, Clone, Copy, PartialEq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthAppsAction {
+    /// The clients on `env`'s auth: linked apps and External clients.
+    List,
+    /// Link a deployed app (by name) to the prod auth.
+    Link,
+    /// Remove a deployed app's link to the prod auth.
+    Unlink,
+    /// Register a prod client for an app not hosted on Quome.
+    RegisterExternal,
+    /// Replace one client's allowed_roles on `env`'s auth.
+    SetAccess,
+}
+
+impl AuthAppsAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            AuthAppsAction::List => "list",
+            AuthAppsAction::Link => "link",
+            AuthAppsAction::Unlink => "unlink",
+            AuthAppsAction::RegisterExternal => "register_external",
+            AuthAppsAction::SetAccess => "set_access",
+        }
+    }
+}
+
+#[derive(Deserialize, JsonSchema, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub enum ClientKind {
+    /// A browser or mobile app that cannot keep a secret.
+    Public,
+    /// A server-side app; it gets a client secret.
+    Confidential,
+}
+
+impl ClientKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            ClientKind::Public => "public",
+            ClientKind::Confidential => "confidential",
+        }
+    }
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct AuthAppsArgs {
+    /// What to do: list, link, unlink, register_external or set_access.
+    action: AuthAppsAction,
+    /// `sandbox` or `prod`. Default sandbox; link, unlink and register_external work on prod only and default to it.
+    env: Option<String>,
+    /// App name, as given to deploy_app (link, unlink).
+    app: Option<String>,
+    /// Client id (register_external, set_access; optional for link).
+    client_id: Option<String>,
+    /// Path on the app that receives the sign-in callback, e.g. `/auth/callback` (link).
+    redirect_path: Option<String>,
+    /// Roles allowed to sign in to the client (link, set_access). Empty allows everyone.
+    allowed_roles: Option<Vec<String>>,
+    /// `public` or `confidential` (register_external).
+    kind: Option<ClientKind>,
+    /// Full callback URLs of the external app (register_external).
+    redirect_uris: Option<Vec<String>>,
+}
+
+/// The fields `client_upsert` takes; an update replaces every one of them.
+const CLIENT_UPSERT_FIELDS: [&str; 9] = [
+    "client_id",
+    "kind",
+    "redirect_uris",
+    "redirect_patterns",
+    "grant_types",
+    "scopes",
+    "login_methods",
+    "allowed_roles",
+    "require_dpop",
+];
+
+/// The value of a required `auth_apps` argument.
+fn needs<T>(v: Option<T>, name: &str, action: AuthAppsAction) -> Result<T, String> {
+    v.ok_or_else(|| format!("`{}` needs `{name}`.", action.as_str()))
 }
 
 impl QuomeMcp {
@@ -870,6 +955,136 @@ impl QuomeMcp {
                 s.kind == "app" && s.name == name && s.status != "deleted" && s.status != "deleting"
             })
             .max_by_key(|s| ts(s)))
+    }
+
+    /// The service id of the deployed app `name`.
+    async fn app_service_id(&self, name: &str) -> Result<String, String> {
+        match self.find_app(name).await? {
+            Some(app) => Ok(app.id),
+            None => Err(format!("No app named {name:?}.")),
+        }
+    }
+
+    /// The platform's list of clients on `env`'s auth. An env whose auth has
+    /// not started has none.
+    async fn auth_app_rows(&self, env: &str) -> Result<Vec<serde_json::Value>, String> {
+        match call!(self, |api| api.auth_apps(env)).map_err(|e| auth_hint(&e)) {
+            Err(e) if e == NOT_STARTED => Ok(vec![]),
+            r => r,
+        }
+    }
+
+    /// One environment for `auth_status`.
+    async fn auth_env_status(&self, env: &str) -> Result<serde_json::Value, String> {
+        let mut out = serde_json::json!({"env": env});
+        match self
+            .auth_call(env, Scope::Read, "status", serde_json::json!({}))
+            .await
+        {
+            Ok(st) => {
+                out["started"] = true.into();
+                for k in ["issuer", "mode", "clients", "users", "roles"] {
+                    if let Some(v) = st.get(k).filter(|v| !v.is_null()) {
+                        out[k] = v.clone();
+                    }
+                }
+                if out.get("issuer").is_none() {
+                    out["issuer"] = self.auth_issuer(env).await?.into();
+                }
+            }
+            Err(e) if e == NOT_STARTED => {
+                out["started"] = false.into();
+                out["note"] = e.into();
+            }
+            Err(e) => return Err(e),
+        }
+        out["apps"] = self.auth_app_rows(env).await?.into();
+        Ok(out)
+    }
+
+    async fn auth_apps_run(&self, a: AuthAppsArgs) -> Result<serde_json::Value, String> {
+        use serde_json::json;
+        let action = a.action;
+        let prod_only = matches!(
+            action,
+            AuthAppsAction::Link | AuthAppsAction::Unlink | AuthAppsAction::RegisterExternal
+        );
+        let env = match a.env.as_deref() {
+            Some(e) => e,
+            None if prod_only => "prod",
+            None => "sandbox",
+        };
+        check_env(env)?;
+        if prod_only && env != "prod" {
+            return Err(format!(
+                "`{}` works on prod only (env \"prod\").",
+                action.as_str()
+            ));
+        }
+        let platform = |e: String| auth_hint(&e);
+        match action {
+            AuthAppsAction::List => Ok(json!({"env": env, "apps": self.auth_app_rows(env).await?})),
+            AuthAppsAction::Link => {
+                let app = needs(a.app, "app", action)?;
+                let id = self.app_service_id(&app).await?;
+                let mut body = json!({});
+                if let Some(c) = a.client_id {
+                    body["client_id"] = c.into();
+                }
+                if let Some(p) = a.redirect_path {
+                    body["redirect_path"] = p.into();
+                }
+                if let Some(r) = a.allowed_roles {
+                    body["allowed_roles"] = r.into();
+                }
+                call!(self, |api| api.auth_link_app(&id, &body)).map_err(platform)
+            }
+            AuthAppsAction::Unlink => {
+                let app = needs(a.app, "app", action)?;
+                let id = self.app_service_id(&app).await?;
+                call!(self, |api| api.auth_unlink_app(&id)).map_err(platform)?;
+                Ok(json!({"app": app, "linked": false}))
+            }
+            AuthAppsAction::RegisterExternal => {
+                let client_id = needs(a.client_id, "client_id", action)?;
+                let kind = needs(a.kind, "kind", action)?;
+                let uris = needs(a.redirect_uris, "redirect_uris", action)?;
+                if uris.is_empty() {
+                    return Err("`register_external` needs at least one redirect URI.".into());
+                }
+                let mut v = call!(self, |api| api.auth_register_external(
+                    &client_id,
+                    kind.as_str(),
+                    &uris
+                ))
+                .map_err(platform)?;
+                if v.get("client_secret").is_some_and(|s| !s.is_null()) {
+                    v["note"] = "Store this secret now; it is not shown again.".into();
+                }
+                Ok(v)
+            }
+            AuthAppsAction::SetAccess => {
+                let client_id = needs(a.client_id, "client_id", action)?;
+                let roles = needs(a.allowed_roles, "allowed_roles", action)?;
+                let list = self
+                    .auth_call(env, Scope::Write, "clients_list", json!({}))
+                    .await?;
+                let client = list["clients"]
+                    .as_array()
+                    .and_then(|cs| cs.iter().find(|c| c["client_id"] == client_id.as_str()))
+                    .ok_or_else(|| format!("No client {client_id:?} on the {env} auth."))?;
+                // An update replaces every field: resend the current ones.
+                let mut args = serde_json::Map::new();
+                for k in CLIENT_UPSERT_FIELDS {
+                    if let Some(v) = client.get(k) {
+                        args.insert(k.into(), v.clone());
+                    }
+                }
+                args.insert("allowed_roles".into(), roles.into());
+                self.auth_call(env, Scope::Write, "client_upsert", args.into())
+                    .await
+            }
+        }
     }
 }
 
@@ -1358,6 +1573,22 @@ impl QuomeMcp {
         let progress = Progress::new(ctx);
         progress.run(self.email_wait_run(a, &progress)).await
     }
+
+    #[tool(
+        description = "Show the org's sign-in (auth) for sandbox and prod: whether each has started, its issuer and mode, how many clients, users and roles it has, and the apps and External clients that use it. Read-only."
+    )]
+    async fn auth_status(&self) -> Result<String, String> {
+        let sandbox = self.auth_env_status("sandbox").await?;
+        let prod = self.auth_env_status("prod").await?;
+        json(&serde_json::json!({ "envs": [sandbox, prod] }))
+    }
+
+    #[tool(
+        description = "Manage which apps sign in with the org's auth. action `list`: the clients on env (default sandbox). `link` / `unlink`: connect a deployed Quome app (by name) to the prod auth, or remove it. `register_external`: a prod client for an app not hosted on Quome; a confidential client's secret is shown once. `set_access`: replace one client's allowed_roles on env."
+    )]
+    async fn auth_apps(&self, Parameters(a): Parameters<AuthAppsArgs>) -> Result<String, String> {
+        json(&self.auth_apps_run(a).await?)
+    }
 }
 
 #[tool_handler(
@@ -1515,6 +1746,8 @@ mod tests {
             "email_list_messages",
             "email_read",
             "email_wait",
+            "auth_status",
+            "auth_apps",
         ];
         want.sort();
         assert_eq!(names, want);
@@ -3728,5 +3961,345 @@ mod tests {
             .await;
         assert!(!err, "{text}");
         assert_server_key_order(&text);
+    }
+
+    const SVC: &str = "33333333-3333-3333-3333-333333333333";
+
+    /// The broker hands out a token for `env` whose instance MCP is `/mcp/<env>`.
+    async fn mount_auth_broker(s: &MockServer, env: &str) {
+        Mock::given(method("POST"))
+            .and(path(api_path("/auth/token")))
+            .and(wiremock::matchers::query_param("env", env))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": format!("T-{env}"), "token_type": "Bearer", "expires_in": 300,
+                "issuer": format!("{}/{env}", s.uri()), "mcp_url": format!("{}/mcp/{env}", s.uri())
+            })))
+            .mount(s)
+            .await;
+    }
+
+    /// The instance for `env` answers `tool` with `structured`.
+    async fn mount_instance_tool(s: &MockServer, env: &str, tool: &str, structured: Value) {
+        Mock::given(method("POST"))
+            .and(path(format!("/mcp/{env}")))
+            .and(wiremock::matchers::body_partial_json(
+                json!({"method": "tools/call", "params": {"name": tool}}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0", "id": 1,
+                "result": {"content": [{"type": "text", "text": "ok"}],
+                           "structuredContent": structured}
+            })))
+            .mount(s)
+            .await;
+    }
+
+    async fn mount_auth_apps(s: &MockServer, env: &str, items: Value) {
+        Mock::given(method("GET"))
+            .and(path(api_path("/auth/apps")))
+            .and(wiremock::matchers::query_param("env", env))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "items": items })))
+            .mount(s)
+            .await;
+    }
+
+    fn rpc_args(reqs: &[wiremock::Request], tool: &str) -> Vec<Value> {
+        reqs.iter()
+            .filter_map(|r| serde_json::from_slice::<Value>(&r.body).ok())
+            .filter(|v| v["params"]["name"] == json!(tool))
+            .map(|v| v["params"]["arguments"].clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn auth_status_reports_both_envs() {
+        let (s, mut c) = start().await;
+        mount_auth_broker(&s, "sandbox").await;
+        Mock::given(method("POST"))
+            .and(path(api_path("/auth/token")))
+            .and(wiremock::matchers::query_param("env", "prod"))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_json(json!({"detail":"not found","reason":"auth_not_started"})),
+            )
+            .mount(&s)
+            .await;
+        mount_instance_tool(
+            &s,
+            "sandbox",
+            "status",
+            json!({"mode": "sandbox", "issuer": "https://auth.apps.example/sandbox",
+                   "org_slug": "acme", "clients": 2, "users": 3, "roles": 1}),
+        )
+        .await;
+        let row = json!({"client_id": "web", "env": "sandbox", "app_id": null,
+                         "label": "external", "redirect_uris": ["https://apps.example/cb"]});
+        mount_auth_apps(&s, "sandbox", json!([row.clone()])).await;
+        mount_auth_apps(&s, "prod", json!([])).await;
+
+        let (err, text) = c.call("auth_status", json!({})).await;
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        let envs = v["envs"].as_array().unwrap();
+        assert_eq!(envs.len(), 2, "{text}");
+        let sb = &envs[0];
+        assert_eq!(sb["env"], "sandbox");
+        assert_eq!(sb["started"], true);
+        assert_eq!(sb["mode"], "sandbox");
+        assert_eq!(sb["issuer"], "https://auth.apps.example/sandbox");
+        assert_eq!(sb["clients"], 2);
+        assert_eq!(sb["users"], 3);
+        assert_eq!(sb["roles"], 1);
+        assert_eq!(sb["apps"], json!([row]));
+        let prod = &envs[1];
+        assert_eq!(prod["env"], "prod");
+        assert_eq!(prod["started"], false);
+        assert_eq!(prod["apps"], json!([]));
+        assert!(
+            prod["note"].as_str().unwrap().contains("hasn't started"),
+            "{text}"
+        );
+        assert!(prod.get("issuer").is_none(), "{text}");
+    }
+
+    #[tokio::test]
+    async fn auth_apps_list_passes_rows_through() {
+        let (s, mut c) = start().await;
+        let row = json!({"client_id": "shop", "env": "prod", "app_id": SVC, "label": "on_quome",
+                         "redirect_uris": [], "kind": "public", "app_name": "shop"});
+        mount_auth_apps(&s, "prod", json!([row.clone()])).await;
+        let (err, text) = c
+            .call("auth_apps", json!({"action": "list", "env": "prod"}))
+            .await;
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v, json!({"env": "prod", "apps": [row]}));
+    }
+
+    async fn mount_shop_service(s: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path(api_path("/services")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"id": SVC, "kind": "app", "name": "shop", "memory_gb": 1.0, "status": "running"}
+            ])))
+            .mount(s)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn auth_apps_link_resolves_app_name() {
+        let (s, mut c) = start().await;
+        mount_shop_service(&s).await;
+        let linked = json!({"client_id": "shop", "env": "prod", "app_id": SVC, "label": "on_quome",
+                            "redirect_uris": ["https://shop-acme.apps.example/auth/callback"],
+                            "issuer": "https://auth.apps.example"});
+        Mock::given(method("POST"))
+            .and(path(api_path(&format!("/auth/apps/{SVC}/link"))))
+            .and(wiremock::matchers::body_json(json!({
+                "redirect_path": "/auth/callback", "allowed_roles": ["admin"]
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(linked.clone()))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let (err, text) = c
+            .call(
+                "auth_apps",
+                json!({"action": "link", "env": "prod", "app": "shop",
+                       "redirect_path": "/auth/callback", "allowed_roles": ["admin"]}),
+            )
+            .await;
+        assert!(!err, "{text}");
+        assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), linked);
+
+        // An unknown name sends nothing to the link route.
+        let (err, text) = c
+            .call("auth_apps", json!({"action": "link", "app": "nope"}))
+            .await;
+        assert!(err);
+        assert!(text.contains("No app named \"nope\""), "{text}");
+    }
+
+    #[tokio::test]
+    async fn auth_apps_link_conflict_hint_and_sandbox_refused() {
+        let (s, mut c) = start().await;
+        mount_shop_service(&s).await;
+        Mock::given(method("POST"))
+            .and(path(api_path(&format!("/auth/apps/{SVC}/link"))))
+            .respond_with(
+                ResponseTemplate::new(409)
+                    .set_body_json(json!({"detail":"conflict","reason":"already_linked"})),
+            )
+            .mount(&s)
+            .await;
+        let (err, text) = c
+            .call("auth_apps", json!({"action": "link", "app": "shop"}))
+            .await;
+        assert!(err);
+        assert_eq!(text, "That app is already linked.");
+
+        let (err, text) = c
+            .call(
+                "auth_apps",
+                json!({"action": "link", "env": "sandbox", "app": "shop"}),
+            )
+            .await;
+        assert!(err);
+        assert!(text.contains("prod"), "{text}");
+        let posts = s
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path().ends_with("/link"))
+            .count();
+        assert_eq!(posts, 1);
+    }
+
+    #[tokio::test]
+    async fn auth_apps_unlink_deletes_the_link() {
+        let (s, mut c) = start().await;
+        mount_shop_service(&s).await;
+        Mock::given(method("DELETE"))
+            .and(path(api_path(&format!("/auth/apps/{SVC}/link"))))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let (err, text) = c
+            .call("auth_apps", json!({"action": "unlink", "app": "shop"}))
+            .await;
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v, json!({"app": "shop", "linked": false}));
+    }
+
+    #[tokio::test]
+    async fn auth_apps_register_external_returns_secret_once() {
+        let (s, mut c) = start().await;
+        Mock::given(method("POST"))
+            .and(path(api_path("/auth/external-clients")))
+            .and(wiremock::matchers::body_json(json!({
+                "client_id": "mobile", "kind": "confidential",
+                "redirect_uris": ["https://apps.example/cb"]
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "client_id": "mobile", "env": "prod", "app_id": null, "label": "external",
+                "kind": "confidential", "redirect_uris": ["https://apps.example/cb"],
+                "client_secret": "S3CRET"
+            })))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let (err, text) = c
+            .call(
+                "auth_apps",
+                json!({"action": "register_external", "client_id": "mobile",
+                       "kind": "confidential", "redirect_uris": ["https://apps.example/cb"]}),
+            )
+            .await;
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["client_secret"], "S3CRET");
+        assert_eq!(v["note"], "Store this secret now; it is not shown again.");
+        assert_eq!(text.matches("S3CRET").count(), 1, "{text}");
+
+        // Missing fields are refused before any request.
+        let (err, text) = c
+            .call(
+                "auth_apps",
+                json!({"action": "register_external", "client_id": "x"}),
+            )
+            .await;
+        assert!(err);
+        assert!(text.contains("kind"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn auth_apps_register_external_host_hint() {
+        let (s, mut c) = start().await;
+        Mock::given(method("POST"))
+            .and(path(api_path("/auth/external-clients")))
+            .respond_with(ResponseTemplate::new(422).set_body_json(
+                json!({"detail":"unprocessable","reason":"redirect_host_not_allowed"}),
+            ))
+            .mount(&s)
+            .await;
+        let (err, text) = c
+            .call(
+                "auth_apps",
+                json!({"action": "register_external", "client_id": "m", "kind": "public",
+                       "redirect_uris": ["https://shop-acme.apps.example/cb"]}),
+            )
+            .await;
+        assert!(err);
+        assert!(text.contains("link the app instead"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn auth_apps_set_access_resends_client_fields() {
+        let (s, mut c) = start().await;
+        Mock::given(method("POST"))
+            .and(path(api_path("/auth/token")))
+            .and(wiremock::matchers::query_param("env", "sandbox"))
+            .and(wiremock::matchers::body_json(
+                json!({"scope": ["auth_read", "auth_sandbox_write"]}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "T-sandbox", "token_type": "Bearer", "expires_in": 300,
+                "issuer": format!("{}/sandbox", s.uri()),
+                "mcp_url": format!("{}/mcp/sandbox", s.uri())
+            })))
+            .mount(&s)
+            .await;
+        let other = json!({"client_id": "other", "kind": "public", "allowed_roles": []});
+        let web = json!({
+            "client_id": "web", "kind": "confidential", "auth_method": "client_secret_basic",
+            "redirect_uris": ["https://apps.example/cb"], "redirect_patterns": ["https://*.apps.example/cb"],
+            "grant_types": ["authorization_code", "refresh_token"], "scopes": ["openid", "email"],
+            "login_methods": ["password"], "allowed_roles": ["member"], "require_dpop": true,
+            "binding": null, "has_secret": true
+        });
+        mount_instance_tool(
+            &s,
+            "sandbox",
+            "clients_list",
+            json!({"clients": [other, web]}),
+        )
+        .await;
+        mount_instance_tool(&s, "sandbox", "client_upsert", json!({"client_id": "web"})).await;
+
+        let (err, text) = c
+            .call(
+                "auth_apps",
+                json!({"action": "set_access", "client_id": "web", "allowed_roles": ["admin", "staff"]}),
+            )
+            .await;
+        assert!(!err, "{text}");
+        let reqs = s.received_requests().await.unwrap();
+        let upserts = rpc_args(&reqs, "client_upsert");
+        assert_eq!(
+            upserts,
+            vec![json!({
+                "client_id": "web", "kind": "confidential",
+                "redirect_uris": ["https://apps.example/cb"],
+                "redirect_patterns": ["https://*.apps.example/cb"],
+                "grant_types": ["authorization_code", "refresh_token"],
+                "scopes": ["openid", "email"], "login_methods": ["password"],
+                "allowed_roles": ["admin", "staff"], "require_dpop": true
+            })]
+        );
+
+        // An unknown client sends no upsert.
+        let (err, text) = c
+            .call(
+                "auth_apps",
+                json!({"action": "set_access", "client_id": "ghost", "allowed_roles": []}),
+            )
+            .await;
+        assert!(err);
+        assert!(text.contains("ghost"), "{text}");
+        let reqs = s.received_requests().await.unwrap();
+        assert_eq!(rpc_args(&reqs, "client_upsert").len(), 1);
     }
 }

@@ -217,7 +217,7 @@ impl AuthInstances {
     }
 }
 
-fn check_env(env: &str) -> Result<(), String> {
+pub(super) fn check_env(env: &str) -> Result<(), String> {
     match env {
         "sandbox" | "prod" => Ok(()),
         _ => Err(format!("env must be \"sandbox\" or \"prod\", not {env:?}.")),
@@ -273,6 +273,9 @@ fn parse_answer(text: &str) -> Result<Value, String> {
     Ok(serde_json::from_str(text).unwrap_or_else(|_| json!({ "text": text })))
 }
 
+/// The hint for an environment whose auth has not started yet.
+pub const NOT_STARTED: &str = "This org's prod auth hasn't started: link an app or promote first.";
+
 /// The next step for an auth tool error.
 pub fn auth_hint(e: &str) -> String {
     let has = |r: &str| e.contains(r);
@@ -281,7 +284,15 @@ pub fn auth_hint(e: &str) -> String {
             .into()
     } else if has("auth_not_started") {
         // A platform 404 arrives as "Not found: auth_not_started" (no status).
-        "This org's prod auth hasn't started: link an app or promote first.".into()
+        NOT_STARTED.into()
+    } else if has("already_linked") {
+        "That app is already linked.".into()
+    } else if has("client_exists") {
+        "A client with that client_id already exists; pick another one.".into()
+    } else if has("redirect_host_not_allowed") {
+        "External clients can't use hosts Quome serves; link the app instead.".into()
+    } else if has("insufficient_credit") {
+        "Registering an external client needs credit on the org's billing.".into()
     } else if has("503") && has("auth_starting") {
         "The auth instance is waking up; try again in a few seconds.".into()
     } else if has("sandbox_only") {
@@ -650,6 +661,14 @@ mod tests {
         assert!(auth_hint("Not found: auth_not_started").contains("hasn't started"));
         assert!(auth_hint("API error: 503 starting: auth_starting").contains("waking up"));
         assert!(auth_hint("sandbox_only: nope").contains("only on the sandbox"));
+        assert_eq!(
+            auth_hint("API error: 409 conflict: already_linked"),
+            "That app is already linked."
+        );
+        assert!(auth_hint("API error: 409 conflict: client_exists").contains("already exists"));
+        assert!(auth_hint("API error: 422 bad: redirect_host_not_allowed")
+            .contains("link the app instead"));
+        assert!(auth_hint("API error: 402 payment: insufficient_credit").contains("credit"));
         assert_eq!(auth_hint("API error: 500 boom"), "API error: 500 boom");
     }
 }

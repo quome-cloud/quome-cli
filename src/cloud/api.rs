@@ -857,6 +857,58 @@ impl CloudApi {
         .await
     }
 
+    /// The clients of the org's auth in `env`: linked apps and External clients,
+    /// each row passed through as the platform sends it.
+    pub async fn auth_apps(&self, env: &str) -> Result<Vec<serde_json::Value>, QuomeError> {
+        #[derive(Deserialize)]
+        struct List {
+            items: Vec<serde_json::Value>,
+        }
+        let l: List = self
+            .json(Method::GET, &self.org_path("/auth/apps"), |b| {
+                b.query(&[("env", env)])
+            })
+            .await?;
+        Ok(l.items)
+    }
+
+    /// Link an app (by service id) to the org's prod auth. `body` holds the
+    /// optional `client_id`, `redirect_path` and `allowed_roles`.
+    pub async fn auth_link_app(
+        &self,
+        service_id: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, QuomeError> {
+        let p = self.org_path(&format!("/auth/apps/{}/link", enc(service_id)));
+        self.json(Method::POST, &p, |b| b.json(body)).await
+    }
+
+    /// Remove an app's link to the org's prod auth (idempotent).
+    pub async fn auth_unlink_app(&self, service_id: &str) -> Result<(), QuomeError> {
+        let p = self.org_path(&format!("/auth/apps/{}/link", enc(service_id)));
+        self.send(Method::DELETE, &p, |b| b).await?;
+        Ok(())
+    }
+
+    /// Register an External client (an app not hosted on Quome) on the org's
+    /// prod auth. A confidential client's `client_secret` is in the answer once.
+    pub async fn auth_register_external(
+        &self,
+        client_id: &str,
+        kind: &str,
+        redirect_uris: &[String],
+    ) -> Result<serde_json::Value, QuomeError> {
+        let body = serde_json::json!({
+            "client_id": client_id, "kind": kind, "redirect_uris": redirect_uris,
+        });
+        self.json(
+            Method::POST,
+            &self.org_path("/auth/external-clients"),
+            |b| b.json(&body),
+        )
+        .await
+    }
+
     pub async fn create_app(&self, name: &str, memory_gb: f64) -> Result<Service, QuomeError> {
         check_name_size(name, memory_gb)?;
         let body = serde_json::json!({"kind": "app", "name": name, "memory_gb": memory_gb});
