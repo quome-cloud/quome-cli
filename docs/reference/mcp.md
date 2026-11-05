@@ -23,7 +23,7 @@ Sandbox and app arguments marked "name or id" accept either. Email `address` arg
 | Tool | Arguments | What it does |
 |------|-----------|--------------|
 | `guide` | none | Reads the Quome Cloud agent guide: how sandboxes, previews, app deploys, email inboxes and auth work, with recipes for each. Claude is told to call it first. |
-| `create_sandbox` | `name?`, `memory_gb?`, `runtime?`, `auth_client?`, `auth_redirect_path?` | Creates a sandbox (a Linux workspace with a coding-agent runtime) and waits until it is running (up to 180 s; it stops early if the sandbox fails, stops or is deleted). `name`: 2-31 chars, a lowercase letter then lowercase letters, digits or hyphens; default `agent-<6 hex>`. `memory_gb`: 0.5, 1, 2, 4, 8, 16, 32 or 64; default 4. `runtime`: `claude`, `codex`, `opencode` or `antigravity`; default `claude`. `auth_client` / `auth_redirect_path`: bind the sandbox to a client of the org's sandbox auth (`auth_redirect_path` is the callback path on the sandbox, for example `/auth/callback`); the sandbox then gets `QUAUTH_ISSUER`, `QUAUTH_CLIENT_ID` and `QUAUTH_CLIENT_SECRET`. |
+| `create_sandbox` | `name?`, `memory_gb?`, `runtime?`, `auth_client?`, `auth_redirect_path?` | Creates a sandbox (a Linux workspace with a coding-agent runtime) and waits until it is running (up to 180 s; it stops early if the sandbox fails, stops or is deleted). `name`: 2-31 chars, a lowercase letter then lowercase letters, digits or hyphens; default `agent-<6 hex>`. `memory_gb`: 0.5, 1, 2, 4, 8, 16, 32 or 64; default 4. `runtime`: `claude`, `codex`, `opencode` or `antigravity`; default `claude`. `auth_client` / `auth_redirect_path`: bind the sandbox to a client of the org's sandbox auth (`auth_redirect_path` is the callback path on the sandbox; default `/auth/callback`, the platform's default); the sandbox then gets `QUAUTH_ISSUER`, `QUAUTH_CLIENT_ID` and `QUAUTH_CLIENT_SECRET`. |
 | `list_sandboxes` | none | Lists this organization's sandboxes. |
 | `stop_sandbox` | `sandbox` | Stops a sandbox (name or id). |
 | `exec` | `sandbox`, `command`, `timeout_s?` | Runs a shell command in the sandbox's `/workspace`. Returns `exit_code`, `stdout`, `stderr`, `truncated`. `timeout_s` is clamped to 1-25; default 25. |
@@ -53,11 +53,11 @@ Sandbox and app arguments marked "name or id" accept either. Email `address` arg
 | `email_wait` | `address`, `since?`, `from_contains?`, `subject_contains?`, `timeout_s?` | Waits for mail at an address (full address or id) and returns `{message, cursor}`: the first message that matches the optional case-insensitive sender and subject filters, in the same envelope as `email_read`. `since`: pass the previous result's `cursor` to get only newer mail; when omitted, a later call in the same session continues from the last cursor for that address, and the first call looks back one minute. `timeout_s`: total wait, clamped to 1-120; default 60. |
 | `email_disable` | `address` | Disables an address (full address or id) for good: it never receives mail again. Messages already received stay readable. Disabling an address that is already disabled succeeds. |
 | `auth_status` | none | Shows the org's sign-in (auth) for sandbox and prod: whether each has started, its issuer and mode, how many clients, users and roles it has, and the apps and External clients that use it. Read-only. |
-| `auth_apps` | `action`, `env?`, `app?`, `client_id?`, `redirect_path?`, `allowed_roles?`, `kind?`, `redirect_uris?` | `list`: the clients on `env` (default sandbox). `link` / `unlink`: connect a deployed Quome app (`app`, by name) to the prod auth, or remove it. `register_external`: a prod client for an app not hosted on Quome (`client_id`, `kind` `public` or `confidential`, `redirect_uris`); a confidential client's secret is shown once. `set_access`: replace one client's `allowed_roles` on `env`. |
+| `auth_apps` | `action`, `env?`, `app?`, `client_id?`, `redirect_path?`, `allowed_roles?`, `kind?`, `redirect_uris?` | `list`: the clients on `env` (default sandbox). `link` / `unlink`: connect a deployed Quome app (`app`, by name) to the prod auth, or remove it; `link` also takes `client_id`, `redirect_path` and `allowed_roles`. `register_external`: a prod client for an app not hosted on Quome (`client_id`, `kind` `public` or `confidential`, `redirect_uris`); a confidential client's secret is shown once. `set_access`: replace one client's `allowed_roles` (`client_id`, `allowed_roles`) on `env`. `link`, `unlink` and `register_external` are prod-only and default to `env` prod. |
 | `auth_config` | `action`, `env?`, `doc?`, `prune?`, `confirm_lockout?` | `export` returns the auth configuration as a document (no secrets); `diff` shows what applying `doc` would change; `apply` does it and returns any newly minted client secrets once. `prune` removes what the document leaves out. A change that could lock users or admins out needs `confirm_lockout: true`. |
 | `auth_roles` | `action`, `env?`, `name?`, `principal?`, `confirm?` | `list`, `create` / `delete` a role (a role that still has assignments needs `confirm: true`), `assign` / `unassign` a role to a `principal` (`user:`, `workload:` or `agent:` `<org>/<id>`). |
 | `auth_users` | `action`, `env?`, `email?`, `name?`, `principal?`, `after?`, `limit?` | `list` (pages with `after` and `limit`; pass the previous `next_cursor`), `create` (`email`, optional `name`; on sandbox the sign-in email lands in `auth_outbox`), `disable` (`principal`, like `user:<org>/<id>`). |
-| `auth_agents` | `action`, `env?`, `client_id`, `name?`, `scopes?` | `create` an agent client (its secret is shown once) or `revoke` it. |
+| `auth_agents` | `action`, `env?`, `client_id`, `name?`, `scopes?` | `create` an agent client (`scopes` is required; its secret is shown once) or `revoke` it. |
 | `auth_promote` | `apply?`, `prune?`, `confirm_lockout?` | Promotes the sandbox auth configuration to prod. Without `apply: true` it only previews the diff. Returns the diff, which clients got linked, lockout risks and missing secrets. A change that could lock users or admins out needs `confirm_lockout: true`. |
 | `auth_test_token` | `client_id`, `subject`, `act?`, `resource?`, `ttl_secs?` | Mints a sandbox access token for a user of the sandbox auth, without a browser; use it as a Bearer token against your app. Sandbox only. |
 | `auth_outbox` | `action`, `recipient?`, `limit?`, `id?` | Reads the emails the sandbox auth captured instead of sending (sign-in links, codes): `list` (optional `recipient`, `limit`) or `read` (`id`). Sandbox only. |
@@ -104,7 +104,7 @@ Limits: 50 signup addresses per person and 20 per sandbox. Disabled addresses do
 
 ### Auth
 
-The `auth_*` tools let the agent build sign-in for an app against the org's auth (the Quome Cloud identity service), test it without a browser, and promote it to prod. `env` is `sandbox` or `prod` and defaults to `sandbox`; `auth_test_token` and `auth_outbox` work on the sandbox only.
+The `auth_*` tools let the agent build sign-in for an app against the org's auth (the Quome Cloud identity service), test it without a browser, and promote it to prod. `env` is `sandbox` or `prod` and defaults to `sandbox` (except the prod-only `auth_apps` actions `link`, `unlink` and `register_external`, which default to `prod`); `auth_test_token` and `auth_outbox` work on the sandbox only.
 
 The loop is sandbox first:
 
@@ -158,7 +158,7 @@ Example `auth_test_token` result:
 }
 ```
 
-Secrets (client secrets, test tokens) are returned once, in the tool result.
+Client secrets are shown once, in the tool result; store them when you get them.
 
 Connections made before auth existed lack the `auth_read`/`auth_sandbox_write`/`auth_prod_write` scopes; run `quome connect` again. Prod changes need an org owner or admin.
 

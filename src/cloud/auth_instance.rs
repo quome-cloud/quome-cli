@@ -304,7 +304,7 @@ pub fn auth_hint(e: &str) -> String {
     } else if has("client_id_taken_by_external") {
         format!("{e}\nThat client_id belongs to an External client; pick another client_id.")
     } else if has("auth_apply_incomplete") {
-        format!("{e}\nThe promote stopped part-way; the listed clients were not applied. Fix the cause and run it again.")
+        format!("{e}\nThe apply stopped part-way. Clients listed under new_client_secrets were created and their secrets are shown once below; store them now. Fix the cause and run it again.")
     } else if has("sandbox_only") {
         "This tool works only on the sandbox environment.".into()
     } else {

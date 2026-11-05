@@ -41,7 +41,7 @@ pub struct Port {
 }
 
 /// A short-lived token for the org's auth instance, brokered by the platform.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Clone, Deserialize, PartialEq)]
 pub struct AuthToken {
     pub access_token: String,
     pub expires_in: u64,
@@ -49,6 +49,18 @@ pub struct AuthToken {
     pub issuer: String,
     /// The instance's MCP endpoint.
     pub mcp_url: String,
+}
+
+/// Never prints the token itself.
+impl std::fmt::Debug for AuthToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthToken")
+            .field("access_token", &"<redacted>")
+            .field("expires_in", &self.expires_in)
+            .field("issuer", &self.issuer)
+            .field("mcp_url", &self.mcp_url)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -918,6 +930,7 @@ impl CloudApi {
     pub async fn auth_apps(&self, env: &str) -> Result<Vec<serde_json::Value>, QuomeError> {
         #[derive(Deserialize)]
         struct List {
+            #[serde(alias = "apps")]
             items: Vec<serde_json::Value>,
         }
         let l: List = self
