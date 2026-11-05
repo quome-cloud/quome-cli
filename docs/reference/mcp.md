@@ -32,7 +32,7 @@ Sandbox and app arguments marked "name or id" accept either. Email `address` arg
 | `list_files` | `sandbox`, `path?` | Lists a directory; default `/workspace`. |
 | `preview` | `sandbox`, `port` | Returns a public preview URL for a port the sandbox is serving. |
 | `deploy_app` | `name`, `folder`, `memory_gb?` | Deploys a local folder containing a Dockerfile as a Quome Cloud app and waits for it to run. `memory_gb` as above; default 1. |
-| `app_status` | `name` | Shows an app's state by name, with its latest build (`build_id`, `status`, `error`) and latest deploy (`latest_deploy`: `deploy_id`, `status`, `error`, `failure`). `state` is `building`, `rolling_out`, `running`, `crashed` (the latest deploy failed), or the app's status otherwise (`created`, `stopped`). The `url` is given only once a build has succeeded. |
+| `app_status` | `name` | Shows an app's state by name, with its latest build (`build_id`, `status`, `error`) and latest deploy (`latest_deploy`: `deploy_id`, `status`, `error`, `failure`). `state` is `building`, `rolling_out`, `running`, `crashed` (the latest deploy failed), or the app's status otherwise (`created`, `stopped`); that raw status (such as `deploying`) also shows while a succeeded deploy's service is still transitioning, and when the deploys cannot be read (then `latest_deploy` is `null`). The `url` is given only once a build has succeeded. |
 | `list_app_catalog` | | Lists the first-party Quome apps you can install, with install status. |
 | `install_app` | `app`, `confirm?` | Without `confirm: true`, previews the billing and changes nothing. With it, installs the app and waits (up to 10 minutes) until it runs; returns `status`, `url` and `next`. |
 | `list_installed_apps` | | Lists this org's installed apps and their status. |
@@ -71,7 +71,7 @@ tail -n 20 /tmp/dev.log                      # a later exec call: check on it
 | `status` | Meaning |
 |----------|---------|
 | `running` | Built and live. `url` is the app URL. |
-| `failed` | The build failed (`error` has the tail), or it built but the container did not stay up: `error` says what was observed (exit code, seconds alive), `container_output` is its last lines. `note` names the build log route. |
+| `failed` | The build failed (`error` has the tail), or it built but the container did not stay up: `error` says what was observed (exit code, seconds alive), `container_output` is its last lines. `note` says the container printed nothing only when its exit was reported (`seconds_alive` set); otherwise it says Quome Cloud has no record of the container's output. `note` names the build log route. |
 | `building` | Still building after 10 minutes. Check later with `app_status`. |
 | `deploying` | Built, but still rolling out after 10 minutes. Check later with `app_status`. |
 

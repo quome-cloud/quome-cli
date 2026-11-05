@@ -947,7 +947,8 @@ impl QuomeMcp {
             return Err(format!("No app named {:?}.", a.name));
         };
         let builds = call!(self, |api| api.list_builds(&app.id))?;
-        let deploys = call!(self, |api| api.list_deploys(&app.id))?;
+        // Without the deploys, state falls back to the service status and latest_deploy is null.
+        let deploys = call!(self, |api| api.list_deploys(&app.id)).unwrap_or_default();
         let latest = deploys.first();
         let live = builds.iter().any(|b| b.status == "succeeded");
         let tail = match builds.first() {
@@ -2068,6 +2069,25 @@ mod tests {
         let v: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["state"], "building", "{text}");
         assert!(v["latest_deploy"]["failure"].is_null());
+    }
+
+    #[tokio::test]
+    async fn app_status_falls_back_to_the_service_status_without_deploys() {
+        let (s, mut c) = start().await;
+        sequence(&s, "GET", api_path("/services"), vec![svc("running")]).await;
+        sequence(&s, "GET", api_path("/apps/app1/builds"), vec![json!([])]).await;
+        sequence_responses(
+            &s,
+            "GET",
+            api_path("/apps/app1/deploys"),
+            vec![ResponseTemplate::new(500).set_body_string("boom")],
+        )
+        .await;
+        let (err, text) = c.call("app_status", json!({"name":"web"})).await;
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["state"], "running", "{text}");
+        assert!(v["latest_deploy"].is_null(), "{text}");
     }
 
     #[tokio::test]
