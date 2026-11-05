@@ -301,12 +301,112 @@ pub enum Download {
     TooLarge(Option<u64>),
 }
 
+/// An app's log history: newest revision first, newest line first inside.
+#[derive(Debug, Deserialize)]
+pub struct LogsResponse {
+    #[serde(default)]
+    pub revisions: Vec<RevisionLogs>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RevisionLogs {
+    pub revision_name: String,
+    #[serde(default)]
+    pub logs: Vec<LogRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LogRecord {
+    pub timestamp: String,
+    #[serde(default)]
+    pub severity: String,
+    pub message: String,
+}
+
+/// One log line with the revision that printed it (also the shape of a live
+/// tail's `data:` event).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct LogLine {
+    pub timestamp: String,
+    #[serde(default)]
+    pub severity: String,
+    pub message: String,
+    #[serde(default)]
+    pub revision: String,
+}
+
+/// How long a live tail request may stay open; the server ends it sooner.
+pub const LOG_STREAM_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+/// How long a log history request, or the opening of a live tail, may take:
+/// the server holds either up to 60 s while the org's log store wakes, then
+/// answers 503 `logs_starting`.
+pub const LOG_REQUEST_TIMEOUT: Duration = Duration::from_secs(75);
+
+/// Whether `e` is this client giving up on a request (its HTTP timeout, or a
+/// live tail that did not open in time).
+pub fn is_timeout(e: &QuomeError) -> bool {
+    match e {
+        QuomeError::Http(h) => h.is_timeout(),
+        QuomeError::Io(io) => io.kind() == std::io::ErrorKind::TimedOut,
+        _ => false,
+    }
+}
+
+/// Incremental `text/event-stream` reader for the live tail: `data:` events
+/// become lines, `:` comments are ignored, and `event: end` ends it.
+#[derive(Default)]
+pub struct SseParser {
+    buf: Vec<u8>,
+    ended: bool,
+}
+
+impl SseParser {
+    /// Feed bytes; returns the complete lines they finish and whether the
+    /// stream has ended. Nothing after the end event is read.
+    pub fn push(&mut self, chunk: &[u8]) -> (Vec<LogLine>, bool) {
+        let mut out = Vec::new();
+        if self.ended {
+            return (out, true);
+        }
+        self.buf.extend(chunk.iter().filter(|b| **b != b'\r'));
+        while let Some(i) = self.buf.windows(2).position(|w| w == b"\n\n") {
+            let block: Vec<u8> = self.buf.drain(..i + 2).collect();
+            let block = String::from_utf8_lossy(&block[..i]);
+            let mut event = "";
+            let mut data: Vec<&str> = Vec::new();
+            for l in block.lines() {
+                if l.starts_with(':') {
+                    continue;
+                }
+                let (field, value) = l.split_once(':').unwrap_or((l, ""));
+                let value = value.strip_prefix(' ').unwrap_or(value);
+                match field {
+                    "event" => event = value,
+                    "data" => data.push(value),
+                    _ => {}
+                }
+            }
+            if event == "end" {
+                self.ended = true;
+                self.buf.clear();
+                break;
+            }
+            if let Ok(line) = serde_json::from_str::<LogLine>(&data.join("\n")) {
+                out.push(line);
+            }
+        }
+        (out, self.ended)
+    }
+}
+
 pub struct CloudApi {
     http: reqwest::Client,
     base: String,
     org: String,
     tokens: TokenSource,
     email_wait_slack: Duration,
+    log_request_timeout: Duration,
 }
 
 fn valid_name(name: &str) -> bool {
@@ -429,12 +529,20 @@ impl CloudApi {
             org: profile.org_id.clone(),
             tokens,
             email_wait_slack: EMAIL_WAIT_HTTP_SLACK,
+            log_request_timeout: LOG_REQUEST_TIMEOUT,
         }
     }
 
     /// Change the slack added to each mail wait's HTTP timeout (tests).
     pub(crate) fn with_email_wait_slack(mut self, slack: Duration) -> CloudApi {
         self.email_wait_slack = slack;
+        self
+    }
+
+    /// Change the log history / live tail open timeout (tests).
+    #[cfg(test)]
+    pub(crate) fn with_log_request_timeout(mut self, timeout: Duration) -> CloudApi {
+        self.log_request_timeout = timeout;
         self
     }
 
@@ -893,6 +1001,79 @@ impl CloudApi {
         self.json(Method::GET, &p, |b| b).await
     }
 
+    /// An app's log history (`limit` 1-1000; `since` RFC 3339 and `q` a
+    /// substring filter, both passed through as given).
+    pub async fn get_app_logs(
+        &self,
+        app_id: &str,
+        limit: u32,
+        since: Option<&str>,
+        q: Option<&str>,
+    ) -> Result<LogsResponse, QuomeError> {
+        let p = self.org_path(&format!("/apps/{}/logs", enc(app_id)));
+        let mut query = vec![("limit", limit.to_string())];
+        if let Some(s) = since {
+            query.push(("since", s.to_string()));
+        }
+        if let Some(q) = q {
+            query.push(("q", q.to_string()));
+        }
+        let timeout = self.log_request_timeout;
+        self.json(Method::GET, &p, |b| b.query(&query).timeout(timeout))
+            .await
+    }
+
+    /// An app's live tail: lines as the server sends them, ending when the
+    /// server sends `event: end`, closes, or the body cannot be read.
+    pub async fn stream_app_logs(
+        &self,
+        app_id: &str,
+    ) -> Result<impl futures_util::Stream<Item = LogLine>, QuomeError> {
+        use futures_util::StreamExt;
+        let p = self.org_path(&format!("/apps/{}/logs/stream", enc(app_id)));
+        // The whole tail may last LOG_STREAM_TIMEOUT; its opening (the server
+        // may hold it while the log store wakes) only LOG_REQUEST_TIMEOUT.
+        let open = self.send(Method::GET, &p, |b| {
+            b.header("Accept", "text/event-stream")
+                .timeout(LOG_STREAM_TIMEOUT)
+        });
+        let resp = tokio::time::timeout(self.log_request_timeout, open)
+            .await
+            .map_err(|_| {
+                QuomeError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "the live tail did not open in time",
+                ))
+            })??;
+        let state = (
+            resp.bytes_stream().boxed(),
+            SseParser::default(),
+            std::collections::VecDeque::<LogLine>::new(),
+            false,
+        );
+        Ok(futures_util::stream::unfold(
+            state,
+            |(mut body, mut parser, mut ready, mut ended)| async move {
+                loop {
+                    if let Some(line) = ready.pop_front() {
+                        return Some((line, (body, parser, ready, ended)));
+                    }
+                    if ended {
+                        return None;
+                    }
+                    match body.next().await {
+                        Some(Ok(chunk)) => {
+                            let (lines, end) = parser.push(&chunk);
+                            ready.extend(lines);
+                            ended = end;
+                        }
+                        _ => ended = true,
+                    }
+                }
+            },
+        ))
+    }
+
     /// The end of a build's log (at most `LOG_TAIL_MAX` bytes, cut at a line
     /// start), or `None` when the build left no log (it failed before running).
     pub async fn build_log_tail(
@@ -927,6 +1108,35 @@ mod tests {
         assert_eq!(super::log_tail("0123456789", 4), "6789");
         // Never splits a multi-byte character.
         assert_eq!(super::log_tail("ééé", 3), "é");
+    }
+
+    #[test]
+    fn sse_parser_reads_data_lines_across_chunks_and_stops_at_end() {
+        let line = |m: &str| super::LogLine {
+            timestamp: "2026-11-04T10:00:00Z".into(),
+            severity: "INFO".into(),
+            message: m.into(),
+            revision: "web-00001".into(),
+        };
+        let mut p = super::SseParser::default();
+        let ev = |m: &str| {
+            format!(
+                "data: {{\"timestamp\":\"2026-11-04T10:00:00Z\",\"severity\":\"INFO\",\"message\":\"{m}\",\"revision\":\"web-00001\"}}\n\n"
+            )
+        };
+        let a = ev("a");
+        let (cut1, cut2) = a.split_at(20);
+        assert_eq!(p.push(b": ping\n\n"), (vec![], false));
+        assert_eq!(p.push(cut1.as_bytes()), (vec![], false));
+        assert_eq!(p.push(cut2.as_bytes()), (vec![line("a")], false));
+        // CRLF framing, a malformed event (skipped), then the end event.
+        let rest = format!(
+            "{}data: not json\n\n{}event: end\ndata: {{}}\n\n{}",
+            ev("b").replace('\n', "\r\n"),
+            ev("c"),
+            ev("after")
+        );
+        assert_eq!(p.push(rest.as_bytes()), (vec![line("b"), line("c")], true));
     }
 
     use super::super::auth::tests::profile;
