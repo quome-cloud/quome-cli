@@ -503,6 +503,108 @@ pub struct AuthAppsArgs {
     redirect_uris: Option<Vec<String>>,
 }
 
+#[derive(Deserialize, JsonSchema, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthUsersAction {
+    /// The users on `env`'s auth.
+    List,
+    /// Create a user.
+    Create,
+    /// Disable a user's sign-in.
+    Disable,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct AuthUsersArgs {
+    /// What to do: list, create or disable.
+    action: AuthUsersAction,
+    /// `sandbox` or `prod`. Default sandbox.
+    env: Option<String>,
+    /// Email address (create).
+    email: Option<String>,
+    /// Display name (create).
+    name: Option<String>,
+    /// The user, as `user:<org>/<id>` (disable).
+    principal: Option<String>,
+    /// Return users after this cursor (list; use `next_cursor` from the previous page).
+    after: Option<i64>,
+    /// Page size (list).
+    limit: Option<u32>,
+}
+
+#[derive(Deserialize, JsonSchema, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthRolesAction {
+    /// The roles on `env`'s auth and how many principals hold each.
+    List,
+    /// Create a role.
+    Create,
+    /// Delete a role.
+    Delete,
+    /// Give a role to a principal.
+    Assign,
+    /// Take a role from a principal.
+    Unassign,
+}
+
+impl AuthRolesAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            AuthRolesAction::List => "list",
+            AuthRolesAction::Create => "create",
+            AuthRolesAction::Delete => "delete",
+            AuthRolesAction::Assign => "assign",
+            AuthRolesAction::Unassign => "unassign",
+        }
+    }
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct AuthRolesArgs {
+    /// What to do: list, create, delete, assign or unassign.
+    action: AuthRolesAction,
+    /// `sandbox` or `prod`. Default sandbox.
+    env: Option<String>,
+    /// Role name (create, delete, assign, unassign).
+    name: Option<String>,
+    /// The holder, as `user:<org>/<id>`, `workload:<org>/<id>` or `agent:<org>/<id>` (assign, unassign).
+    principal: Option<String>,
+    /// Set true to delete a role that still has assignments (delete).
+    confirm: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthAgentsAction {
+    /// Create an agent client; its secret is shown once.
+    Create,
+    /// Revoke an agent client.
+    Revoke,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct AuthAgentsArgs {
+    /// What to do: create or revoke.
+    action: AuthAgentsAction,
+    /// `sandbox` or `prod`. Default sandbox.
+    env: Option<String>,
+    /// The agent's client id.
+    client_id: String,
+    /// Display name (create).
+    name: Option<String>,
+    /// Scopes the agent may use (create).
+    scopes: Option<Vec<String>>,
+}
+
+impl AuthAgentsAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            AuthAgentsAction::Create => "create",
+            AuthAgentsAction::Revoke => "revoke",
+        }
+    }
+}
+
 /// The fields `client_upsert` takes; an update replaces every one of them.
 const CLIENT_UPSERT_FIELDS: [&str; 9] = [
     "client_id",
@@ -516,9 +618,9 @@ const CLIENT_UPSERT_FIELDS: [&str; 9] = [
     "require_dpop",
 ];
 
-/// The value of a required `auth_apps` argument.
-fn needs<T>(v: Option<T>, name: &str, action: AuthAppsAction) -> Result<T, String> {
-    v.ok_or_else(|| format!("`{}` needs `{name}`.", action.as_str()))
+/// The value of a required argument of an `auth_*` action.
+fn needs<T>(v: Option<T>, name: &str, action: &str) -> Result<T, String> {
+    v.ok_or_else(|| format!("`{action}` needs `{name}`."))
 }
 
 impl QuomeMcp {
@@ -1025,7 +1127,7 @@ impl QuomeMcp {
         match action {
             AuthAppsAction::List => Ok(json!({"env": env, "apps": self.auth_app_rows(env).await?})),
             AuthAppsAction::Link => {
-                let app = needs(a.app, "app", action)?;
+                let app = needs(a.app, "app", action.as_str())?;
                 let id = self.app_service_id(&app).await?;
                 let mut body = json!({});
                 if let Some(c) = a.client_id {
@@ -1040,15 +1142,15 @@ impl QuomeMcp {
                 call!(self, |api| api.auth_link_app(&id, &body)).map_err(platform)
             }
             AuthAppsAction::Unlink => {
-                let app = needs(a.app, "app", action)?;
+                let app = needs(a.app, "app", action.as_str())?;
                 let id = self.app_service_id(&app).await?;
                 call!(self, |api| api.auth_unlink_app(&id)).map_err(platform)?;
                 Ok(json!({"app": app, "linked": false}))
             }
             AuthAppsAction::RegisterExternal => {
-                let client_id = needs(a.client_id, "client_id", action)?;
-                let kind = needs(a.kind, "kind", action)?;
-                let uris = needs(a.redirect_uris, "redirect_uris", action)?;
+                let client_id = needs(a.client_id, "client_id", action.as_str())?;
+                let kind = needs(a.kind, "kind", action.as_str())?;
+                let uris = needs(a.redirect_uris, "redirect_uris", action.as_str())?;
                 if uris.is_empty() {
                     return Err("`register_external` needs at least one redirect URI.".into());
                 }
@@ -1064,8 +1166,8 @@ impl QuomeMcp {
                 Ok(v)
             }
             AuthAppsAction::SetAccess => {
-                let client_id = needs(a.client_id, "client_id", action)?;
-                let roles = needs(a.allowed_roles, "allowed_roles", action)?;
+                let client_id = needs(a.client_id, "client_id", action.as_str())?;
+                let roles = needs(a.allowed_roles, "allowed_roles", action.as_str())?;
                 let list = self
                     .auth_call(env, Scope::Write, "clients_list", json!({}))
                     .await?;
@@ -1083,6 +1185,124 @@ impl QuomeMcp {
                 args.insert("allowed_roles".into(), roles.into());
                 self.auth_call(env, Scope::Write, "client_upsert", args.into())
                     .await
+            }
+        }
+    }
+
+    async fn auth_users_run(&self, a: AuthUsersArgs) -> Result<serde_json::Value, String> {
+        use serde_json::json;
+        let env = a.env.as_deref().unwrap_or("sandbox");
+        check_env(env)?;
+        match a.action {
+            AuthUsersAction::List => {
+                self.auth_call(
+                    env,
+                    Scope::Read,
+                    "users_list",
+                    json!({"after": a.after, "limit": a.limit}),
+                )
+                .await
+            }
+            AuthUsersAction::Create => {
+                let email = needs(a.email, "email", "create")?;
+                let mut v = self
+                    .auth_call(
+                        env,
+                        Scope::Write,
+                        "user_create",
+                        json!({"email": email, "name": a.name}),
+                    )
+                    .await?;
+                if env == "sandbox" {
+                    v["next"] = "Read the sign-in email with auth_outbox.".into();
+                }
+                Ok(v)
+            }
+            AuthUsersAction::Disable => {
+                let principal = needs(a.principal, "principal", "disable")?;
+                self.auth_call(
+                    env,
+                    Scope::Write,
+                    "user_disable",
+                    json!({"principal": principal}),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn auth_roles_run(&self, a: AuthRolesArgs) -> Result<serde_json::Value, String> {
+        use serde_json::json;
+        let env = a.env.as_deref().unwrap_or("sandbox");
+        check_env(env)?;
+        let action = a.action.as_str();
+        match a.action {
+            AuthRolesAction::List => {
+                self.auth_call(env, Scope::Read, "roles_list", json!({}))
+                    .await
+            }
+            AuthRolesAction::Create => {
+                let name = needs(a.name, "name", action)?;
+                self.auth_call(env, Scope::Write, "role_create", json!({"name": name}))
+                    .await
+            }
+            AuthRolesAction::Delete => {
+                let name = needs(a.name, "name", action)?;
+                self.auth_call(
+                    env,
+                    Scope::Write,
+                    "role_delete",
+                    json!({"name": name, "confirm": a.confirm}),
+                )
+                .await
+            }
+            AuthRolesAction::Assign | AuthRolesAction::Unassign => {
+                let role = needs(a.name, "name", action)?;
+                let principal = needs(a.principal, "principal", action)?;
+                let tool = if matches!(a.action, AuthRolesAction::Assign) {
+                    "role_assign"
+                } else {
+                    "role_unassign"
+                };
+                self.auth_call(
+                    env,
+                    Scope::Write,
+                    tool,
+                    json!({"principal": principal, "role": role}),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn auth_agents_run(&self, a: AuthAgentsArgs) -> Result<serde_json::Value, String> {
+        use serde_json::json;
+        let env = a.env.as_deref().unwrap_or("sandbox");
+        check_env(env)?;
+        match a.action {
+            AuthAgentsAction::Create => {
+                let scopes = needs(a.scopes, "scopes", a.action.as_str())?;
+                let mut v = self
+                    .auth_call(
+                        env,
+                        Scope::Write,
+                        "agent_create",
+                        json!({"client_id": a.client_id, "name": a.name, "scopes": scopes}),
+                    )
+                    .await?;
+                if v.get("client_secret").is_some_and(|s| !s.is_null()) {
+                    v["note"] = "Store this secret now; it is not shown again.".into();
+                }
+                Ok(v)
+            }
+            AuthAgentsAction::Revoke => {
+                self.auth_call(
+                    env,
+                    Scope::Write,
+                    "agent_revoke",
+                    json!({"client_id": a.client_id}),
+                )
+                .await
             }
         }
     }
@@ -1589,6 +1809,30 @@ impl QuomeMcp {
     async fn auth_apps(&self, Parameters(a): Parameters<AuthAppsArgs>) -> Result<String, String> {
         json(&self.auth_apps_run(a).await?)
     }
+
+    #[tool(
+        description = "Manage the users of the org's auth on env (default sandbox). action `list` (pages with after/limit), `create` (email, optional name; on sandbox the sign-in email lands in auth_outbox), `disable` (principal like `user:<org>/<id>`)."
+    )]
+    async fn auth_users(&self, Parameters(a): Parameters<AuthUsersArgs>) -> Result<String, String> {
+        json(&self.auth_users_run(a).await?)
+    }
+
+    #[tool(
+        description = "Manage roles on the org's auth on env (default sandbox). action `list`, `create` / `delete` (name; a role with assignments needs confirm: true), `assign` / `unassign` (name and principal: `user:`, `workload:` or `agent:` `<org>/<id>`)."
+    )]
+    async fn auth_roles(&self, Parameters(a): Parameters<AuthRolesArgs>) -> Result<String, String> {
+        json(&self.auth_roles_run(a).await?)
+    }
+
+    #[tool(
+        description = "Manage agent clients on the org's auth on env (default sandbox). action `create` (client_id, scopes, optional name; the secret is shown once) or `revoke` (client_id)."
+    )]
+    async fn auth_agents(
+        &self,
+        Parameters(a): Parameters<AuthAgentsArgs>,
+    ) -> Result<String, String> {
+        json(&self.auth_agents_run(a).await?)
+    }
 }
 
 #[tool_handler(
@@ -1748,6 +1992,9 @@ mod tests {
             "email_wait",
             "auth_status",
             "auth_apps",
+            "auth_users",
+            "auth_roles",
+            "auth_agents",
         ];
         want.sort();
         assert_eq!(names, want);
@@ -4301,5 +4548,219 @@ mod tests {
         assert!(text.contains("ghost"), "{text}");
         let reqs = s.received_requests().await.unwrap();
         assert_eq!(rpc_args(&reqs, "client_upsert").len(), 1);
+    }
+
+    /// The broker hands out a token for `env` only when asked for exactly `scope`.
+    async fn mount_auth_broker_scope(s: &MockServer, env: &str, scope: Value) {
+        Mock::given(method("POST"))
+            .and(path(api_path("/auth/token")))
+            .and(wiremock::matchers::query_param("env", env))
+            .and(wiremock::matchers::body_json(json!({ "scope": scope })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": format!("T-{env}"), "token_type": "Bearer", "expires_in": 300,
+                "issuer": format!("{}/{env}", s.uri()), "mcp_url": format!("{}/mcp/{env}", s.uri())
+            })))
+            .expect(1)
+            .mount(s)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn auth_users_actions_call_the_instance() {
+        let (s, mut c) = start().await;
+        mount_auth_broker_scope(&s, "sandbox", json!(["auth_read"])).await;
+        mount_auth_broker_scope(&s, "sandbox", json!(["auth_read", "auth_sandbox_write"])).await;
+        mount_auth_broker_scope(&s, "prod", json!(["auth_read", "auth_prod_write"])).await;
+        mount_instance_tool(
+            &s,
+            "sandbox",
+            "users_list",
+            json!({"users": [], "next_cursor": null}),
+        )
+        .await;
+        mount_instance_tool(
+            &s,
+            "sandbox",
+            "user_create",
+            json!({"principal": "user:acme/1"}),
+        )
+        .await;
+        mount_instance_tool(
+            &s,
+            "prod",
+            "user_create",
+            json!({"principal": "user:acme/2"}),
+        )
+        .await;
+        mount_instance_tool(&s, "sandbox", "user_disable", json!({"disabled": true})).await;
+
+        let (err, text) = c
+            .call(
+                "auth_users",
+                json!({"action": "list", "after": 7, "limit": 20}),
+            )
+            .await;
+        assert!(!err, "{text}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&text).unwrap(),
+            json!({"users": [], "next_cursor": null})
+        );
+
+        let (err, text) = c
+            .call(
+                "auth_users",
+                json!({"action": "create", "email": "a@apps.example", "name": "Ann"}),
+            )
+            .await;
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["principal"], "user:acme/1");
+        assert_eq!(v["next"], "Read the sign-in email with auth_outbox.");
+
+        // Prod: no hint, prod write scope.
+        let (err, text) = c
+            .call(
+                "auth_users",
+                json!({"action": "create", "env": "prod", "email": "b@apps.example"}),
+            )
+            .await;
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert!(v.get("next").is_none(), "{text}");
+
+        let (err, text) = c
+            .call(
+                "auth_users",
+                json!({"action": "disable", "principal": "user:acme/1"}),
+            )
+            .await;
+        assert!(!err, "{text}");
+
+        let reqs = s.received_requests().await.unwrap();
+        let list = rpc_args(&reqs, "users_list");
+        assert_eq!(list[0]["after"], 7);
+        assert_eq!(list[0]["limit"], 20);
+        let create = rpc_args(&reqs, "user_create");
+        assert_eq!(create[0], json!({"email": "a@apps.example", "name": "Ann"}));
+        assert_eq!(create[1]["email"], "b@apps.example");
+        assert_eq!(
+            rpc_args(&reqs, "user_disable"),
+            vec![json!({"principal": "user:acme/1"})]
+        );
+
+        let (err, text) = c.call("auth_users", json!({"action": "create"})).await;
+        assert!(err);
+        assert!(text.contains("`create` needs `email`"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn auth_roles_actions_call_the_instance() {
+        let (s, mut c) = start().await;
+        mount_auth_broker_scope(&s, "sandbox", json!(["auth_read"])).await;
+        mount_auth_broker_scope(&s, "sandbox", json!(["auth_read", "auth_sandbox_write"])).await;
+        for tool in [
+            "roles_list",
+            "role_create",
+            "role_delete",
+            "role_assign",
+            "role_unassign",
+        ] {
+            mount_instance_tool(&s, "sandbox", tool, json!({"tool": tool})).await;
+        }
+        let steps = [
+            (json!({"action": "list"}), "roles_list"),
+            (json!({"action": "create", "name": "staff"}), "role_create"),
+            (
+                json!({"action": "delete", "name": "staff", "confirm": true}),
+                "role_delete",
+            ),
+            (
+                json!({"action": "assign", "name": "staff", "principal": "agent:acme/9"}),
+                "role_assign",
+            ),
+            (
+                json!({"action": "unassign", "name": "staff", "principal": "agent:acme/9"}),
+                "role_unassign",
+            ),
+        ];
+        for (args, tool) in &steps {
+            let (err, text) = c.call("auth_roles", args.clone()).await;
+            assert!(!err, "{tool}: {text}");
+            assert_eq!(
+                serde_json::from_str::<Value>(&text).unwrap(),
+                json!({"tool": tool})
+            );
+        }
+        let reqs = s.received_requests().await.unwrap();
+        assert_eq!(rpc_args(&reqs, "roles_list"), vec![json!({})]);
+        assert_eq!(
+            rpc_args(&reqs, "role_create"),
+            vec![json!({"name": "staff"})]
+        );
+        assert_eq!(
+            rpc_args(&reqs, "role_delete"),
+            vec![json!({"name": "staff", "confirm": true})]
+        );
+        let grant = json!({"principal": "agent:acme/9", "role": "staff"});
+        assert_eq!(rpc_args(&reqs, "role_assign"), vec![grant.clone()]);
+        assert_eq!(rpc_args(&reqs, "role_unassign"), vec![grant]);
+
+        let (err, text) = c
+            .call("auth_roles", json!({"action": "assign", "name": "staff"}))
+            .await;
+        assert!(err);
+        assert!(text.contains("`assign` needs `principal`"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn auth_agents_create_returns_secret_once_and_revoke() {
+        let (s, mut c) = start().await;
+        mount_auth_broker_scope(&s, "sandbox", json!(["auth_read", "auth_sandbox_write"])).await;
+        mount_instance_tool(
+            &s,
+            "sandbox",
+            "agent_create",
+            json!({"client_id": "bot", "client_secret": "SECRET-1"}),
+        )
+        .await;
+        mount_instance_tool(&s, "sandbox", "agent_revoke", json!({"revoked": true})).await;
+
+        let (err, text) = c
+            .call(
+                "auth_agents",
+                json!({"action": "create", "client_id": "bot", "name": "Bot",
+                       "scopes": ["auth_read"]}),
+            )
+            .await;
+        assert!(!err, "{text}");
+        assert_eq!(text.matches("SECRET-1").count(), 1, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["note"], "Store this secret now; it is not shown again.");
+
+        let (err, text) = c
+            .call(
+                "auth_agents",
+                json!({"action": "revoke", "client_id": "bot"}),
+            )
+            .await;
+        assert!(!err, "{text}");
+        let reqs = s.received_requests().await.unwrap();
+        assert_eq!(
+            rpc_args(&reqs, "agent_create"),
+            vec![json!({"client_id": "bot", "name": "Bot", "scopes": ["auth_read"]})]
+        );
+        assert_eq!(
+            rpc_args(&reqs, "agent_revoke"),
+            vec![json!({"client_id": "bot"})]
+        );
+
+        let (err, text) = c
+            .call(
+                "auth_agents",
+                json!({"action": "create", "client_id": "bot"}),
+            )
+            .await;
+        assert!(err);
+        assert!(text.contains("`create` needs `scopes`"), "{text}");
     }
 }
