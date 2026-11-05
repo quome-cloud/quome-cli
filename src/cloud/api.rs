@@ -40,10 +40,43 @@ pub struct Port {
     pub url: String,
 }
 
+/// A short-lived token for the org's auth instance, brokered by the platform.
+#[derive(Clone, Deserialize, PartialEq)]
+pub struct AuthToken {
+    pub access_token: String,
+    pub expires_in: u64,
+    /// The instance's issuer URL.
+    pub issuer: String,
+    /// The instance's MCP endpoint.
+    pub mcp_url: String,
+}
+
+/// Never prints the token itself.
+impl std::fmt::Debug for AuthToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthToken")
+            .field("access_token", &"<redacted>")
+            .field("expires_in", &self.expires_in)
+            .field("issuer", &self.issuer)
+            .field("mcp_url", &self.mcp_url)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct Ports {
     pub detected: Vec<u16>,
     pub exposed: Vec<Port>,
+}
+
+/// What `create_sandbox` sends. The auth fields are passed through as given;
+/// the platform validates them.
+pub struct CreateSandbox<'a> {
+    pub name: &'a str,
+    pub memory_gb: f64,
+    pub runtime: &'a str,
+    pub auth_client: Option<&'a str>,
+    pub auth_redirect_path: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -500,13 +533,39 @@ fn map_error(status: u16, text: &str) -> QuomeError {
     }
 }
 
-async fn check(resp: Response) -> Result<Response, QuomeError> {
+async fn check(resp: Response, map: fn(u16, &str) -> QuomeError) -> Result<Response, QuomeError> {
     let status = resp.status();
     if status.is_success() {
         return Ok(resp);
     }
     let text = resp.text().await.unwrap_or_default();
-    Err(map_error(status.as_u16(), &text))
+    Err(map(status.as_u16(), &text))
+}
+
+/// Like `map_error`, but a 409 or 502 keeps the body's extra fields (such as
+/// `lockout_risks` or `client_ids`) as pretty JSON after the message.
+fn map_error_keeping_body(status: u16, text: &str) -> QuomeError {
+    let e = map_error(status, text);
+    if !matches!(status, 409 | 502) {
+        return e;
+    }
+    let mut v: serde_json::Value = serde_json::from_str(text).unwrap_or_default();
+    let Some(obj) = v.as_object_mut() else {
+        return e;
+    };
+    for k in ["detail", "reason", "message"] {
+        obj.remove(k);
+    }
+    if let Some(serde_json::Value::Object(extra)) = obj.remove("extra") {
+        obj.extend(extra);
+    }
+    match e {
+        QuomeError::ApiError(m) if !obj.is_empty() => QuomeError::ApiError(format!(
+            "{m}\n{}",
+            serde_json::to_string_pretty(&v).unwrap_or_default()
+        )),
+        e => e,
+    }
 }
 
 impl CloudApi {
@@ -554,6 +613,17 @@ impl CloudApi {
         path: &str,
         build: impl Fn(RequestBuilder) -> RequestBuilder,
     ) -> Result<Response, QuomeError> {
+        self.send_mapping(m, path, build, map_error).await
+    }
+
+    /// `send` with a custom mapping of error answers.
+    async fn send_mapping(
+        &self,
+        m: Method,
+        path: &str,
+        build: impl Fn(RequestBuilder) -> RequestBuilder,
+        map: fn(u16, &str) -> QuomeError,
+    ) -> Result<Response, QuomeError> {
         let url = format!("{}{}", self.base, path);
         let mut retried = false;
         loop {
@@ -562,7 +632,7 @@ impl CloudApi {
                 .send()
                 .await?;
             if resp.status().as_u16() != 401 {
-                return check(resp).await;
+                return check(resp, map).await;
             }
             let text = resp.text().await.unwrap_or_default();
             let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
@@ -606,12 +676,14 @@ impl CloudApi {
         self.json(Method::GET, &p, |b| b).await
     }
 
-    pub async fn create_sandbox(
-        &self,
-        name: &str,
-        memory_gb: f64,
-        runtime: &str,
-    ) -> Result<Sandbox, QuomeError> {
+    pub async fn create_sandbox(&self, req: CreateSandbox<'_>) -> Result<Sandbox, QuomeError> {
+        let CreateSandbox {
+            name,
+            memory_gb,
+            runtime,
+            auth_client,
+            auth_redirect_path,
+        } = req;
         check_name_size(name, memory_gb)?;
         if !RUNTIMES.contains(&runtime) {
             return Err(QuomeError::Usage(format!(
@@ -619,7 +691,14 @@ impl CloudApi {
                 RUNTIMES.join(", ")
             )));
         }
-        let body = serde_json::json!({"name": name, "memory_gb": memory_gb, "runtime": runtime});
+        let mut body =
+            serde_json::json!({"name": name, "memory_gb": memory_gb, "runtime": runtime});
+        if let Some(c) = auth_client {
+            body["auth_client"] = c.into();
+        }
+        if let Some(p) = auth_redirect_path {
+            body["auth_redirect_path"] = p.into();
+        }
         self.json(Method::POST, &self.org_path("/sandboxes"), |b| {
             b.json(&body)
         })
@@ -945,6 +1024,87 @@ impl CloudApi {
         }
     }
 
+    /// A token for the org's auth instance in `env` (`sandbox` or `prod`) with `scope`.
+    pub async fn auth_token(&self, env: &str, scope: &[&str]) -> Result<AuthToken, QuomeError> {
+        let body = serde_json::json!({ "scope": scope });
+        self.json(Method::POST, &self.org_path("/auth/token"), |b| {
+            b.query(&[("env", env)]).json(&body)
+        })
+        .await
+    }
+
+    /// The clients of the org's auth in `env`: linked apps and External clients,
+    /// each row passed through as the platform sends it.
+    pub async fn auth_apps(&self, env: &str) -> Result<Vec<serde_json::Value>, QuomeError> {
+        #[derive(Deserialize)]
+        struct List {
+            #[serde(alias = "apps")]
+            items: Vec<serde_json::Value>,
+        }
+        let l: List = self
+            .json(Method::GET, &self.org_path("/auth/apps"), |b| {
+                b.query(&[("env", env)])
+            })
+            .await?;
+        Ok(l.items)
+    }
+
+    /// Link an app (by service id) to the org's prod auth. `body` holds the
+    /// optional `client_id`, `redirect_path` and `allowed_roles`.
+    pub async fn auth_link_app(
+        &self,
+        service_id: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, QuomeError> {
+        let p = self.org_path(&format!("/auth/apps/{}/link", enc(service_id)));
+        self.json(Method::POST, &p, |b| b.json(body)).await
+    }
+
+    /// Remove an app's link to the org's prod auth (idempotent).
+    pub async fn auth_unlink_app(&self, service_id: &str) -> Result<(), QuomeError> {
+        let p = self.org_path(&format!("/auth/apps/{}/link", enc(service_id)));
+        self.send(Method::DELETE, &p, |b| b).await?;
+        Ok(())
+    }
+
+    /// Register an External client (an app not hosted on Quome) on the org's
+    /// prod auth. A confidential client's `client_secret` is in the answer once.
+    pub async fn auth_register_external(
+        &self,
+        client_id: &str,
+        kind: &str,
+        redirect_uris: &[String],
+    ) -> Result<serde_json::Value, QuomeError> {
+        let body = serde_json::json!({
+            "client_id": client_id, "kind": kind, "redirect_uris": redirect_uris,
+        });
+        self.json(
+            Method::POST,
+            &self.org_path("/auth/external-clients"),
+            |b| b.json(&body),
+        )
+        .await
+    }
+
+    /// Promote the sandbox auth config to prod (`apply: false` previews the
+    /// diff). A 409 or 502 error keeps the body's `lockout_risks` / `client_ids`.
+    pub async fn auth_promote(
+        &self,
+        apply: bool,
+        prune: bool,
+        confirm_lockout: bool,
+    ) -> Result<serde_json::Value, QuomeError> {
+        let body = serde_json::json!({
+            "apply": apply, "prune": prune, "confirm_lockout": confirm_lockout,
+        });
+        let p = self.org_path("/auth/promote");
+        Ok(self
+            .send_mapping(Method::POST, &p, |b| b.json(&body), map_error_keeping_body)
+            .await?
+            .json()
+            .await?)
+    }
+
     pub async fn create_app(&self, name: &str, memory_gb: f64) -> Result<Service, QuomeError> {
         check_name_size(name, memory_gb)?;
         let body = serde_json::json!({"kind": "app", "name": name, "memory_gb": memory_gb});
@@ -1232,18 +1392,80 @@ mod tests {
             .mount(&s)
             .await;
         let e = api
-            .create_sandbox("ok-name", 4.0, "claude")
+            .create_sandbox(cs("ok-name", 4.0, "claude"))
             .await
             .unwrap_err();
         assert_eq!(e.to_string(), "API error: 422 invalid: invalid_name");
     }
 
     #[tokio::test]
+    async fn create_sandbox_sends_auth_client_when_set() {
+        let (s, api) = setup().await;
+        Mock::given(method("POST"))
+            .and(path(format!("/api/v1/orgs/{ORG}/sandboxes")))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "id":"s1","name":"good","status":"provisioning","runtime":"claude","memory_gb":4.0
+            })))
+            .mount(&s)
+            .await;
+        api.create_sandbox(CreateSandbox {
+            auth_client: Some("web"),
+            auth_redirect_path: Some("/cb"),
+            ..cs("good", 4.0, "claude")
+        })
+        .await
+        .unwrap();
+        let reqs = s.received_requests().await.unwrap();
+        let r = reqs
+            .iter()
+            .find(|r| r.url.path().ends_with("/sandboxes"))
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"name":"good","memory_gb":4.0,"runtime":"claude",
+                "auth_client":"web","auth_redirect_path":"/cb"})
+        );
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_omits_auth_fields_when_unset() {
+        let (s, api) = setup().await;
+        Mock::given(method("POST"))
+            .and(path(format!("/api/v1/orgs/{ORG}/sandboxes")))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "id":"s1","name":"good","status":"provisioning","runtime":"claude","memory_gb":4.0
+            })))
+            .mount(&s)
+            .await;
+        api.create_sandbox(cs("good", 4.0, "claude")).await.unwrap();
+        let reqs = s.received_requests().await.unwrap();
+        let r = reqs
+            .iter()
+            .find(|r| r.url.path().ends_with("/sandboxes"))
+            .unwrap();
+        let text = String::from_utf8(r.body.clone()).unwrap();
+        assert!(text.contains("runtime"), "{text}");
+        assert!(!text.contains("auth_"), "{text}");
+        assert!(!text.contains("null"), "{text}");
+    }
+
+    fn cs<'a>(name: &'a str, memory_gb: f64, runtime: &'a str) -> CreateSandbox<'a> {
+        CreateSandbox {
+            name,
+            memory_gb,
+            runtime,
+            auth_client: None,
+            auth_redirect_path: None,
+        }
+    }
+
+    #[tokio::test]
     async fn create_sandbox_validates_locally_and_posts() {
         let (s, api) = setup().await;
-        assert!(api.create_sandbox("Bad", 4.0, "claude").await.is_err());
-        assert!(api.create_sandbox("good", 3.0, "claude").await.is_err());
-        assert!(api.create_sandbox("good", 4.0, "vim").await.is_err());
+        assert!(api.create_sandbox(cs("Bad", 4.0, "claude")).await.is_err());
+        assert!(api.create_sandbox(cs("good", 3.0, "claude")).await.is_err());
+        assert!(api.create_sandbox(cs("good", 4.0, "vim")).await.is_err());
         Mock::given(method("POST"))
             .and(path(format!("/api/v1/orgs/{ORG}/sandboxes")))
             .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
@@ -1252,7 +1474,7 @@ mod tests {
             .expect(1)
             .mount(&s)
             .await;
-        let sb = api.create_sandbox("good", 4.0, "codex").await.unwrap();
+        let sb = api.create_sandbox(cs("good", 4.0, "codex")).await.unwrap();
         assert_eq!(sb.id, "s1");
         let reqs = s.received_requests().await.unwrap();
         let r = reqs
@@ -2072,5 +2294,37 @@ mod tests {
         let step = api.email_wait(ADDR, None, None, None, 1).await.unwrap();
         assert!(matches!(step, WaitStep::Busy), "{step:?}");
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[tokio::test]
+    async fn auth_token_posts_scope_and_env() {
+        let (s, api) = setup().await;
+        Mock::given(method("POST"))
+            .and(path(format!("/api/v1/orgs/{ORG}/auth/token")))
+            .and(query_param("env", "prod"))
+            .and(header("authorization", "Bearer AT"))
+            .and(wiremock::matchers::body_json(
+                serde_json::json!({"scope": ["auth_read", "auth_prod_write"]}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "T1", "token_type": "Bearer", "expires_in": 300,
+                "issuer": s.uri(), "mcp_url": format!("{}/mcp", s.uri())
+            })))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let t = api
+            .auth_token("prod", &["auth_read", "auth_prod_write"])
+            .await
+            .unwrap();
+        assert_eq!(
+            t,
+            AuthToken {
+                access_token: "T1".into(),
+                expires_in: 300,
+                issuer: s.uri(),
+                mcp_url: format!("{}/mcp", s.uri()),
+            }
+        );
     }
 }
