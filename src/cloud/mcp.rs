@@ -469,9 +469,10 @@ const MAX_FOLLOW_LINES: usize = 1000;
 /// Longest gap between progress notifications while following.
 const FOLLOW_HEARTBEAT: Duration = Duration::from_secs(15);
 
-/// The org's log store is waking up (503 `logs_starting`); retry shortly.
+/// The org's log store is waking up (503 `logs_starting`, or the request
+/// outlived this client's timeout while the server held it); retry shortly.
 fn logs_starting(e: &QuomeError) -> bool {
-    matches!(e, QuomeError::ApiError(m) if m.contains("logs_starting"))
+    matches!(e, QuomeError::ApiError(m) if m.contains("logs_starting")) || super::api::is_timeout(e)
 }
 
 impl QuomeMcp {
@@ -904,7 +905,7 @@ impl QuomeMcp {
             .collect();
         lines.reverse();
         let mut truncated = lines.len() >= limit as usize;
-        let mut note = LOGS_NOTE;
+        let mut note = LOGS_NOTE.to_string();
 
         if a.follow == Some(true) {
             let deadline = Instant::now() + self.timing.log_wait;
@@ -918,7 +919,7 @@ impl QuomeMcp {
                     // Still starting at the deadline: the history is all there is.
                     Err(e) if logs_starting(&e) => break None,
                     Err(QuomeError::RateLimited) => {
-                        note = FOLLOW_BUSY_NOTE;
+                        note = FOLLOW_BUSY_NOTE.to_string();
                         break None;
                     }
                     Err(e) => return Err(fail(e)),
@@ -1528,6 +1529,14 @@ mod tests {
     }
 
     async fn start_with(timing: Timing) -> (MockServer, Client) {
+        start_with_api(timing, |api| api).await
+    }
+
+    /// `start_with`, the client adjusted by `tweak` (shorter HTTP timeouts).
+    async fn start_with_api(
+        timing: Timing,
+        tweak: impl FnOnce(CloudApi) -> CloudApi,
+    ) -> (MockServer, Client) {
         let s = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/.well-known/openid-configuration"))
@@ -1545,7 +1554,10 @@ mod tests {
             .mount(&s)
             .await;
         let p = profile(&s.uri());
-        let api = CloudApi::new(&p, TokenSource::new(&p, AgentKey::generate(), "vrc".into()));
+        let api = tweak(CloudApi::new(
+            &p,
+            TokenSource::new(&p, AgentKey::generate(), "vrc".into()),
+        ));
         let server = QuomeMcp::with_timing(api, p, timing);
         let (cw, sr) = tokio::io::duplex(1 << 20);
         let (sw, cr) = tokio::io::duplex(1 << 20);
@@ -3992,6 +4004,47 @@ mod tests {
             .filter(|r| r.url.path() == logs_path())
             .count();
         assert!(polls > 1, "retried {polls} times");
+    }
+
+    /// The server holds a history request while the store wakes (up to 60 s): a
+    /// request that outlives the client's timeout is "starting", retried within
+    /// the wait, not an error.
+    #[tokio::test]
+    async fn app_logs_history_timeout_is_starting() {
+        let timing = Timing {
+            poll: Duration::from_millis(5),
+            sandbox_wait: Duration::from_secs(5),
+            build_wait: Duration::from_secs(5),
+            email_backoff: Duration::from_millis(5),
+            log_wait: Duration::from_millis(1500),
+            log_retry: Duration::from_millis(5),
+        };
+        let (s, mut c) = start_with_api(timing, |api| {
+            api.with_log_request_timeout(Duration::from_secs(1))
+        })
+        .await;
+        sequence(&s, "GET", api_path("/services"), vec![svc("running")]).await;
+        Mock::given(method("GET"))
+            .and(path(logs_path()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(logs_history())
+                    .set_delay(Duration::from_secs(2)),
+            )
+            .mount(&s)
+            .await;
+        let (err, text) = c.call("app_logs", json!({"app": "web"})).await;
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["status"], "starting", "{text}");
+        let polls = s
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() == logs_path())
+            .count();
+        assert!(polls >= 2, "retried {polls} times");
     }
 
     #[tokio::test]

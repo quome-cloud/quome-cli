@@ -338,6 +338,21 @@ pub struct LogLine {
 /// How long a live tail request may stay open; the server ends it sooner.
 pub const LOG_STREAM_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
+/// How long a log history request, or the opening of a live tail, may take:
+/// the server holds either up to 60 s while the org's log store wakes, then
+/// answers 503 `logs_starting`.
+pub const LOG_REQUEST_TIMEOUT: Duration = Duration::from_secs(75);
+
+/// Whether `e` is this client giving up on a request (its HTTP timeout, or a
+/// live tail that did not open in time).
+pub fn is_timeout(e: &QuomeError) -> bool {
+    match e {
+        QuomeError::Http(h) => h.is_timeout(),
+        QuomeError::Io(io) => io.kind() == std::io::ErrorKind::TimedOut,
+        _ => false,
+    }
+}
+
 /// Incremental `text/event-stream` reader for the live tail: `data:` events
 /// become lines, `:` comments are ignored, and `event: end` ends it.
 #[derive(Default)]
@@ -391,6 +406,7 @@ pub struct CloudApi {
     org: String,
     tokens: TokenSource,
     email_wait_slack: Duration,
+    log_request_timeout: Duration,
 }
 
 fn valid_name(name: &str) -> bool {
@@ -513,12 +529,20 @@ impl CloudApi {
             org: profile.org_id.clone(),
             tokens,
             email_wait_slack: EMAIL_WAIT_HTTP_SLACK,
+            log_request_timeout: LOG_REQUEST_TIMEOUT,
         }
     }
 
     /// Change the slack added to each mail wait's HTTP timeout (tests).
     pub(crate) fn with_email_wait_slack(mut self, slack: Duration) -> CloudApi {
         self.email_wait_slack = slack;
+        self
+    }
+
+    /// Change the log history / live tail open timeout (tests).
+    #[cfg(test)]
+    pub(crate) fn with_log_request_timeout(mut self, timeout: Duration) -> CloudApi {
+        self.log_request_timeout = timeout;
         self
     }
 
@@ -994,7 +1018,9 @@ impl CloudApi {
         if let Some(q) = q {
             query.push(("q", q.to_string()));
         }
-        self.json(Method::GET, &p, |b| b.query(&query)).await
+        let timeout = self.log_request_timeout;
+        self.json(Method::GET, &p, |b| b.query(&query).timeout(timeout))
+            .await
     }
 
     /// An app's live tail: lines as the server sends them, ending when the
@@ -1005,12 +1031,20 @@ impl CloudApi {
     ) -> Result<impl futures_util::Stream<Item = LogLine>, QuomeError> {
         use futures_util::StreamExt;
         let p = self.org_path(&format!("/apps/{}/logs/stream", enc(app_id)));
-        let resp = self
-            .send(Method::GET, &p, |b| {
-                b.header("Accept", "text/event-stream")
-                    .timeout(LOG_STREAM_TIMEOUT)
-            })
-            .await?;
+        // The whole tail may last LOG_STREAM_TIMEOUT; its opening (the server
+        // may hold it while the log store wakes) only LOG_REQUEST_TIMEOUT.
+        let open = self.send(Method::GET, &p, |b| {
+            b.header("Accept", "text/event-stream")
+                .timeout(LOG_STREAM_TIMEOUT)
+        });
+        let resp = tokio::time::timeout(self.log_request_timeout, open)
+            .await
+            .map_err(|_| {
+                QuomeError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "the live tail did not open in time",
+                ))
+            })??;
         let state = (
             resp.bytes_stream().boxed(),
             SseParser::default(),
