@@ -628,3 +628,27 @@ mod binding_tests {
         assert!(v.get("container_name").is_some());
     }
 }
+
+#[cfg(test)]
+mod log_tests {
+    use super::*;
+
+    #[test]
+    fn app_logs_deserializes_the_per_app_logs_response() {
+        // Newest revision first, newest line first inside; every severity the server sends.
+        let body = r#"{"revisions":[
+            {"revision_name":"web-00003","logs":[
+                {"timestamp":"2026-11-04T10:00:03.123456Z","severity":"FATAL","message":"three"},
+                {"timestamp":"2026-11-04T10:00:02+00:00","severity":"TRACE","message":"two"}]},
+            {"revision_name":"web-00002","logs":[
+                {"timestamp":"2026-11-04T09:59:00Z","severity":"WARN","message":"one"}]}]}"#;
+        let logs: AppLogs = serde_json::from_str(body).unwrap();
+        assert_eq!(logs.revisions.len(), 2);
+        assert_eq!(logs.revisions[0].revision_name, "web-00003");
+        assert_eq!(logs.revisions[0].logs[0].severity.as_deref(), Some("FATAL"));
+        assert_eq!(logs.revisions[0].logs[1].message, "two");
+        assert_eq!(logs.revisions[1].logs[0].message, "one");
+        let empty: AppLogs = serde_json::from_str(r#"{"revisions":[]}"#).unwrap();
+        assert!(empty.revisions.is_empty());
+    }
+}
