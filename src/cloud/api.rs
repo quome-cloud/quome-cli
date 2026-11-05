@@ -105,6 +105,44 @@ pub struct Deploy {
     pub workflow_id: String,
 }
 
+/// What Quome Cloud observed of a container that did not stay up.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct DeployFailure {
+    pub message: String,
+    #[serde(default)]
+    pub exit_code: Option<i64>,
+    #[serde(default)]
+    pub signal: Option<i64>,
+    #[serde(default)]
+    pub seconds_alive: Option<f64>,
+    #[serde(default)]
+    pub console_tail: String,
+    #[serde(default)]
+    pub instance_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct DeployStage {
+    pub stage: String,
+    pub status: String,
+}
+
+/// One deploy: `in_progress`, then `succeeded` or `failed`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct DeployRecord {
+    pub id: String,
+    pub status: String,
+    #[serde(default)]
+    pub error: Option<String>,
+    /// Set only for a failed rollout where the container was observed.
+    #[serde(default)]
+    pub failure: Option<DeployFailure>,
+    #[serde(default)]
+    pub revision_id: Option<String>,
+    #[serde(default)]
+    pub stages: Vec<DeployStage>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct Build {
     pub id: String,
@@ -827,6 +865,21 @@ impl CloudApi {
         let p = self.org_path(&format!("/apps/{}/deploy", enc(app_id)));
         let body = serde_json::json!({"source_key": source_key});
         self.json(Method::POST, &p, |b| b.json(&body)).await
+    }
+
+    pub async fn get_deploy(
+        &self,
+        app_id: &str,
+        deploy_id: &str,
+    ) -> Result<DeployRecord, QuomeError> {
+        let p = self.org_path(&format!("/apps/{}/deploys/{}", enc(app_id), enc(deploy_id)));
+        self.json(Method::GET, &p, |b| b).await
+    }
+
+    /// An app's deploys, newest first.
+    pub async fn list_deploys(&self, app_id: &str) -> Result<Vec<DeployRecord>, QuomeError> {
+        let p = self.org_path(&format!("/apps/{}/deploys", enc(app_id)));
+        self.json(Method::GET, &p, |b| b).await
     }
 
     /// An app's builds, newest first (the server returns up to 100).
