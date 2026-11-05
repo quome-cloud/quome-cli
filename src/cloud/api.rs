@@ -183,6 +183,78 @@ pub struct AppKeys {
     pub notes: Vec<String>,
 }
 
+/// Longest single server wait for mail (the edge cuts requests at 30 s).
+pub const MAX_EMAIL_WAIT: u32 = 25;
+/// A mail wait's HTTP timeout is the server wait plus this slack, so a slow
+/// answer is retried soon and `email_wait` keeps close to its total timeout.
+pub const EMAIL_WAIT_HTTP_SLACK: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct EmailAddress {
+    pub id: String,
+    pub address: String,
+    pub kind: String,
+    #[serde(default)]
+    pub label: Option<String>,
+    pub status: String,
+    pub forward: bool,
+    pub owner_user_id: String,
+    #[serde(default)]
+    pub sandbox_id: Option<String>,
+    #[serde(default)]
+    pub created_by_actor: Option<String>,
+    #[serde(default)]
+    pub created_by_on_behalf_of: Option<String>,
+    pub created_at: String,
+    #[serde(default)]
+    pub last_message_at: Option<String>,
+}
+
+/// One short server wait for mail.
+#[derive(Debug)]
+pub enum WaitStep {
+    /// A matching message: the server's envelope, unchanged, and the cursor
+    /// (`now`) to pass as the next `since`.
+    Message {
+        message: serde_json::Value,
+        now: String,
+    },
+    /// Nothing matched; pass `now` as the next `since`.
+    NoMatch { now: String },
+    /// The server (or the edge) was busy; retry with the same cursor.
+    Busy,
+}
+
+/// Lowercase an address label and check it is 1-20 of `[a-z0-9-]`.
+pub fn check_label(label: &str) -> Result<String, QuomeError> {
+    let l = label.to_lowercase();
+    let ok = (1..=20).contains(&l.len())
+        && l.bytes()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-');
+    if ok {
+        Ok(l)
+    } else {
+        Err(QuomeError::Usage(
+            "Label must be 1-20 characters: lowercase letters, digits or hyphens, such as the \
+             service name."
+                .into(),
+        ))
+    }
+}
+
+/// Whether a wait error means "busy, try again": any 429, a 502/503/504, or
+/// this client's HTTP timeout.
+fn wait_busy(e: &QuomeError) -> bool {
+    match e {
+        QuomeError::RateLimited => true,
+        QuomeError::ApiError(m) => ["502", "503", "504"]
+            .iter()
+            .any(|c| m == c || m.starts_with(&format!("{c} "))),
+        QuomeError::Http(h) => h.is_timeout(),
+        _ => false,
+    }
+}
+
 /// The result of a size-capped download.
 #[derive(Debug, PartialEq)]
 pub enum Download {
@@ -196,6 +268,7 @@ pub struct CloudApi {
     base: String,
     org: String,
     tokens: TokenSource,
+    email_wait_slack: Duration,
 }
 
 fn valid_name(name: &str) -> bool {
@@ -317,7 +390,14 @@ impl CloudApi {
             base: format!("{}/api/v1", profile.api_url.trim_end_matches('/')),
             org: profile.org_id.clone(),
             tokens,
+            email_wait_slack: EMAIL_WAIT_HTTP_SLACK,
         }
+    }
+
+    /// Change the slack added to each mail wait's HTTP timeout (tests).
+    pub(crate) fn with_email_wait_slack(mut self, slack: Duration) -> CloudApi {
+        self.email_wait_slack = slack;
+        self
     }
 
     /// Send an authenticated request. A 401 that is not a known session reason
@@ -603,6 +683,114 @@ impl CloudApi {
         let p = self.org_path(&format!("/app-installs/{}/delete-data", enc(slug)));
         let body = serde_json::json!({"confirm": true, "slug": slug});
         self.json(Method::POST, &p, |b| b.json(&body)).await
+    }
+
+    pub async fn email_create_address(
+        &self,
+        kind: &str,
+        label: &str,
+        sandbox_id: Option<&str>,
+        forward: bool,
+    ) -> Result<EmailAddress, QuomeError> {
+        let label = check_label(label)?;
+        let mut body = serde_json::json!({"kind": kind, "label": label, "forward": forward});
+        if let Some(sb) = sandbox_id {
+            body["sandbox_id"] = serde_json::Value::String(sb.into());
+        }
+        self.json(Method::POST, &self.org_path("/email/addresses"), |b| {
+            b.json(&body)
+        })
+        .await
+    }
+
+    pub async fn email_list_addresses(&self) -> Result<Vec<EmailAddress>, QuomeError> {
+        #[derive(Deserialize)]
+        struct List {
+            addresses: Vec<EmailAddress>,
+        }
+        let l: List = self
+            .json(Method::GET, &self.org_path("/email/addresses"), |b| b)
+            .await?;
+        Ok(l.addresses)
+    }
+
+    pub async fn email_disable(&self, id: &str) -> Result<EmailAddress, QuomeError> {
+        let p = self.org_path(&format!("/email/addresses/{}", enc(id)));
+        let body = serde_json::json!({"status": "disabled"});
+        self.json(Method::PATCH, &p, |b| b.json(&body)).await
+    }
+
+    /// An address's messages, newest first: the whole response body.
+    pub async fn email_list_messages(
+        &self,
+        id: &str,
+        since: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<serde_json::Value, QuomeError> {
+        let p = self.org_path(&format!("/email/addresses/{}/messages", enc(id)));
+        let limit = limit.map(|l| l.to_string());
+        let mut query: Vec<(&str, &str)> = Vec::new();
+        if let Some(since) = since {
+            query.push(("since", since));
+        }
+        if let Some(l) = &limit {
+            query.push(("limit", l));
+        }
+        self.json(Method::GET, &p, |b| b.query(&query)).await
+    }
+
+    /// One message's envelope, exactly as the server sent it (never HTML).
+    pub async fn email_message(&self, id: &str) -> Result<serde_json::Value, QuomeError> {
+        let p = self.org_path(&format!("/email/messages/{}", enc(id)));
+        self.json(Method::GET, &p, |b| b).await
+    }
+
+    /// One server wait of `timeout_s` (1-`MAX_EMAIL_WAIT`) seconds for mail.
+    pub async fn email_wait(
+        &self,
+        id: &str,
+        since: Option<&str>,
+        from_contains: Option<&str>,
+        subject_contains: Option<&str>,
+        timeout_s: u32,
+    ) -> Result<WaitStep, QuomeError> {
+        if timeout_s == 0 || timeout_s > MAX_EMAIL_WAIT {
+            return Err(QuomeError::Usage(format!(
+                "Wait timeout must be 1-{MAX_EMAIL_WAIT} seconds."
+            )));
+        }
+        let p = self.org_path(&format!("/email/addresses/{}/wait", enc(id)));
+        let t = timeout_s.to_string();
+        let http_timeout = Duration::from_secs(timeout_s.into()) + self.email_wait_slack;
+        let mut query: Vec<(&str, &str)> = vec![("timeout_s", t.as_str())];
+        for (k, v) in [
+            ("since", since),
+            ("from_contains", from_contains),
+            ("subject_contains", subject_contains),
+        ] {
+            if let Some(v) = v.filter(|v| !v.is_empty()) {
+                query.push((k, v));
+            }
+        }
+        let resp = self
+            .send(Method::GET, &p, |b| b.query(&query).timeout(http_timeout))
+            .await;
+        let mut v: serde_json::Value = match resp {
+            Ok(r) => match r.json().await {
+                Ok(v) => v,
+                Err(e) if e.is_timeout() => return Ok(WaitStep::Busy),
+                Err(e) => return Err(e.into()),
+            },
+            Err(e) if wait_busy(&e) => return Ok(WaitStep::Busy),
+            Err(e) => return Err(e),
+        };
+        let Some(now) = v["now"].as_str().map(String::from) else {
+            return Err(QuomeError::InvalidResponse);
+        };
+        match v.get_mut("message").map(serde_json::Value::take) {
+            Some(message) if !message.is_null() => Ok(WaitStep::Message { message, now }),
+            _ => Ok(WaitStep::NoMatch { now }),
+        }
     }
 
     pub async fn create_app(&self, name: &str, memory_gb: f64) -> Result<Service, QuomeError> {
@@ -1385,5 +1573,235 @@ mod tests {
             "error":null,"note":"data kept"}))
         .unwrap();
         assert_eq!(serde_json::to_value(&i).unwrap()["note"], "data kept");
+    }
+
+    const SB: &str = "22222222-2222-2222-2222-222222222222";
+    const ADDR: &str = "33333333-3333-3333-3333-333333333333";
+
+    fn addr_json(status: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": ADDR, "address": "jim-sendgrid-k3f9.acme@in.quome.cloud", "kind": "signup",
+            "label": "sendgrid", "status": status, "forward": true, "owner_user_id": "u1",
+            "sandbox_id": null, "created_by_actor": "agent", "created_by_on_behalf_of": "u1",
+            "created_at": "2026-11-04T10:00:00Z", "last_message_at": null
+        })
+    }
+
+    #[tokio::test]
+    async fn email_create_address_validates_label_and_posts() {
+        let (s, api) = setup().await;
+        let too_long = "a".repeat(21);
+        assert!(api
+            .email_create_address("signup", "has space", None, true)
+            .await
+            .is_err());
+        assert!(api
+            .email_create_address("signup", &too_long, None, true)
+            .await
+            .is_err());
+        Mock::given(method("POST"))
+            .and(path(format!("/api/v1/orgs/{ORG}/email/addresses")))
+            .and(wiremock::matchers::body_json(
+                serde_json::json!({"kind":"signup","label":"sendgrid","forward":true}),
+            ))
+            .respond_with(ResponseTemplate::new(201).set_body_json(addr_json("active")))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let a = api
+            .email_create_address("signup", "SendGrid", None, true)
+            .await
+            .unwrap();
+        assert_eq!(a.id, ADDR);
+        assert_eq!(a.address, "jim-sendgrid-k3f9.acme@in.quome.cloud");
+        Mock::given(method("POST"))
+            .and(path(format!("/api/v1/orgs/{ORG}/email/addresses")))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "kind":"sandbox","label":"test","forward":false,"sandbox_id":SB
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(addr_json("active")))
+            .expect(1)
+            .mount(&s)
+            .await;
+        api.email_create_address("sandbox", "test", Some(SB), false)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn email_disable_sends_status_disabled() {
+        let (s, api) = setup().await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("/api/v1/orgs/{ORG}/email/addresses/{ADDR}")))
+            .and(wiremock::matchers::body_json(
+                serde_json::json!({"status":"disabled"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(addr_json("disabled")))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let a = api.email_disable(ADDR).await.unwrap();
+        assert_eq!(a.status, "disabled");
+        assert_eq!(a.sandbox_id, None);
+    }
+
+    #[tokio::test]
+    async fn email_message_returns_the_body_unchanged() {
+        let (s, api) = setup().await;
+        let msg = "44444444-4444-4444-4444-444444444444";
+        let env = serde_json::json!({
+            "untrusted": true, "note": "n", "id": msg, "body": "<<<EMAIL x>>>\nhi\n<<<END EMAIL x>>>",
+            "nonce": "x", "codes": [], "links": [], "attachments": [], "future_field": 1
+        });
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v1/orgs/{ORG}/email/messages/{msg}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(env.clone()))
+            .expect(1)
+            .mount(&s)
+            .await;
+        assert_eq!(api.email_message(msg).await.unwrap(), env);
+        let reqs = s.received_requests().await.unwrap();
+        let r = reqs
+            .iter()
+            .find(|r| r.url.path().contains("/email/messages/"))
+            .unwrap();
+        assert_eq!(r.url.query(), None);
+    }
+
+    fn wait_path() -> String {
+        format!("/api/v1/orgs/{ORG}/email/addresses/{ADDR}/wait")
+    }
+
+    #[tokio::test]
+    async fn email_wait_query_omits_empty_filters() {
+        let (s, api) = setup().await;
+        Mock::given(method("GET"))
+            .and(path(wait_path()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"message":null,"now":"T"})),
+            )
+            .mount(&s)
+            .await;
+        api.email_wait(ADDR, None, Some(""), None, 25)
+            .await
+            .unwrap();
+        api.email_wait(ADDR, Some("2026-11-04T10:00:00Z"), Some("acme"), None, 25)
+            .await
+            .unwrap();
+        let reqs = s.received_requests().await.unwrap();
+        let waits: Vec<_> = reqs
+            .iter()
+            .filter(|r| r.url.path().ends_with("/wait"))
+            .collect();
+        assert_eq!(waits.len(), 2);
+        assert_eq!(waits[0].url.query(), Some("timeout_s=25"));
+        let q: std::collections::HashMap<String, String> =
+            waits[1].url.query_pairs().into_owned().collect();
+        assert_eq!(q.len(), 3);
+        assert_eq!(q["timeout_s"], "25");
+        assert_eq!(q["since"], "2026-11-04T10:00:00Z");
+        assert_eq!(q["from_contains"], "acme");
+    }
+
+    #[tokio::test]
+    async fn email_wait_rejects_timeout_over_25() {
+        let (s, api) = setup().await;
+        for t in [26, 0] {
+            assert!(matches!(
+                api.email_wait(ADDR, None, None, None, t).await,
+                Err(QuomeError::Usage(_))
+            ));
+        }
+        let reqs = s.received_requests().await.unwrap();
+        assert!(!reqs.iter().any(|r| r.url.path().ends_with("/wait")));
+    }
+
+    #[tokio::test]
+    async fn email_wait_maps_busy_statuses() {
+        let cases = [
+            ResponseTemplate::new(429).set_body_json(
+                serde_json::json!({"detail":"too_many_requests","reason":"too_many_waits"}),
+            ),
+            ResponseTemplate::new(503).set_body_json(
+                serde_json::json!({"detail":"unavailable","reason":"wait_capacity"}),
+            ),
+            ResponseTemplate::new(503).set_body_json(
+                serde_json::json!({"detail":"unavailable","reason":"wait_unavailable"}),
+            ),
+            ResponseTemplate::new(504),
+        ];
+        for r in cases {
+            let (s, api) = setup().await;
+            Mock::given(method("GET"))
+                .and(path(wait_path()))
+                .respond_with(r)
+                .mount(&s)
+                .await;
+            let step = api.email_wait(ADDR, None, None, None, 5).await.unwrap();
+            assert!(matches!(step, WaitStep::Busy));
+        }
+        let (s, api) = setup().await;
+        Mock::given(method("GET"))
+            .and(path(wait_path()))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .set_body_json(serde_json::json!({"detail":"forbidden","reason":"forbidden"})),
+            )
+            .mount(&s)
+            .await;
+        assert!(api.email_wait(ADDR, None, None, None, 5).await.is_err());
+        let (s, api) = setup().await;
+        Mock::given(method("GET"))
+            .and(path(wait_path()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"message":null,"now":"T"})),
+            )
+            .mount(&s)
+            .await;
+        match api.email_wait(ADDR, None, None, None, 5).await.unwrap() {
+            WaitStep::NoMatch { now } => assert_eq!(now, "T"),
+            _ => panic!("want NoMatch"),
+        }
+    }
+
+    #[tokio::test]
+    async fn email_wait_match_carries_now() {
+        let (s, api) = setup().await;
+        Mock::given(method("GET"))
+            .and(path(wait_path()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"message": {"id": "m1"}, "now": "T2"})),
+            )
+            .mount(&s)
+            .await;
+        match api.email_wait(ADDR, None, None, None, 5).await.unwrap() {
+            WaitStep::Message { message, now } => {
+                assert_eq!(message, serde_json::json!({"id": "m1"}));
+                assert_eq!(now, "T2");
+            }
+            _ => panic!("want Message"),
+        }
+    }
+
+    #[tokio::test]
+    async fn email_wait_client_timeout_is_busy() {
+        let (s, api) = setup().await;
+        let api = api.with_email_wait_slack(Duration::from_millis(100));
+        Mock::given(method("GET"))
+            .and(path(wait_path()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"message":null,"now":"T"}))
+                    .set_delay(Duration::from_secs(5)),
+            )
+            .mount(&s)
+            .await;
+        let started = std::time::Instant::now();
+        let step = api.email_wait(ADDR, None, None, None, 1).await.unwrap();
+        assert!(matches!(step, WaitStep::Busy), "{step:?}");
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 }

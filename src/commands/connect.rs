@@ -630,7 +630,7 @@ mod tests {
         );
         assert_eq!(
             mcp_config_json_for("quome", "work"),
-            r#"{"mcpServers":{"quome":{"args":["mcp","--profile","work"],"command":"quome"}}}"#
+            r#"{"mcpServers":{"quome":{"command":"quome","args":["mcp","--profile","work"]}}}"#
         );
     }
 
