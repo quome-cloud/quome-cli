@@ -4,6 +4,7 @@
 
 pub mod api;
 pub mod auth;
+pub mod auth_instance;
 pub mod email;
 pub mod keys;
 pub mod loopback;

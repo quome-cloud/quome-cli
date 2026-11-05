@@ -40,6 +40,17 @@ pub struct Port {
     pub url: String,
 }
 
+/// A short-lived token for the org's auth instance, brokered by the platform.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct AuthToken {
+    pub access_token: String,
+    pub expires_in: u64,
+    /// The instance's issuer URL.
+    pub issuer: String,
+    /// The instance's MCP endpoint.
+    pub mcp_url: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct Ports {
     pub detected: Vec<u16>,
@@ -835,6 +846,15 @@ impl CloudApi {
             Some(message) if !message.is_null() => Ok(WaitStep::Message { message, now }),
             _ => Ok(WaitStep::NoMatch { now }),
         }
+    }
+
+    /// A token for the org's auth instance in `env` (`sandbox` or `prod`) with `scope`.
+    pub async fn auth_token(&self, env: &str, scope: &[&str]) -> Result<AuthToken, QuomeError> {
+        let body = serde_json::json!({ "scope": scope });
+        self.json(Method::POST, &self.org_path("/auth/token"), |b| {
+            b.query(&[("env", env)]).json(&body)
+        })
+        .await
     }
 
     pub async fn create_app(&self, name: &str, memory_gb: f64) -> Result<Service, QuomeError> {
@@ -1862,5 +1882,37 @@ mod tests {
         let step = api.email_wait(ADDR, None, None, None, 1).await.unwrap();
         assert!(matches!(step, WaitStep::Busy), "{step:?}");
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[tokio::test]
+    async fn auth_token_posts_scope_and_env() {
+        let (s, api) = setup().await;
+        Mock::given(method("POST"))
+            .and(path(format!("/api/v1/orgs/{ORG}/auth/token")))
+            .and(query_param("env", "prod"))
+            .and(header("authorization", "Bearer AT"))
+            .and(wiremock::matchers::body_json(
+                serde_json::json!({"scope": ["auth_read", "auth_prod_write"]}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "T1", "token_type": "Bearer", "expires_in": 300,
+                "issuer": s.uri(), "mcp_url": format!("{}/mcp", s.uri())
+            })))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let t = api
+            .auth_token("prod", &["auth_read", "auth_prod_write"])
+            .await
+            .unwrap();
+        assert_eq!(
+            t,
+            AuthToken {
+                access_token: "T1".into(),
+                expires_in: 300,
+                issuer: s.uri(),
+                mcp_url: format!("{}/mcp", s.uri()),
+            }
+        );
     }
 }

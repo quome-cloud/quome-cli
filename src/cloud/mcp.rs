@@ -1,6 +1,7 @@
 //! The `quome mcp` server: Quome Cloud tools for Claude Code over MCP stdio.
 use super::api::{CloudApi, Download, Sandbox, WaitStep, MAX_EMAIL_WAIT, MAX_EXEC_TIMEOUT};
 use super::auth::TokenSource;
+use super::auth_instance::AuthInstances;
 use super::email::{
     backoff, email_hint, normalize_address, AddressArgs, AddressKind, CreateAddressArgs,
     ListMessagesArgs, ReadArgs, WaitArgs, LIST_NOTE,
@@ -111,7 +112,7 @@ fn is_session_error(e: &QuomeError) -> bool {
 
 /// The message for a tool call that failed; session errors that a reload could
 /// not fix also say to restart.
-fn fail(e: QuomeError) -> String {
+pub(super) fn fail(e: QuomeError) -> String {
     let m = describe(&e);
     if !is_session_error(&e) {
         return m;
@@ -225,6 +226,8 @@ pub struct QuomeMcp {
     reload: Option<Reloader>,
     refreshing: Arc<tokio::sync::Mutex<()>>,
     timing: Timing,
+    /// Brokered tokens and calls for the org's auth instances.
+    auth: Arc<AuthInstances>,
     /// The last `email_wait` cursor per address id in this session, so a later
     /// wait without `since` returns only newer mail.
     email_cursors: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
@@ -439,14 +442,24 @@ impl QuomeMcp {
     }
 
     pub fn with_timing(api: CloudApi, profile: Profile, timing: Timing) -> QuomeMcp {
+        let conn = Arc::new(std::sync::RwLock::new(Arc::new(Conn {
+            api: Arc::new(api),
+            profile: Arc::new(profile),
+        })));
+        let current = conn.clone();
+        let auth = AuthInstances::new(Arc::new(move || {
+            current
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .api
+                .clone()
+        }));
         QuomeMcp {
-            conn: Arc::new(std::sync::RwLock::new(Arc::new(Conn {
-                api: Arc::new(api),
-                profile: Arc::new(profile),
-            }))),
+            conn,
             reload: None,
             refreshing: Arc::new(tokio::sync::Mutex::new(())),
             timing,
+            auth: Arc::new(auth),
             email_cursors: Arc::default(),
             tool_router: Self::tool_router(),
         }
