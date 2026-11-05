@@ -1,5 +1,7 @@
 //! The `quome mcp` server: Quome Cloud tools for Claude Code over MCP stdio.
-use super::api::{CloudApi, Download, Sandbox, WaitStep, MAX_EMAIL_WAIT, MAX_EXEC_TIMEOUT};
+use super::api::{
+    CloudApi, CreateSandbox, Download, Sandbox, WaitStep, MAX_EMAIL_WAIT, MAX_EXEC_TIMEOUT,
+};
 use super::auth::TokenSource;
 use super::auth_instance::{
     auth_hint, check_env, AuthCallError, AuthInstances, Scope, NOT_STARTED,
@@ -244,6 +246,10 @@ pub struct CreateSandboxArgs {
     memory_gb: Option<f64>,
     /// Agent runtime: claude, codex, opencode or antigravity. Default claude.
     runtime: Option<String>,
+    /// Bind this sandbox to the org's sandbox auth as OAuth client <name>; its settings arrive as QUAUTH_ISSUER, QUAUTH_CLIENT_ID and QUAUTH_CLIENT_SECRET.
+    auth_client: Option<String>,
+    /// Redirect path for that client. Default /auth/callback.
+    auth_redirect_path: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -605,6 +611,41 @@ impl AuthAgentsAction {
     }
 }
 
+#[derive(Deserialize, JsonSchema)]
+pub struct AuthTestTokenArgs {
+    /// The OAuth client id to mint the token for.
+    client_id: String,
+    /// The principal the token is for, as `user:<org>/<id>`.
+    subject: String,
+    /// Act as this principal on the subject's behalf (delegation).
+    act: Option<String>,
+    /// Audience (resource) the token is for.
+    resource: Option<String>,
+    /// Lifetime in seconds.
+    ttl_secs: Option<u64>,
+}
+
+#[derive(Deserialize, JsonSchema, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthOutboxAction {
+    /// List captured emails, newest first.
+    List,
+    /// Read one captured email.
+    Read,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct AuthOutboxArgs {
+    /// What to do: list or read.
+    action: AuthOutboxAction,
+    /// Only mail to this address (list).
+    recipient: Option<String>,
+    /// At most this many messages (list).
+    limit: Option<u32>,
+    /// The message id (read).
+    id: Option<String>,
+}
+
 #[derive(Deserialize, JsonSchema, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthConfigAction {
@@ -901,11 +942,13 @@ impl QuomeMcp {
         let name = a.name.unwrap_or_else(|| {
             format!("agent-{}", &uuid::Uuid::new_v4().simple().to_string()[..6])
         });
-        let sb = call!(self, |api| api.create_sandbox(
-            &name,
-            a.memory_gb.unwrap_or(4.0),
-            a.runtime.as_deref().unwrap_or("claude"),
-        ))?;
+        let sb = call!(self, |api| api.create_sandbox(CreateSandbox {
+            name: &name,
+            memory_gb: a.memory_gb.unwrap_or(4.0),
+            runtime: a.runtime.as_deref().unwrap_or("claude"),
+            auth_client: a.auth_client.as_deref(),
+            auth_redirect_path: a.auth_redirect_path.as_deref(),
+        }))?;
         progress.note(format!("Created sandbox {name}")).await;
         let deadline = Instant::now() + self.timing.sandbox_wait;
         let mut cur = sb;
@@ -1272,6 +1315,52 @@ impl QuomeMcp {
                     json!({"principal": principal}),
                 )
                 .await
+            }
+        }
+    }
+
+    async fn auth_test_token_run(&self, a: AuthTestTokenArgs) -> Result<serde_json::Value, String> {
+        use serde_json::json;
+        let mut args = json!({"client_id": a.client_id, "subject": a.subject});
+        if let Some(v) = a.act {
+            args["act"] = v.into();
+        }
+        if let Some(v) = a.resource {
+            args["resource"] = v.into();
+        }
+        if let Some(v) = a.ttl_secs {
+            args["ttl_secs"] = v.into();
+        }
+        let mut out = self
+            .auth_call("sandbox", Scope::Write, "test_token", args)
+            .await?;
+        if let Some(o) = out.as_object_mut() {
+            o.insert(
+                "note".into(),
+                "Sandbox token: use it as `Authorization: Bearer …` against your app.".into(),
+            );
+        }
+        Ok(out)
+    }
+
+    async fn auth_outbox_run(&self, a: AuthOutboxArgs) -> Result<serde_json::Value, String> {
+        use serde_json::json;
+        match a.action {
+            AuthOutboxAction::List => {
+                let mut args = json!({});
+                if let Some(v) = a.recipient {
+                    args["recipient"] = v.into();
+                }
+                if let Some(v) = a.limit {
+                    args["limit"] = v.into();
+                }
+                self.auth_call("sandbox", Scope::Read, "outbox_list", args)
+                    .await
+            }
+            AuthOutboxAction::Read => {
+                let id = needs(a.id, "id", "read")?;
+                self.auth_call("sandbox", Scope::Read, "outbox_read", json!({"id": id}))
+                    .await
             }
         }
     }
@@ -1894,6 +1983,26 @@ impl QuomeMcp {
     }
 
     #[tool(
+        description = "Mint a sandbox access token for a user of the org's sandbox auth (no browser needed): client_id, subject (`user:<org>/<id>`), optional act, resource, ttl_secs. Use it as a Bearer token against your app. Sandbox only."
+    )]
+    async fn auth_test_token(
+        &self,
+        Parameters(a): Parameters<AuthTestTokenArgs>,
+    ) -> Result<String, String> {
+        json(&self.auth_test_token_run(a).await?)
+    }
+
+    #[tool(
+        description = "Read the emails the sandbox auth captured instead of sending (sign-in links, codes). action `list` (optional recipient, limit) or `read` (id). Sandbox only."
+    )]
+    async fn auth_outbox(
+        &self,
+        Parameters(a): Parameters<AuthOutboxArgs>,
+    ) -> Result<String, String> {
+        json(&self.auth_outbox_run(a).await?)
+    }
+
+    #[tool(
         description = "Manage roles on the org's auth on env (default sandbox). action `list`, `create` / `delete` (name; a role with assignments needs confirm: true), `assign` / `unassign` (name and principal: `user:`, `workload:` or `agent:` `<org>/<id>`)."
     )]
     async fn auth_roles(&self, Parameters(a): Parameters<AuthRolesArgs>) -> Result<String, String> {
@@ -2093,6 +2202,8 @@ mod tests {
             "auth_agents",
             "auth_config",
             "auth_promote",
+            "auth_test_token",
+            "auth_outbox",
         ];
         want.sort();
         assert_eq!(names, want);
@@ -4749,6 +4860,100 @@ mod tests {
         let (err, text) = c.call("auth_users", json!({"action": "create"})).await;
         assert!(err);
         assert!(text.contains("`create` needs `email`"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn auth_test_token_is_sandbox_only_and_write_scope() {
+        let (s, mut c) = start().await;
+        mount_auth_broker_scope(&s, "sandbox", json!(["auth_read", "auth_sandbox_write"])).await;
+        mount_instance_tool(
+            &s,
+            "sandbox",
+            "test_token",
+            json!({"access_token": "AT", "id_token": "IT", "expires_in": 300}),
+        )
+        .await;
+        let (err, text) = c
+            .call(
+                "auth_test_token",
+                json!({"client_id": "web", "subject": "user:acme/1", "ttl_secs": 60}),
+            )
+            .await;
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["access_token"], "AT");
+        assert_eq!(v["id_token"], "IT");
+        assert_eq!(
+            v["note"],
+            "Sandbox token: use it as `Authorization: Bearer …` against your app."
+        );
+        let reqs = s.received_requests().await.unwrap();
+        assert_eq!(
+            rpc_args(&reqs, "test_token"),
+            vec![json!({"client_id": "web", "subject": "user:acme/1", "ttl_secs": 60})]
+        );
+        // No env argument exists; every request went to the sandbox.
+        assert!(reqs.iter().all(|r| !r.url.path().ends_with("/mcp/prod")));
+    }
+
+    #[tokio::test]
+    async fn auth_outbox_read_passes_id() {
+        let (s, mut c) = start().await;
+        mount_auth_broker_scope(&s, "sandbox", json!(["auth_read"])).await;
+        mount_instance_tool(
+            &s,
+            "sandbox",
+            "outbox_read",
+            json!({"id": "m1", "body": "hi"}),
+        )
+        .await;
+        mount_instance_tool(&s, "sandbox", "outbox_list", json!({"messages": []})).await;
+        let (err, text) = c
+            .call("auth_outbox", json!({"action": "read", "id": "m1"}))
+            .await;
+        assert!(!err, "{text}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&text).unwrap(),
+            json!({"id": "m1", "body": "hi"})
+        );
+        let (err, text) = c
+            .call(
+                "auth_outbox",
+                json!({"action": "list", "recipient": "a@apps.example", "limit": 5}),
+            )
+            .await;
+        assert!(!err, "{text}");
+        let (err, text) = c.call("auth_outbox", json!({"action": "read"})).await;
+        assert!(err);
+        assert!(text.contains("`read` needs `id`"), "{text}");
+        let reqs = s.received_requests().await.unwrap();
+        assert_eq!(rpc_args(&reqs, "outbox_read"), vec![json!({"id": "m1"})]);
+        assert_eq!(
+            rpc_args(&reqs, "outbox_list"),
+            vec![json!({"recipient": "a@apps.example", "limit": 5})]
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_only_refusal_is_readable() {
+        let (s, mut c) = start().await;
+        mount_auth_broker_scope(&s, "sandbox", json!(["auth_read"])).await;
+        Mock::given(method("POST"))
+            .and(path("/mcp/sandbox"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0", "id": 1,
+                "result": {"content": [{"type": "text",
+                    "text": "sandbox_only: this tool works only on a sandbox instance"}],
+                    "isError": true}
+            })))
+            .mount(&s)
+            .await;
+        let (err, text) = c.call("auth_outbox", json!({"action": "list"})).await;
+        assert!(err);
+        assert!(
+            text.contains("This tool works only on the sandbox environment."),
+            "{text}"
+        );
     }
 
     #[tokio::test]

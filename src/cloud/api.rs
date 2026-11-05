@@ -57,6 +57,16 @@ pub struct Ports {
     pub exposed: Vec<Port>,
 }
 
+/// What `create_sandbox` sends. The auth fields are passed through as given;
+/// the platform validates them.
+pub struct CreateSandbox<'a> {
+    pub name: &'a str,
+    pub memory_gb: f64,
+    pub runtime: &'a str,
+    pub auth_client: Option<&'a str>,
+    pub auth_redirect_path: Option<&'a str>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct Sandbox {
     pub id: String,
@@ -546,12 +556,14 @@ impl CloudApi {
         self.json(Method::GET, &p, |b| b).await
     }
 
-    pub async fn create_sandbox(
-        &self,
-        name: &str,
-        memory_gb: f64,
-        runtime: &str,
-    ) -> Result<Sandbox, QuomeError> {
+    pub async fn create_sandbox(&self, req: CreateSandbox<'_>) -> Result<Sandbox, QuomeError> {
+        let CreateSandbox {
+            name,
+            memory_gb,
+            runtime,
+            auth_client,
+            auth_redirect_path,
+        } = req;
         check_name_size(name, memory_gb)?;
         if !RUNTIMES.contains(&runtime) {
             return Err(QuomeError::Usage(format!(
@@ -559,7 +571,14 @@ impl CloudApi {
                 RUNTIMES.join(", ")
             )));
         }
-        let body = serde_json::json!({"name": name, "memory_gb": memory_gb, "runtime": runtime});
+        let mut body =
+            serde_json::json!({"name": name, "memory_gb": memory_gb, "runtime": runtime});
+        if let Some(c) = auth_client {
+            body["auth_client"] = c.into();
+        }
+        if let Some(p) = auth_redirect_path {
+            body["auth_redirect_path"] = p.into();
+        }
         self.json(Method::POST, &self.org_path("/sandboxes"), |b| {
             b.json(&body)
         })
@@ -1150,18 +1169,80 @@ mod tests {
             .mount(&s)
             .await;
         let e = api
-            .create_sandbox("ok-name", 4.0, "claude")
+            .create_sandbox(cs("ok-name", 4.0, "claude"))
             .await
             .unwrap_err();
         assert_eq!(e.to_string(), "API error: 422 invalid: invalid_name");
     }
 
     #[tokio::test]
+    async fn create_sandbox_sends_auth_client_when_set() {
+        let (s, api) = setup().await;
+        Mock::given(method("POST"))
+            .and(path(format!("/api/v1/orgs/{ORG}/sandboxes")))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "id":"s1","name":"good","status":"provisioning","runtime":"claude","memory_gb":4.0
+            })))
+            .mount(&s)
+            .await;
+        api.create_sandbox(CreateSandbox {
+            auth_client: Some("web"),
+            auth_redirect_path: Some("/cb"),
+            ..cs("good", 4.0, "claude")
+        })
+        .await
+        .unwrap();
+        let reqs = s.received_requests().await.unwrap();
+        let r = reqs
+            .iter()
+            .find(|r| r.url.path().ends_with("/sandboxes"))
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"name":"good","memory_gb":4.0,"runtime":"claude",
+                "auth_client":"web","auth_redirect_path":"/cb"})
+        );
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_omits_auth_fields_when_unset() {
+        let (s, api) = setup().await;
+        Mock::given(method("POST"))
+            .and(path(format!("/api/v1/orgs/{ORG}/sandboxes")))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "id":"s1","name":"good","status":"provisioning","runtime":"claude","memory_gb":4.0
+            })))
+            .mount(&s)
+            .await;
+        api.create_sandbox(cs("good", 4.0, "claude")).await.unwrap();
+        let reqs = s.received_requests().await.unwrap();
+        let r = reqs
+            .iter()
+            .find(|r| r.url.path().ends_with("/sandboxes"))
+            .unwrap();
+        let text = String::from_utf8(r.body.clone()).unwrap();
+        assert!(text.contains("runtime"), "{text}");
+        assert!(!text.contains("auth_"), "{text}");
+        assert!(!text.contains("null"), "{text}");
+    }
+
+    fn cs<'a>(name: &'a str, memory_gb: f64, runtime: &'a str) -> CreateSandbox<'a> {
+        CreateSandbox {
+            name,
+            memory_gb,
+            runtime,
+            auth_client: None,
+            auth_redirect_path: None,
+        }
+    }
+
+    #[tokio::test]
     async fn create_sandbox_validates_locally_and_posts() {
         let (s, api) = setup().await;
-        assert!(api.create_sandbox("Bad", 4.0, "claude").await.is_err());
-        assert!(api.create_sandbox("good", 3.0, "claude").await.is_err());
-        assert!(api.create_sandbox("good", 4.0, "vim").await.is_err());
+        assert!(api.create_sandbox(cs("Bad", 4.0, "claude")).await.is_err());
+        assert!(api.create_sandbox(cs("good", 3.0, "claude")).await.is_err());
+        assert!(api.create_sandbox(cs("good", 4.0, "vim")).await.is_err());
         Mock::given(method("POST"))
             .and(path(format!("/api/v1/orgs/{ORG}/sandboxes")))
             .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
@@ -1170,7 +1251,7 @@ mod tests {
             .expect(1)
             .mount(&s)
             .await;
-        let sb = api.create_sandbox("good", 4.0, "codex").await.unwrap();
+        let sb = api.create_sandbox(cs("good", 4.0, "codex")).await.unwrap();
         assert_eq!(sb.id, "s1");
         let reqs = s.received_requests().await.unwrap();
         let r = reqs
