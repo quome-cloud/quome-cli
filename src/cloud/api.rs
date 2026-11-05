@@ -617,6 +617,12 @@ impl CloudApi {
             .await
     }
 
+    /// Delete a service (an app you deployed): `202` with the service, now `deleting`.
+    pub async fn delete_service(&self, id: &str) -> Result<Service, QuomeError> {
+        let p = self.org_path(&format!("/services/{}", enc(id)));
+        self.json(Method::DELETE, &p, |b| b).await
+    }
+
     pub async fn app_catalog(&self) -> Result<Vec<CatalogApp>, QuomeError> {
         self.json(Method::GET, &self.org_path("/app-catalog"), |b| b)
             .await
