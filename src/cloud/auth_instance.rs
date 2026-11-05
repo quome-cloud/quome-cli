@@ -2,7 +2,8 @@
 //! platform, then one stateless JSON-RPC `tools/call` to the instance's MCP.
 use super::api::{AuthToken, CloudApi};
 use super::auth::{CONNECT_TIMEOUT, REQUEST_TIMEOUT};
-use super::mcp::fail;
+use super::mcp::{fail, is_session_error};
+use crate::errors::QuomeError;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -34,6 +35,45 @@ impl Scope {
             (Scope::Read, _) => &["auth_read"],
             (Scope::Write, "prod") => &["auth_read", "auth_prod_write"],
             (Scope::Write, _) => &["auth_read", "auth_sandbox_write"],
+        }
+    }
+}
+
+/// Why an auth call failed: the platform (broker) refused, or the instance did.
+#[derive(Debug)]
+pub enum AuthCallError {
+    /// The broker call failed; a reconnect may fix some of these.
+    Api(QuomeError),
+    /// The instance (or this client) failed; the message already has its hint.
+    Instance(String),
+}
+
+impl From<String> for AuthCallError {
+    fn from(m: String) -> Self {
+        AuthCallError::Instance(m)
+    }
+}
+
+impl AuthCallError {
+    /// True when re-reading the stored connection may help: the delegation was
+    /// revoked or is invalid, or it lacks the auth scopes or role (a re-run of
+    /// `quome connect` fixes that).
+    pub fn needs_reconnect(&self) -> bool {
+        match self {
+            AuthCallError::Api(QuomeError::ApiError(m)) => {
+                m.starts_with("403")
+                    && (m.contains("capability_missing") || m.contains("role_required"))
+            }
+            AuthCallError::Api(e) => is_session_error(e),
+            AuthCallError::Instance(_) => false,
+        }
+    }
+
+    /// The message for the agent, with the next step.
+    pub fn message(self) -> String {
+        match self {
+            AuthCallError::Api(e) => auth_hint(&fail(e)),
+            AuthCallError::Instance(m) => m,
         }
     }
 }
@@ -79,7 +119,7 @@ impl AuthInstances {
     }
 
     /// The instance's issuer URL for `env`.
-    pub async fn issuer(&self, env: &str) -> Result<String, String> {
+    pub async fn issuer(&self, env: &str) -> Result<String, AuthCallError> {
         check_env(env)?;
         {
             let api = (self.api)();
@@ -103,7 +143,7 @@ impl AuthInstances {
         scope: Scope,
         tool: &str,
         args: Value,
-    ) -> Result<Value, String> {
+    ) -> Result<Value, AuthCallError> {
         check_env(env)?;
         let mut retried = false;
         loop {
@@ -135,16 +175,16 @@ impl AuthInstances {
             let text = resp.text().await.map_err(instance_unreachable)?;
             if !(200..300).contains(&status) {
                 let quoted: String = text.trim().chars().take(SNIPPET).collect();
-                return Err(auth_hint(
+                return Err(AuthCallError::Instance(auth_hint(
                     format!("The org's auth instance answered {status}: {quoted}").trim(),
-                ));
+                )));
             }
-            return parse_answer(&text);
+            return Ok(parse_answer(&text)?);
         }
     }
 
     /// A valid token for `env` and `scope`, brokered anew within 30 s of expiry.
-    async fn token(&self, env: &str, scope: Scope) -> Result<AuthToken, String> {
+    async fn token(&self, env: &str, scope: Scope) -> Result<AuthToken, AuthCallError> {
         let api = (self.api)();
         let mut cache = self.cache.lock().await;
         if !cache.api.as_ref().is_some_and(|a| Arc::ptr_eq(a, &api)) {
@@ -162,7 +202,7 @@ impl AuthInstances {
         let t = api
             .auth_token(env, scope.scopes(env))
             .await
-            .map_err(|e| auth_hint(&fail(e)))?;
+            .map_err(AuthCallError::Api)?;
         cache.tokens.insert(key, (t.clone(), fetched));
         Ok(t)
     }
@@ -399,7 +439,8 @@ mod tests {
         let e = auth
             .call("prod", Scope::Write, "test_token", json!({}))
             .await
-            .unwrap_err();
+            .unwrap_err()
+            .message();
         assert!(e.contains("only on the sandbox"), "{e}");
     }
 
@@ -419,7 +460,8 @@ mod tests {
         let e = auth
             .call("sandbox", Scope::Write, "apply", json!({}))
             .await
-            .unwrap_err();
+            .unwrap_err()
+            .message();
         assert!(e.contains("partial_apply: 1 of 2 changes applied"), "{e}");
         assert!(e.contains("\"client_secret\": \"s1\""), "{e}");
     }
@@ -439,7 +481,8 @@ mod tests {
         let e = auth
             .call("sandbox", Scope::Read, "nope", json!({}))
             .await
-            .unwrap_err();
+            .unwrap_err()
+            .message();
         assert!(e.contains("unknown tool: nope"), "{e}");
     }
 
@@ -507,16 +550,29 @@ mod tests {
     #[tokio::test]
     async fn instance_401_evicts_and_retries_once() {
         let (s, auth, _) = setup().await;
-        mount_broker(&s, 300, 2).await;
+        // The broker hands out T1, then T2; the instance refuses T1.
+        for (tok, n) in [("T1", 1u64), ("T2", 1)] {
+            Mock::given(method("POST"))
+                .and(path(broker_path()))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "access_token": tok, "token_type": "Bearer", "expires_in": 300,
+                    "issuer": s.uri(), "mcp_url": format!("{}/mcp", s.uri())
+                })))
+                .up_to_n_times(n)
+                .expect(1)
+                .mount(&s)
+                .await;
+        }
         Mock::given(method("POST"))
             .and(path("/mcp"))
+            .and(header("authorization", "Bearer T1"))
             .respond_with(ResponseTemplate::new(401))
-            .up_to_n_times(1)
             .expect(1)
             .mount(&s)
             .await;
         Mock::given(method("POST"))
             .and(path("/mcp"))
+            .and(header("authorization", "Bearer T2"))
             .respond_with(result(
                 json!({"content": [{"type": "text", "text": "{\"ok\":true}"}]}),
             ))
@@ -543,7 +599,8 @@ mod tests {
         let e = auth
             .call("sandbox", Scope::Read, "status", json!({}))
             .await
-            .unwrap_err();
+            .unwrap_err()
+            .message();
         assert!(e.contains("401"), "{e}");
     }
 
@@ -561,7 +618,8 @@ mod tests {
         let e = auth
             .call("sandbox", Scope::Read, "status", json!({}))
             .await
-            .unwrap_err();
+            .unwrap_err()
+            .message();
         assert!(e.contains("quome connect"), "{e}");
     }
 
@@ -579,7 +637,8 @@ mod tests {
         let e = auth
             .call("staging", Scope::Read, "status", json!({}))
             .await
-            .unwrap_err();
+            .unwrap_err()
+            .message();
         assert!(e.contains("sandbox"), "{e}");
     }
 

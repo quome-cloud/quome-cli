@@ -1,7 +1,7 @@
 //! The `quome mcp` server: Quome Cloud tools for Claude Code over MCP stdio.
 use super::api::{CloudApi, Download, Sandbox, WaitStep, MAX_EMAIL_WAIT, MAX_EXEC_TIMEOUT};
 use super::auth::TokenSource;
-use super::auth_instance::AuthInstances;
+use super::auth_instance::{AuthCallError, AuthInstances, Scope};
 use super::email::{
     backoff, email_hint, normalize_address, AddressArgs, AddressKind, CreateAddressArgs,
     ListMessagesArgs, ReadArgs, WaitArgs, LIST_NOTE,
@@ -103,7 +103,7 @@ pub fn describe(e: &QuomeError) -> String {
     e.to_string()
 }
 
-fn is_session_error(e: &QuomeError) -> bool {
+pub(super) fn is_session_error(e: &QuomeError) -> bool {
     matches!(
         e,
         QuomeError::CloudDisconnected | QuomeError::CloudInvalidGrant
@@ -497,6 +497,44 @@ impl QuomeMcp {
             profile: Arc::new(profile),
         });
         true
+    }
+
+    /// Run a call to the org's auth instance. When the broker says the
+    /// connection is revoked or lacks auth access, pick up a re-run of
+    /// `quome connect` and retry once.
+    async fn auth_retry<T, F, Fut>(&self, f: F) -> Result<T, String>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<T, AuthCallError>>,
+    {
+        let mut retried = false;
+        loop {
+            let api = self.conn().api.clone();
+            match f().await {
+                Ok(v) => return Ok(v),
+                Err(e) if !retried && e.needs_reconnect() && self.refresh(&api).await => {
+                    retried = true;
+                }
+                Err(e) => return Err(e.message()),
+            }
+        }
+    }
+
+    /// Call `tool` on the org's auth instance for `env` (what every `auth_*` tool uses).
+    async fn auth_call(
+        &self,
+        env: &str,
+        scope: Scope,
+        tool: &str,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        self.auth_retry(|| self.auth.call(env, scope, tool, args.clone()))
+            .await
+    }
+
+    /// The issuer URL of the org's auth instance for `env`.
+    async fn auth_issuer(&self, env: &str) -> Result<String, String> {
+        self.auth_retry(|| self.auth.issuer(env)).await
     }
 
     /// Serve MCP over any reader/writer pair until the client disconnects.
@@ -1816,6 +1854,79 @@ mod tests {
         let (err, text) = c.call("list_sandboxes", json!({})).await;
         assert!(!err, "{text}");
         assert_eq!(text.trim(), "[]");
+    }
+
+    #[tokio::test]
+    async fn auth_call_picks_up_a_reconnect_without_restart() {
+        let s = revoking_server().await;
+        let broker = api_path("/auth/token");
+        Mock::given(method("POST"))
+            .and(path(broker.clone()))
+            .and(wiremock::matchers::header("authorization", "Bearer OLD"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .set_body_json(json!({"detail":"forbidden","reason":"capability_missing"})),
+            )
+            .expect(1)
+            .mount(&s)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(broker))
+            .and(wiremock::matchers::header("authorization", "Bearer NEW"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "T1", "token_type": "Bearer", "expires_in": 300,
+                "issuer": s.uri(), "mcp_url": format!("{}/mcp", s.uri())
+            })))
+            .expect(1)
+            .mount(&s)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .and(wiremock::matchers::header("authorization", "Bearer T1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0", "id": 1,
+                "result": {"content": [{"type": "text", "text": "{\"mode\":\"sandbox\"}"}]}
+            })))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let old = AgentKey::generate();
+        let (home, reload) = cloud_home(&s.uri(), "j", "d", &old);
+        let p = profile(&s.uri());
+        let api = CloudApi::new(&p, TokenSource::new(&p, old, "vrc".into()));
+        let server = QuomeMcp::new(api, p).with_reloader(reload);
+
+        // The user re-ran `quome connect` and allowed auth access.
+        write_connection(home.path(), &s.uri(), "j2", "d2", &AgentKey::generate());
+        let v = server
+            .auth_call("sandbox", Scope::Read, "status", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(v, json!({"mode": "sandbox"}));
+    }
+
+    #[tokio::test]
+    async fn auth_call_without_a_reconnect_gives_the_hint_once() {
+        let s = revoking_server().await;
+        Mock::given(method("POST"))
+            .and(path(api_path("/auth/token")))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .set_body_json(json!({"detail":"forbidden","reason":"capability_missing"})),
+            )
+            .expect(1)
+            .mount(&s)
+            .await;
+        let old = AgentKey::generate();
+        let (_home, reload) = cloud_home(&s.uri(), "j", "d", &old);
+        let p = profile(&s.uri());
+        let api = CloudApi::new(&p, TokenSource::new(&p, old, "vrc".into()));
+        let server = QuomeMcp::new(api, p).with_reloader(reload);
+        let e = server
+            .auth_call("sandbox", Scope::Read, "status", json!({}))
+            .await
+            .unwrap_err();
+        assert!(e.contains("quome connect"), "{e}");
     }
 
     #[test]
