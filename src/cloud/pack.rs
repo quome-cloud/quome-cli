@@ -4,7 +4,7 @@
 use crate::errors::QuomeError;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use tempfile::NamedTempFile;
 
 /// Hard cap on the tar size (512 MiB).
@@ -28,17 +28,38 @@ pub fn pack_folder(dir: &Path) -> Result<PackedSource, QuomeError> {
     pack_with_cap(dir, MAX_TAR_BYTES)
 }
 
-/// Packs `dir` into a tar with entries capped at `cap` bytes. Paths are relative,
-/// forward-slash and sorted; only regular files and in-folder symlinks are emitted.
-fn pack_with_cap(dir: &Path, cap: u64) -> Result<PackedSource, QuomeError> {
-    let root = fs::canonicalize(dir)
-        .map_err(|e| QuomeError::Usage(format!("cannot read {}: {e}", dir.display())))?;
-    // Before walking anything: a folder without a Dockerfile (a home directory,
-    // say) should fail at once, not after reading every file in it.
-    match fs::symlink_metadata(root.join("Dockerfile")) {
-        Ok(m) if m.is_file() || m.file_type().is_symlink() => {}
-        _ => return Err(no_dockerfile()),
-    }
+/// The files `pack_folder` would include, as (relative forward-slash path, absolute
+/// path), sorted, with the same `.dockerignore` rules and size cap. Unlike
+/// `pack_folder` it does not require a Dockerfile. Symlinks that leave the folder are
+/// left out.
+pub fn list_folder(dir: &Path) -> Result<Vec<(String, PathBuf)>, QuomeError> {
+    let root = canonical_root(dir)?;
+    let listing = list_with_cap(&root, MAX_TAR_BYTES)?;
+    Ok(listing
+        .files
+        .into_iter()
+        .map(|rel| {
+            let full = root.join(&rel);
+            (rel, full)
+        })
+        .collect())
+}
+
+fn canonical_root(dir: &Path) -> Result<PathBuf, QuomeError> {
+    fs::canonicalize(dir)
+        .map_err(|e| QuomeError::Usage(format!("cannot read {}: {e}", dir.display())))
+}
+
+/// What the walk of a canonical `root` yields: the included relative paths in order,
+/// and a warning for each symlink left out because it points outside the folder.
+struct Listing {
+    files: Vec<String>,
+    warnings: Vec<String>,
+}
+
+/// Walks `root` with its `.dockerignore`, keeping regular files and in-folder
+/// symlinks, and refuses once the regular files' sizes add up past `cap`.
+fn list_with_cap(root: &Path, cap: u64) -> Result<Listing, QuomeError> {
     let set = match fs::read_to_string(root.join(".dockerignore")) {
         Ok(text) => IgnoreSet::parse(&text),
         Err(_) => IgnoreSet::default(),
@@ -46,8 +67,51 @@ fn pack_with_cap(dir: &Path, cap: u64) -> Result<PackedSource, QuomeError> {
     let skip = |rel: &str| rel != "Dockerfile" && rel != ".dockerignore" && set.ignored(rel);
 
     let mut paths = Vec::new();
-    walk(&root, "", &set, &skip, false, &mut paths)?;
+    walk(root, "", &set, &skip, false, &mut paths)?;
     paths.sort();
+
+    let mut files = Vec::new();
+    let mut warnings = Vec::new();
+    let mut total: u64 = 0;
+    for rel in paths {
+        let full = root.join(&rel);
+        let meta = fs::symlink_metadata(&full)?;
+        if meta.file_type().is_symlink() {
+            let link = fs::read_link(&full)?;
+            if !inside_root(root, &full, &link) {
+                warnings.push(format!(
+                    "warning: skipping symlink {rel} -> {} (target outside the build context)",
+                    link.display()
+                ));
+                continue;
+            }
+        } else if meta.is_file() {
+            total += meta.len();
+            if total > cap {
+                return Err(cap_exceeded(cap));
+            }
+        } else {
+            continue;
+        }
+        files.push(rel);
+    }
+    Ok(Listing { files, warnings })
+}
+
+/// Packs `dir` into a tar with entries capped at `cap` bytes. Paths are relative,
+/// forward-slash and sorted; only regular files and in-folder symlinks are emitted.
+fn pack_with_cap(dir: &Path, cap: u64) -> Result<PackedSource, QuomeError> {
+    let root = canonical_root(dir)?;
+    // Before walking anything: a folder without a Dockerfile (a home directory,
+    // say) should fail at once, not after reading every file in it.
+    match fs::symlink_metadata(root.join("Dockerfile")) {
+        Ok(m) if m.is_file() || m.file_type().is_symlink() => {}
+        _ => return Err(no_dockerfile()),
+    }
+    let Listing {
+        files: paths,
+        warnings,
+    } = list_with_cap(&root, cap)?;
 
     let tmp = tempfile::Builder::new()
         .prefix("quome-src-")
@@ -58,7 +122,6 @@ fn pack_with_cap(dir: &Path, cap: u64) -> Result<PackedSource, QuomeError> {
         n: 0,
         cap,
     });
-    let mut warnings = Vec::new();
     let mut count = 0;
     let mut has_dockerfile = false;
     for rel in &paths {
@@ -69,13 +132,6 @@ fn pack_with_cap(dir: &Path, cap: u64) -> Result<PackedSource, QuomeError> {
         header.set_mtime(0);
         if meta.file_type().is_symlink() {
             let link = fs::read_link(&full)?;
-            if !inside_root(&root, &full, &link) {
-                warnings.push(format!(
-                    "warning: skipping symlink {rel} -> {} (target outside the build context)",
-                    link.display()
-                ));
-                continue;
-            }
             header.set_entry_type(tar::EntryType::Symlink);
             header.set_size(0);
             builder.append_link(&mut header, rel, &link)
@@ -131,13 +187,21 @@ struct CapWriter<W> {
     cap: u64,
 }
 
+fn cap_message(cap: u64) -> String {
+    format!(
+        "source exceeds {} MiB; add entries to .dockerignore",
+        cap >> 20
+    )
+}
+
+fn cap_exceeded(cap: u64) -> QuomeError {
+    QuomeError::Usage(cap_message(cap))
+}
+
 impl<W: Write> Write for CapWriter<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if self.n + buf.len() as u64 > self.cap {
-            return Err(io::Error::other(format!(
-                "source exceeds {} MiB; add entries to .dockerignore",
-                self.cap >> 20
-            )));
+            return Err(io::Error::other(cap_message(self.cap)));
         }
         self.n += buf.len() as u64;
         self.w.write(buf)
@@ -817,5 +881,42 @@ mod tests {
         let err = pack_with_cap(dir.path(), 8192).err().expect("must fail");
         assert!(err.to_string().contains("source exceeds"), "{err}");
         assert!(pack_with_cap(dir.path(), 1 << 20).is_ok());
+    }
+
+    #[test]
+    fn list_folder_matches_the_pack_without_needing_a_dockerfile() {
+        let dir = tempfile::tempdir().unwrap();
+        write_tree(
+            dir.path(),
+            &[
+                ("main.go", "x"),
+                ("src/a.go", "x"),
+                ("src/debug.log", "x"),
+                (".dockerignore", "**/*.log\n"),
+            ],
+        );
+        let listed = list_folder(dir.path()).unwrap();
+        let rels: Vec<&str> = listed.iter().map(|(r, _)| r.as_str()).collect();
+        assert_eq!(rels, [".dockerignore", "main.go", "src/a.go"]);
+        let root = fs::canonicalize(dir.path()).unwrap();
+        assert_eq!(listed[2].1, root.join("src/a.go"));
+        assert!(pack_folder(dir.path()).is_err());
+        fs::write(dir.path().join("Dockerfile"), "x").unwrap();
+        let (names, _) = entries(&pack_folder(dir.path()).unwrap());
+        let listed: Vec<String> = list_folder(dir.path())
+            .unwrap()
+            .into_iter()
+            .map(|(r, _)| r)
+            .collect();
+        assert_eq!(names, listed);
+    }
+
+    #[test]
+    fn list_folder_refuses_past_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        write_tree(dir.path(), &[("a", &"x".repeat(4096))]);
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let err = list_with_cap(&root, 2048).err().expect("must fail");
+        assert!(err.to_string().contains("source exceeds"), "{err}");
     }
 }

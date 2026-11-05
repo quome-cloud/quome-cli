@@ -6,7 +6,7 @@ use super::email::{
     ListMessagesArgs, ReadArgs, WaitArgs, LIST_NOTE,
 };
 use super::keys::{AgentKey, KeyStore};
-use super::pack::pack_folder;
+use super::pack::{list_folder, pack_folder};
 use super::state::{CloudState, Profile};
 use crate::errors::QuomeError;
 use base64::Engine;
@@ -279,6 +279,24 @@ pub struct AppConfirmArgs {
     app: String,
     /// Set true to go ahead. Without it nothing changes and you get a preview.
     confirm: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct DeleteAppArgs {
+    /// App name, as given to deploy_app.
+    name: String,
+    /// Set true to go ahead. Without it nothing changes and you get a preview.
+    confirm: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct SyncFolderArgs {
+    /// Sandbox name or id.
+    sandbox: String,
+    /// Local folder to upload.
+    folder: String,
+    /// Sandbox directory to upload into: /workspace or a path under it with no `..` segment. Default /workspace.
+    dest: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -831,6 +849,62 @@ impl QuomeMcp {
     }
 
     #[tool(
+        description = "Upload a local folder into a sandbox under dest (default /workspace), honouring the folder's .dockerignore. Existing files are overwritten; files in the sandbox that are not in the folder are left alone. Returns the file and byte counts."
+    )]
+    async fn sync_folder(
+        &self,
+        Parameters(a): Parameters<SyncFolderArgs>,
+    ) -> Result<String, String> {
+        let dest = a.dest.as_deref().unwrap_or("/workspace");
+        if dest != "/workspace" {
+            check_workspace_path(dest)?;
+        }
+        let folder = std::path::PathBuf::from(&a.folder);
+        let files = tokio::task::spawn_blocking(move || list_folder(&folder))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        // The ignore file only steers what is sent; it is not part of the content.
+        // Symlinks to directories, and dangling ones, have no bytes to send.
+        let files: Vec<_> = files
+            .into_iter()
+            .filter(|(rel, full)| rel != ".dockerignore" && full.is_file())
+            .map(|(rel, full)| {
+                let target = format!("{}/{}", dest.trim_end_matches('/'), rel);
+                (rel, full, target)
+            })
+            .collect();
+        for (_, _, target) in &files {
+            check_workspace_path(target)?;
+        }
+        let id = self.sandbox_id(&a.sandbox).await?;
+        let mut written = 0usize;
+        let mut total = 0usize;
+        for (rel, full, target) in &files {
+            let sent = async {
+                let bytes = tokio::fs::read(full)
+                    .await
+                    .map_err(|e| format!("cannot read {}: {e}", full.display()))?;
+                call!(self, |api| api.upload(&id, target, &bytes))?;
+                Ok::<usize, String>(bytes.len())
+            }
+            .await;
+            match sent {
+                Ok(n) => {
+                    written += 1;
+                    total += n;
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "sync_folder stopped at {rel:?} after {written} file(s): {e}"
+                    ))
+                }
+            }
+        }
+        json(&serde_json::json!({"sandbox": id, "dest": dest, "files": written, "bytes": total}))
+    }
+
+    #[tool(
         description = "Read a text file (up to 1 MiB) from a sandbox. For larger or binary files use exec (for example `base64` or `head`)."
     )]
     async fn read_file(&self, Parameters(a): Parameters<PathArgs>) -> Result<String, String> {
@@ -923,6 +997,24 @@ impl QuomeMcp {
             }),
             "url": live.then(|| self.app_url(&app.name)),
         }))
+    }
+
+    #[tool(
+        description = "Delete a Quome Cloud app you deployed: its service, URL and running container. Without confirm: true it only previews; with it, deletes. This cannot be undone."
+    )]
+    async fn delete_app(&self, Parameters(a): Parameters<DeleteAppArgs>) -> Result<String, String> {
+        let Some(app) = self.find_app(&a.name).await? else {
+            return Err(format!("No app named {:?}.", a.name));
+        };
+        if a.confirm != Some(true) {
+            return json(&serde_json::json!({
+                "app": a.name, "id": app.id, "deleted": false,
+                "warning": "Deleting removes the app, its URL and its running container. This cannot be undone.",
+                "next": "Ask the user, then call delete_app again with confirm: true."}));
+        }
+        let service = call!(self, |api| api.delete_service(&app.id))?;
+        json(&serde_json::json!({
+            "app": a.name, "id": app.id, "deleted": true, "status": service.status}))
     }
 
     #[tool(description = "List the first-party Quome apps you can install, with install status.")]
@@ -1306,6 +1398,8 @@ mod tests {
             "preview",
             "deploy_app",
             "app_status",
+            "delete_app",
+            "sync_folder",
             "list_app_catalog",
             "install_app",
             "list_installed_apps",
@@ -2124,6 +2218,185 @@ mod tests {
         let (err, text) = c.call("app_status", json!({"name":"web"})).await;
         assert!(err);
         assert!(text.contains("No app named"), "{text}");
+    }
+
+    async fn one_app(s: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path(api_path("/services")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"id":"app1","kind":"app","name":"app1","memory_gb":1,"status":"running"}])))
+            .mount(s)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn delete_app_previews_without_confirm() {
+        let (s, mut c) = start().await;
+        one_app(&s).await;
+        let (err, text) = c.call("delete_app", json!({"name":"app1"})).await;
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["deleted"], false);
+        assert_eq!(v["id"], "app1");
+        assert!(v["warning"].as_str().unwrap().contains("cannot be undone"));
+        assert!(!s
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.method.as_str() == "DELETE"));
+    }
+
+    #[tokio::test]
+    async fn delete_app_deletes_with_confirm() {
+        let (s, mut c) = start().await;
+        one_app(&s).await;
+        Mock::given(method("DELETE"))
+            .and(path(api_path("/services/app1")))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!(
+                {"id":"app1","kind":"app","name":"app1","memory_gb":1,"status":"deleting"})))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let (err, text) = c
+            .call("delete_app", json!({"name":"app1","confirm":true}))
+            .await;
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["deleted"], true);
+        assert_eq!(v["status"], "deleting");
+    }
+
+    #[tokio::test]
+    async fn delete_app_unknown_name_sends_nothing() {
+        let (s, mut c) = start().await;
+        one_app(&s).await;
+        let (err, text) = c
+            .call("delete_app", json!({"name":"nope","confirm":true}))
+            .await;
+        assert!(err);
+        assert!(text.contains("No app named"), "{text}");
+        assert!(!s
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.method.as_str() == "DELETE"));
+    }
+
+    fn sync_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "aaa").unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/b.txt"), "bbbbb").unwrap();
+        std::fs::write(dir.path().join(".dockerignore"), "ignored.txt\n").unwrap();
+        std::fs::write(dir.path().join("ignored.txt"), "no").unwrap();
+        dir
+    }
+
+    fn puts(reqs: &[wiremock::Request]) -> Vec<String> {
+        reqs.iter()
+            .filter(|r| r.method.as_str() == "PUT")
+            .filter_map(|r| {
+                r.url
+                    .query_pairs()
+                    .find(|(k, _)| k == "path")
+                    .map(|(_, v)| v.into_owned())
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn sync_folder_uploads_each_file_under_dest() {
+        use wiremock::matchers::query_param;
+        let (s, mut c) = start().await;
+        let dir = sync_dir();
+        for p in ["/workspace/app/a.txt", "/workspace/app/sub/b.txt"] {
+            Mock::given(method("PUT"))
+                .and(path(api_path(&format!("/sandboxes/{SB}/workspace-files"))))
+                .and(query_param("path", p))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+                .expect(1)
+                .mount(&s)
+                .await;
+        }
+        let (err, text) = c
+            .call(
+                "sync_folder",
+                json!({"sandbox": SB, "folder": dir.path(), "dest": "/workspace/app"}),
+            )
+            .await;
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["files"], 2);
+        assert_eq!(v["bytes"], 3 + 5);
+        assert_eq!(v["dest"], "/workspace/app");
+        let sent = puts(&s.received_requests().await.unwrap());
+        assert!(!sent.iter().any(|p| p.contains("ignored.txt")), "{sent:?}");
+        assert!(
+            !sent.iter().any(|p| p.contains(".dockerignore")),
+            "{sent:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_folder_refuses_bad_dest() {
+        let (s, mut c) = start().await;
+        let dir = sync_dir();
+        for dest in ["/etc", "/workspace/../x"] {
+            let (err, text) = c
+                .call(
+                    "sync_folder",
+                    json!({"sandbox": SB, "folder": dir.path(), "dest": dest}),
+                )
+                .await;
+            assert!(err, "{dest}");
+            assert!(text.contains("Refusing"), "{text}");
+        }
+        assert!(s.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sync_folder_empty_folder() {
+        let (s, mut c) = start().await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".dockerignore"), "*\n").unwrap();
+        let (err, text) = c
+            .call("sync_folder", json!({"sandbox": SB, "folder": dir.path()}))
+            .await;
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["files"], 0);
+        assert_eq!(v["dest"], "/workspace");
+        assert!(puts(&s.received_requests().await.unwrap()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn sync_folder_reports_the_failing_file() {
+        use wiremock::matchers::query_param;
+        let (s, mut c) = start().await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "aaa").unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/b.txt"), "bbbbb").unwrap();
+        Mock::given(method("PUT"))
+            .and(query_param("path", "/workspace/a.txt"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&s)
+            .await;
+        Mock::given(method("PUT"))
+            .and(query_param("path", "/workspace/sub/b.txt"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&s)
+            .await;
+        let (err, text) = c
+            .call("sync_folder", json!({"sandbox": SB, "folder": dir.path()}))
+            .await;
+        assert!(err);
+        assert!(
+            text.contains("stopped at \"sub/b.txt\" after 1 file"),
+            "{text}"
+        );
     }
 
     async fn catalog(s: &MockServer) {

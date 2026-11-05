@@ -28,11 +28,13 @@ Sandbox and app arguments marked "name or id" accept either. Email `address` arg
 | `stop_sandbox` | `sandbox` | Stops a sandbox (name or id). |
 | `exec` | `sandbox`, `command`, `timeout_s?` | Runs a shell command in the sandbox's `/workspace`. Returns `exit_code`, `stdout`, `stderr`, `truncated`. `timeout_s` is clamped to 1-25; default 25. |
 | `write_file` | `sandbox`, `path`, `content?`, `content_base64?` | Writes a file. `path` must be absolute, under `/workspace/`, with no `..` segment. Give exactly one of `content` (text) or `content_base64` (binary). |
+| `sync_folder` | `sandbox`, `folder`, `dest?` | Uploads a local folder into the sandbox under `dest` (default `/workspace`; otherwise a path under `/workspace/` with no `..` segment), honouring the folder's `.dockerignore`. The `.dockerignore` itself is not uploaded. Existing files are overwritten; files in the sandbox that are not in the folder are left alone. Returns `files` and `bytes`. On a failed upload it names the file it stopped at and how many were written before it. |
 | `read_file` | `sandbox`, `path` | Reads a text file, up to 1 MiB. For larger or binary files use `exec` (for example `base64` or `head`). |
 | `list_files` | `sandbox`, `path?` | Lists a directory; default `/workspace`. |
 | `preview` | `sandbox`, `port` | Returns a public preview URL for a port the sandbox is serving. |
 | `deploy_app` | `name`, `folder`, `memory_gb?` | Deploys a local folder containing a Dockerfile as a Quome Cloud app and waits for it to run. `memory_gb` as above; default 1. |
 | `app_status` | `name` | Shows an app's state by name, with its latest build (`build_id`, `status`, `error`). The `url` is given only once a build has succeeded. |
+| `delete_app` | `name`, `confirm?` | Without `confirm: true`, previews. With it, deletes an app you deployed: its service, URL and running container. This cannot be undone. |
 | `list_app_catalog` | | Lists the first-party Quome apps you can install, with install status. |
 | `install_app` | `app`, `confirm?` | Without `confirm: true`, previews the billing and changes nothing. With it, installs the app and waits (up to 10 minutes) until it runs; returns `status`, `url` and `next`. |
 | `list_installed_apps` | | Lists this org's installed apps and their status. |
@@ -74,6 +76,8 @@ tail -n 20 /tmp/dev.log                      # a later exec call: check on it
 | `failed` | The build failed (`error` has the tail), or it built but the new revision did not start (`service_status`). `note` names the build log route; check that the container listens on `$PORT`. |
 | `building` | Still building after 10 minutes. Check later with `app_status`. |
 | `deploying` | Built, but still rolling out after 10 minutes. Check later with `app_status`. |
+
+To remove a deployed app, call `delete_app` with its name; it previews first and deletes only with `confirm: true`.
 
 ### Email
 
