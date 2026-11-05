@@ -295,6 +295,16 @@ pub fn auth_hint(e: &str) -> String {
         "Registering an external client needs credit on the org's billing.".into()
     } else if has("503") && has("auth_starting") {
         "The auth instance is waking up; try again in a few seconds.".into()
+    } else if has("lockout_confirmation_required") {
+        format!("{e}\nRe-run with confirm_lockout: true to proceed.")
+    } else if has("prune_would_remove_tracked_clients") {
+        format!("{e}\nPruning would remove clients the platform tracks; unlink those apps first or run without prune.")
+    } else if has("client_bound_elsewhere") {
+        format!("{e}\nThose clients are bound to another app; unlink them there first.")
+    } else if has("client_id_taken_by_external") {
+        format!("{e}\nThat client_id belongs to an External client; pick another client_id.")
+    } else if has("auth_apply_incomplete") {
+        format!("{e}\nThe promote stopped part-way; the listed clients were not applied. Fix the cause and run it again.")
     } else if has("sandbox_only") {
         "This tool works only on the sandbox environment.".into()
     } else {

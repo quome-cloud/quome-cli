@@ -605,6 +605,51 @@ impl AuthAgentsAction {
     }
 }
 
+#[derive(Deserialize, JsonSchema, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthConfigAction {
+    /// Export the instance's configuration as a document.
+    Export,
+    /// Show what applying a document would change.
+    Diff,
+    /// Apply a document to the instance.
+    Apply,
+}
+
+impl AuthConfigAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            AuthConfigAction::Export => "export",
+            AuthConfigAction::Diff => "diff",
+            AuthConfigAction::Apply => "apply",
+        }
+    }
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct AuthConfigArgs {
+    /// What to do: export, diff or apply.
+    action: AuthConfigAction,
+    /// `sandbox` or `prod`. Default sandbox.
+    env: Option<String>,
+    /// The configuration document, as export returns it (diff, apply).
+    doc: Option<serde_json::Value>,
+    /// Remove what the document leaves out. Default false (diff, apply).
+    prune: Option<bool>,
+    /// Set true to apply a change that could lock users or admins out (diff, apply).
+    confirm_lockout: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct AuthPromoteArgs {
+    /// Set true to apply; default false only previews the diff.
+    apply: Option<bool>,
+    /// Remove prod config the sandbox does not have. Default false.
+    prune: Option<bool>,
+    /// Set true to proceed when the change could lock users or admins out.
+    confirm_lockout: Option<bool>,
+}
+
 /// The fields `client_upsert` takes; an update replaces every one of them.
 const CLIENT_UPSERT_FIELDS: [&str; 9] = [
     "client_id",
@@ -1275,6 +1320,37 @@ impl QuomeMcp {
         }
     }
 
+    async fn auth_config_run(&self, a: AuthConfigArgs) -> Result<serde_json::Value, String> {
+        use serde_json::json;
+        let env = a.env.as_deref().unwrap_or("sandbox");
+        check_env(env)?;
+        let (scope, tool) = match a.action {
+            AuthConfigAction::Export => {
+                return self
+                    .auth_call(env, Scope::Read, "config_export", json!({}))
+                    .await;
+            }
+            AuthConfigAction::Diff => (Scope::Read, "config_diff"),
+            AuthConfigAction::Apply => (Scope::Write, "config_apply"),
+        };
+        let doc = needs(a.doc, "doc", a.action.as_str())?;
+        let args = json!({
+            "doc": doc,
+            "prune": a.prune.unwrap_or(false),
+            "confirm_lockout": a.confirm_lockout.unwrap_or(false),
+        });
+        self.auth_call(env, scope, tool, args).await
+    }
+
+    async fn auth_promote_run(&self, a: AuthPromoteArgs) -> Result<serde_json::Value, String> {
+        let (apply, prune, confirm) = (
+            a.apply.unwrap_or(false),
+            a.prune.unwrap_or(false),
+            a.confirm_lockout.unwrap_or(false),
+        );
+        call!(self, |api| api.auth_promote(apply, prune, confirm)).map_err(|e| auth_hint(&e))
+    }
+
     async fn auth_agents_run(&self, a: AuthAgentsArgs) -> Result<serde_json::Value, String> {
         use serde_json::json;
         let env = a.env.as_deref().unwrap_or("sandbox");
@@ -1833,6 +1909,26 @@ impl QuomeMcp {
     ) -> Result<String, String> {
         json(&self.auth_agents_run(a).await?)
     }
+
+    #[tool(
+        description = "Export, diff or apply the org's auth configuration on env (default sandbox). action `export` returns a config document (no secrets); `diff` (doc, optional prune) shows what applying would change; `apply` does it and returns any newly minted client secrets once. A change that could lock users out needs confirm_lockout: true."
+    )]
+    async fn auth_config(
+        &self,
+        Parameters(a): Parameters<AuthConfigArgs>,
+    ) -> Result<String, String> {
+        json(&self.auth_config_run(a).await?)
+    }
+
+    #[tool(
+        description = "Promote the sandbox auth config to prod. Without apply: true it only previews the diff. Returns the diff, which clients got linked, lockout risks and missing secrets. A change that could lock users out needs confirm_lockout: true."
+    )]
+    async fn auth_promote(
+        &self,
+        Parameters(a): Parameters<AuthPromoteArgs>,
+    ) -> Result<String, String> {
+        json(&self.auth_promote_run(a).await?)
+    }
 }
 
 #[tool_handler(
@@ -1995,6 +2091,8 @@ mod tests {
             "auth_users",
             "auth_roles",
             "auth_agents",
+            "auth_config",
+            "auth_promote",
         ];
         want.sort();
         assert_eq!(names, want);
@@ -4762,5 +4860,163 @@ mod tests {
             .await;
         assert!(err);
         assert!(text.contains("`create` needs `scopes`"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn auth_config_apply_surfaces_minted_secrets() {
+        let (s, mut c) = start().await;
+        mount_auth_broker_scope(&s, "sandbox", json!(["auth_read"])).await;
+        mount_auth_broker_scope(&s, "sandbox", json!(["auth_read", "auth_sandbox_write"])).await;
+        mount_instance_tool(&s, "sandbox", "config_export", json!({"clients": []})).await;
+        mount_instance_tool(&s, "sandbox", "config_diff", json!({"added": []})).await;
+        Mock::given(method("POST"))
+            .and(path("/mcp/sandbox"))
+            .and(wiremock::matchers::body_partial_json(
+                json!({"params": {"name": "config_apply"}}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0", "id": 1,
+                "result": {
+                    "content": [{"type": "text", "text": "auth_apply_incomplete: 1 of 2 clients applied"}],
+                    "structuredContent": {
+                        "error": "auth_apply_incomplete",
+                        "error_description": "stopped",
+                        "new_client_secrets": [{"client_id": "web", "client_secret": "SECRET-XYZ"}]
+                    },
+                    "isError": true
+                }
+            })))
+            .mount(&s)
+            .await;
+
+        let (err, text) = c.call("auth_config", json!({"action": "export"})).await;
+        assert!(!err, "{text}");
+        let doc = json!({"clients": [{"client_id": "web"}]});
+        let (err, _) = c
+            .call(
+                "auth_config",
+                json!({"action": "diff", "doc": doc, "prune": true}),
+            )
+            .await;
+        assert!(!err);
+        let (err, text) = c.call("auth_config", json!({"action": "diff"})).await;
+        assert!(err);
+        assert!(text.contains("`diff` needs `doc`"), "{text}");
+
+        let (err, text) = c
+            .call("auth_config", json!({"action": "apply", "doc": doc}))
+            .await;
+        assert!(err);
+        assert!(text.contains("SECRET-XYZ"), "{text}");
+        assert!(text.contains("new_client_secrets"), "{text}");
+
+        let reqs = s.received_requests().await.unwrap();
+        assert_eq!(
+            rpc_args(&reqs, "config_diff")[0],
+            json!({"doc": doc, "prune": true, "confirm_lockout": false})
+        );
+        assert_eq!(rpc_args(&reqs, "config_export"), vec![json!({})]);
+    }
+
+    #[tokio::test]
+    async fn auth_config_apply_lockout_error_says_confirm() {
+        let (s, mut c) = start().await;
+        mount_auth_broker_scope(&s, "sandbox", json!(["auth_read", "auth_sandbox_write"])).await;
+        Mock::given(method("POST"))
+            .and(path("/mcp/sandbox"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0", "id": 1,
+                "result": {"content": [{"type": "text",
+                    "text": "lockout_confirmation_required: removes the last admin"}],
+                    "isError": true}
+            })))
+            .mount(&s)
+            .await;
+        let (err, text) = c
+            .call("auth_config", json!({"action": "apply", "doc": {}}))
+            .await;
+        assert!(err);
+        assert!(text.contains("removes the last admin"), "{text}");
+        assert!(
+            text.contains("Re-run with confirm_lockout: true to proceed."),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_promote_lockout_409_explains_confirm() {
+        let (s, mut c) = start().await;
+        Mock::given(method("POST"))
+            .and(path(api_path("/auth/promote")))
+            .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+                "detail": "Promote would lock users out",
+                "reason": "lockout_confirmation_required",
+                "lockout_risks": ["removes role admin from 3 users"]
+            })))
+            .mount(&s)
+            .await;
+        let (err, text) = c.call("auth_promote", json!({"apply": true})).await;
+        assert!(err);
+        assert!(text.contains("removes role admin from 3 users"), "{text}");
+        assert!(
+            text.contains("Re-run with confirm_lockout: true to proceed."),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_promote_conflicts_keep_client_ids() {
+        let (s, mut c) = start().await;
+        Mock::given(method("POST"))
+            .and(path(api_path("/auth/promote")))
+            .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+                "detail": "bound", "reason": "client_bound_elsewhere",
+                "client_ids": ["web-1"]
+            })))
+            .mount(&s)
+            .await;
+        let (err, text) = c.call("auth_promote", json!({})).await;
+        assert!(err);
+        assert!(text.contains("client_bound_elsewhere"), "{text}");
+        assert!(text.contains("web-1"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn auth_promote_apply_passes_body() {
+        let (s, mut c) = start().await;
+        Mock::given(method("POST"))
+            .and(path(api_path("/auth/promote")))
+            .and(wiremock::matchers::body_json(
+                json!({"apply": true, "prune": true, "confirm_lockout": true}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "diff": {"added": []}, "applied": true,
+                "clients": [{"client_id": "web", "linked": true}],
+                "lockout_risks": [], "missing_secrets": [], "prod_started": true
+            })))
+            .expect(1)
+            .mount(&s)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(api_path("/auth/promote")))
+            .and(wiremock::matchers::body_json(
+                json!({"apply": false, "prune": false, "confirm_lockout": false}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"applied": false})))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let (err, text) = c
+            .call(
+                "auth_promote",
+                json!({"apply": true, "prune": true, "confirm_lockout": true}),
+            )
+            .await;
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["applied"], true);
+        assert_eq!(v["clients"][0]["client_id"], "web");
+        let (err, text) = c.call("auth_promote", json!({})).await;
+        assert!(!err, "{text}");
     }
 }

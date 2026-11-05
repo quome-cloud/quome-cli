@@ -411,13 +411,39 @@ fn map_error(status: u16, text: &str) -> QuomeError {
     }
 }
 
-async fn check(resp: Response) -> Result<Response, QuomeError> {
+async fn check(resp: Response, map: fn(u16, &str) -> QuomeError) -> Result<Response, QuomeError> {
     let status = resp.status();
     if status.is_success() {
         return Ok(resp);
     }
     let text = resp.text().await.unwrap_or_default();
-    Err(map_error(status.as_u16(), &text))
+    Err(map(status.as_u16(), &text))
+}
+
+/// Like `map_error`, but a 409 or 502 keeps the body's extra fields (such as
+/// `lockout_risks` or `client_ids`) as pretty JSON after the message.
+fn map_error_keeping_body(status: u16, text: &str) -> QuomeError {
+    let e = map_error(status, text);
+    if !matches!(status, 409 | 502) {
+        return e;
+    }
+    let mut v: serde_json::Value = serde_json::from_str(text).unwrap_or_default();
+    let Some(obj) = v.as_object_mut() else {
+        return e;
+    };
+    for k in ["detail", "reason", "message"] {
+        obj.remove(k);
+    }
+    if let Some(serde_json::Value::Object(extra)) = obj.remove("extra") {
+        obj.extend(extra);
+    }
+    match e {
+        QuomeError::ApiError(m) if !obj.is_empty() => QuomeError::ApiError(format!(
+            "{m}\n{}",
+            serde_json::to_string_pretty(&v).unwrap_or_default()
+        )),
+        e => e,
+    }
 }
 
 impl CloudApi {
@@ -457,6 +483,17 @@ impl CloudApi {
         path: &str,
         build: impl Fn(RequestBuilder) -> RequestBuilder,
     ) -> Result<Response, QuomeError> {
+        self.send_mapping(m, path, build, map_error).await
+    }
+
+    /// `send` with a custom mapping of error answers.
+    async fn send_mapping(
+        &self,
+        m: Method,
+        path: &str,
+        build: impl Fn(RequestBuilder) -> RequestBuilder,
+        map: fn(u16, &str) -> QuomeError,
+    ) -> Result<Response, QuomeError> {
         let url = format!("{}{}", self.base, path);
         let mut retried = false;
         loop {
@@ -465,7 +502,7 @@ impl CloudApi {
                 .send()
                 .await?;
             if resp.status().as_u16() != 401 {
-                return check(resp).await;
+                return check(resp, map).await;
             }
             let text = resp.text().await.unwrap_or_default();
             let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
@@ -907,6 +944,25 @@ impl CloudApi {
             |b| b.json(&body),
         )
         .await
+    }
+
+    /// Promote the sandbox auth config to prod (`apply: false` previews the
+    /// diff). A 409 or 502 error keeps the body's `lockout_risks` / `client_ids`.
+    pub async fn auth_promote(
+        &self,
+        apply: bool,
+        prune: bool,
+        confirm_lockout: bool,
+    ) -> Result<serde_json::Value, QuomeError> {
+        let body = serde_json::json!({
+            "apply": apply, "prune": prune, "confirm_lockout": confirm_lockout,
+        });
+        let p = self.org_path("/auth/promote");
+        Ok(self
+            .send_mapping(Method::POST, &p, |b| b.json(&body), map_error_keeping_body)
+            .await?
+            .json()
+            .await?)
     }
 
     pub async fn create_app(&self, name: &str, memory_gb: f64) -> Result<Service, QuomeError> {
