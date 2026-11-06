@@ -34,6 +34,27 @@ pub struct Me {
     pub api_origin: String,
 }
 
+/// Size and usage of an agent's private pod in a Quome Cloud cache.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct PodInfo {
+    pub namespace: String,
+    pub maxmemory: u64,
+    pub used_memory: u64,
+    pub keys: u64,
+    pub facts: u64,
+    pub maxfacts: u64,
+    pub connected_clients: u64,
+}
+
+/// One remembered fact in a pod.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct Fact {
+    pub id: u64,
+    pub body: String,
+    pub tags: Vec<String>,
+    pub ts: i64,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct Port {
     pub port: u16,
@@ -1207,6 +1228,123 @@ impl CloudApi {
             .await?)
     }
 
+    fn pod_path(&self, cache: &str, rest: &str) -> String {
+        self.org_path(&format!("/caches/{}/my-pod{}", enc(cache), rest))
+    }
+
+    /// Size and usage of the caller's pod in a cache (name or id).
+    pub async fn cache_pod(&self, cache: &str) -> Result<PodInfo, QuomeError> {
+        self.json(Method::GET, &self.pod_path(cache, ""), |b| b)
+            .await
+    }
+
+    /// Store a tagged fact in the pod; returns its id.
+    pub async fn cache_remember(
+        &self,
+        cache: &str,
+        text: &str,
+        tags: &[String],
+    ) -> Result<u64, QuomeError> {
+        let body = serde_json::json!({"text": text, "tags": tags});
+        #[derive(Deserialize)]
+        struct Reply {
+            id: u64,
+        }
+        let r: Reply = self
+            .json(Method::POST, &self.pod_path(cache, "/remember"), |b| {
+                b.json(&body)
+            })
+            .await?;
+        Ok(r.id)
+    }
+
+    /// Facts carrying the given tags, newest first; `topk` caps the count.
+    pub async fn cache_recall(
+        &self,
+        cache: &str,
+        tags: &[String],
+        topk: Option<u32>,
+    ) -> Result<Vec<Fact>, QuomeError> {
+        #[derive(Deserialize)]
+        struct Reply {
+            facts: Vec<Fact>,
+        }
+        let mut body = serde_json::json!({"tags": tags});
+        if let Some(k) = topk {
+            body["topk"] = k.into();
+        }
+        let r: Reply = self
+            .json(Method::POST, &self.pod_path(cache, "/recall"), |b| {
+                b.json(&body)
+            })
+            .await?;
+        Ok(r.facts)
+    }
+
+    /// Delete a fact by id; false when there was none.
+    pub async fn cache_forget(&self, cache: &str, id: u64) -> Result<bool, QuomeError> {
+        #[derive(Deserialize)]
+        struct Reply {
+            forgotten: bool,
+        }
+        let body = serde_json::json!({"id": id});
+        let r: Reply = self
+            .json(Method::POST, &self.pod_path(cache, "/forget"), |b| {
+                b.json(&body)
+            })
+            .await?;
+        Ok(r.forgotten)
+    }
+
+    /// Read a key from the pod; `None` when it is not set.
+    pub async fn cache_get(&self, cache: &str, key: &str) -> Result<Option<String>, QuomeError> {
+        #[derive(Deserialize)]
+        struct Reply {
+            value: Option<String>,
+        }
+        let body = serde_json::json!({"key": key});
+        let r: Reply = self
+            .json(Method::POST, &self.pod_path(cache, "/get"), |b| {
+                b.json(&body)
+            })
+            .await?;
+        Ok(r.value)
+    }
+
+    /// Write a key in the pod, optionally expiring after `ttl` seconds.
+    pub async fn cache_set(
+        &self,
+        cache: &str,
+        key: &str,
+        value: &str,
+        ttl: Option<u64>,
+    ) -> Result<(), QuomeError> {
+        let mut body = serde_json::json!({"key": key, "value": value});
+        if let Some(t) = ttl {
+            body["ttl"] = t.into();
+        }
+        self.send(Method::POST, &self.pod_path(cache, "/set"), |b| {
+            b.json(&body)
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Delete a key from the pod; false when it was not set.
+    pub async fn cache_del(&self, cache: &str, key: &str) -> Result<bool, QuomeError> {
+        #[derive(Deserialize)]
+        struct Reply {
+            deleted: bool,
+        }
+        let body = serde_json::json!({"key": key});
+        let r: Reply = self
+            .json(Method::POST, &self.pod_path(cache, "/del"), |b| {
+                b.json(&body)
+            })
+            .await?;
+        Ok(r.deleted)
+    }
+
     pub async fn create_app(&self, name: &str, memory_gb: f64) -> Result<Service, QuomeError> {
         check_name_size(name, memory_gb)?;
         let body = serde_json::json!({"kind": "app", "name": name, "memory_gb": memory_gb});
@@ -1404,7 +1542,7 @@ mod tests {
     use super::super::auth::tests::profile;
     use super::super::keys::AgentKey;
     use super::*;
-    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::matchers::{body_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const ORG: &str = "11111111-1111-1111-1111-111111111111";
@@ -2592,5 +2730,182 @@ mod tests {
             QuomeError::ApiError(m) => assert_eq!(m, "503 unavailable: git_starting"),
             e => panic!("{e:?}"),
         }
+    }
+
+    fn pod_mock(verb: &str, rest: &str, body: serde_json::Value, reply: serde_json::Value) -> Mock {
+        let m = Mock::given(method(verb))
+            .and(path(format!("/api/v1/orgs/{ORG}/caches/mem/my-pod{rest}")));
+        let m = if verb == "POST" {
+            m.and(body_json(body))
+        } else {
+            m
+        };
+        m.respond_with(ResponseTemplate::new(200).set_body_json(reply))
+    }
+
+    #[tokio::test]
+    async fn cache_pod_reads_usage() {
+        let (s, api) = setup().await;
+        pod_mock(
+            "GET",
+            "",
+            serde_json::Value::Null,
+            serde_json::json!({"namespace":"n1","maxmemory":100,"used_memory":10,"keys":2,
+                "facts":3,"maxfacts":50,"connected_clients":1}),
+        )
+        .mount(&s)
+        .await;
+        let p = api.cache_pod("mem").await.unwrap();
+        assert_eq!(p.namespace, "n1");
+        assert_eq!((p.maxmemory, p.used_memory, p.keys), (100, 10, 2));
+        assert_eq!((p.facts, p.maxfacts, p.connected_clients), (3, 50, 1));
+    }
+
+    #[tokio::test]
+    async fn cache_remember_sends_text_and_tags() {
+        let (s, api) = setup().await;
+        pod_mock(
+            "POST",
+            "/remember",
+            serde_json::json!({"text":"likes tea","tags":["pref","a"]}),
+            serde_json::json!({"id": 7}),
+        )
+        .mount(&s)
+        .await;
+        let id = api
+            .cache_remember("mem", "likes tea", &["pref".into(), "a".into()])
+            .await
+            .unwrap();
+        assert_eq!(id, 7);
+    }
+
+    #[tokio::test]
+    async fn cache_recall_omits_topk_unless_given() {
+        let (s, api) = setup().await;
+        let fact = serde_json::json!({"id":1,"body":"b","tags":["t"],"ts":1730000000});
+        pod_mock(
+            "POST",
+            "/recall",
+            serde_json::json!({"tags":["t"]}),
+            serde_json::json!({"facts":[fact]}),
+        )
+        .mount(&s)
+        .await;
+        let facts = api.cache_recall("mem", &["t".into()], None).await.unwrap();
+        assert_eq!(
+            facts,
+            vec![Fact {
+                id: 1,
+                body: "b".into(),
+                tags: vec!["t".into()],
+                ts: 1730000000
+            }]
+        );
+        pod_mock(
+            "POST",
+            "/recall",
+            serde_json::json!({"tags":[],"topk":5}),
+            serde_json::json!({"facts":[]}),
+        )
+        .mount(&s)
+        .await;
+        assert!(api
+            .cache_recall("mem", &[], Some(5))
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn cache_forget_reports_whether_found() {
+        let (s, api) = setup().await;
+        pod_mock(
+            "POST",
+            "/forget",
+            serde_json::json!({"id":9}),
+            serde_json::json!({"forgotten": true}),
+        )
+        .mount(&s)
+        .await;
+        assert!(api.cache_forget("mem", 9).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn cache_get_returns_value_or_none() {
+        let (s, api) = setup().await;
+        pod_mock(
+            "POST",
+            "/get",
+            serde_json::json!({"key":"a"}),
+            serde_json::json!({"value": "v"}),
+        )
+        .mount(&s)
+        .await;
+        pod_mock(
+            "POST",
+            "/get",
+            serde_json::json!({"key":"b"}),
+            serde_json::json!({"value": null}),
+        )
+        .mount(&s)
+        .await;
+        assert_eq!(
+            api.cache_get("mem", "a").await.unwrap().as_deref(),
+            Some("v")
+        );
+        assert_eq!(api.cache_get("mem", "b").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn cache_set_omits_ttl_unless_given() {
+        let (s, api) = setup().await;
+        pod_mock(
+            "POST",
+            "/set",
+            serde_json::json!({"key":"k","value":"v"}),
+            serde_json::json!({"ok": true}),
+        )
+        .mount(&s)
+        .await;
+        pod_mock(
+            "POST",
+            "/set",
+            serde_json::json!({"key":"k","value":"v","ttl":60}),
+            serde_json::json!({"ok": true}),
+        )
+        .mount(&s)
+        .await;
+        api.cache_set("mem", "k", "v", None).await.unwrap();
+        api.cache_set("mem", "k", "v", Some(60)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cache_del_reports_whether_deleted() {
+        let (s, api) = setup().await;
+        pod_mock(
+            "POST",
+            "/del",
+            serde_json::json!({"key":"k"}),
+            serde_json::json!({"deleted": false}),
+        )
+        .mount(&s)
+        .await;
+        assert!(!api.cache_del("mem", "k").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn cache_name_is_percent_encoded() {
+        let (s, api) = setup().await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/api/v1/orgs/{ORG}/caches/my%20cache%2F1/my-pod"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"namespace":"n","maxmemory":1,"used_memory":0,"keys":0,
+                    "facts":0,"maxfacts":1,"connected_clients":0}),
+            ))
+            .mount(&s)
+            .await;
+        api.cache_pod("my cache/1").await.unwrap();
     }
 }
