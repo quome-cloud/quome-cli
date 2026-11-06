@@ -109,15 +109,14 @@ pub fn answer(token: &GitToken, now_unix: u64) -> String {
     )
 }
 
-/// The text for git's stdout, or `None` for nothing. `git_base` redirects the
-/// git server (tests only).
+/// The text for git's stdout, or `None` for nothing. `now_unix` reads the
+/// clock (Unix seconds).
 pub async fn run(
     home: &Path,
     store: &dyn KeyStore,
     args: &Args,
     input: &str,
-    now_unix: u64,
-    git_base: Option<String>,
+    now_unix: &dyn Fn() -> u64,
 ) -> Result<Option<String>> {
     if args.action != "get" {
         return Ok(None);
@@ -130,15 +129,13 @@ pub async fn run(
     let p = Arc::new(profile.clone());
     let (key, vrc) = AgentKey::load_from(store, &name)?;
     let api = Arc::new(CloudApi::new(&p, TokenSource::new(&p, key, vrc)));
-    let mut git = GitClient::new(Arc::new(move || (api.clone(), p.clone())));
-    if let Some(base) = git_base {
-        git = git.with_server_base(base);
-    }
+    let git = GitClient::new(Arc::new(move || (api.clone(), p.clone())));
     let token = git
         .credential_token()
         .await
         .map_err(|e| QuomeError::Usage(e.message()))?;
-    Ok(Some(answer(&token, now_unix)))
+    // Read the clock after the mint, which may have waited for the server.
+    Ok(Some(answer(&token, now_unix())))
 }
 
 pub async fn execute(args: Args) -> Result<()> {
@@ -148,11 +145,13 @@ pub async fn execute(args: Args) -> Result<()> {
     let home = dirs::home_dir()
         .ok_or_else(|| QuomeError::CloudState("cannot find home directory".into()))?;
     let store = platform_store()?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    if let Some(out) = run(&home, store.as_ref(), &args, &input, now, None).await? {
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    };
+    if let Some(out) = run(&home, store.as_ref(), &args, &input, &now).await? {
         print!("{out}");
     }
     Ok(())
@@ -344,7 +343,7 @@ mod tests {
     }
 
     async fn get(e: &Env, input: &str) -> Result<Option<String>> {
-        run(e.home.path(), &e.store, &args("get"), input, 1_000, None).await
+        run(e.home.path(), &e.store, &args("get"), input, &|| 1_000).await
     }
 
     #[tokio::test]
@@ -362,6 +361,34 @@ mod tests {
             out.as_deref(),
             Some("username=quome\npassword=G1\npassword_expiry_utc=1300\n")
         );
+    }
+
+    /// Answers with a token and moves the shared clock to 5000.
+    struct MintAt(Arc<std::sync::atomic::AtomicU64>);
+
+    impl wiremock::Respond for MintAt {
+        fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+            self.0.store(5_000, std::sync::atomic::Ordering::SeqCst);
+            token("G1")
+        }
+    }
+
+    #[tokio::test]
+    async fn expiry_counts_from_after_the_mint() {
+        let e = env().await;
+        let clock = Arc::new(std::sync::atomic::AtomicU64::new(1_000));
+        Mock::given(method("POST"))
+            .and(path(broker()))
+            .respond_with(MintAt(clock.clone()))
+            .expect(1)
+            .mount(&e.server)
+            .await;
+        let now = || clock.load(std::sync::atomic::Ordering::SeqCst);
+        let out = run(e.home.path(), &e.store, &args("get"), INPUT, &now)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(out.ends_with("password_expiry_utc=5300\n"), "{out}");
     }
 
     #[tokio::test]
@@ -430,7 +457,7 @@ mod tests {
     async fn store_and_erase_do_nothing() {
         let e = env().await;
         for action in ["store", "erase", "bogus"] {
-            let out = run(e.home.path(), &e.store, &args(action), INPUT, 1_000, None)
+            let out = run(e.home.path(), &e.store, &args(action), INPUT, &|| 1_000)
                 .await
                 .unwrap();
             assert!(out.is_none(), "{action}");
