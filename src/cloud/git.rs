@@ -141,6 +141,11 @@ impl GitError {
                 if status == 404 && code == "not_found" {
                     return NOT_FOUND_HINT.into();
                 }
+                // A known code decides the hint, not words inside the message.
+                let by_code = git_hint(&code);
+                if by_code != code {
+                    return by_code;
+                }
                 git_hint(format!("The org's git server answered {status} {code}: {message}").trim())
             }
             GitError::Unreachable(m) | GitError::Usage(m) => m,
@@ -181,6 +186,23 @@ pub fn git_hint(e: &str) -> String {
         "Quome Cloud could not issue a Git token; try again in a few seconds.".into()
     } else if has("repo_exists") {
         "A repo with that name already exists.".into()
+    } else if has("protected_branch") {
+        "main takes changes only through a pull request: commit to another branch and open one with git_pr.".into()
+    } else if has("base_not_found") {
+        "That base_branch does not exist.".into()
+    } else if has("quota_exceeded") {
+        "The org's Git storage is full.".into()
+    } else if has("too_many_ops") || has("blob_too_large") {
+        "A commit takes at most 1000 changes and files up to 10 MiB.".into()
+    } else if has("source_moved") {
+        "The PR's branch moved since you reviewed it; get the PR again and review its new head."
+            .into()
+    } else if has("approvals_required") {
+        "This PR needs an approval from a different person before it can merge.".into()
+    } else if has("pr_not_open") {
+        "That PR is not open.".into()
+    } else if has("merge_conflict") {
+        "The branches conflict; update the source branch, then merge.".into()
     } else if has("image_unpinned") {
         "Git is not available for this org yet.".into()
     } else {
@@ -502,6 +524,136 @@ pub struct GitCloneUrlArgs {
     pub repo: String,
 }
 
+/// One change in a commit.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(tag = "op", rename_all = "lowercase")]
+pub enum Change {
+    /// Create or replace a file. Give exactly one of content (text) or content_base64.
+    Put {
+        /// File path in the repo.
+        path: String,
+        /// The file's text (UTF-8).
+        content: Option<String>,
+        /// The file's bytes, standard base64 (for binary files).
+        content_base64: Option<String>,
+    },
+    /// Delete a file.
+    Delete {
+        /// File path in the repo.
+        path: String,
+    },
+    /// Move or rename a file.
+    Move {
+        /// Current path.
+        from: String,
+        /// New path.
+        to: String,
+    },
+}
+
+/// Arguments of `git_commit`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct GitCommitArgs {
+    /// Repo name, or <org>/<name>.
+    pub repo: String,
+    /// Branch to commit onto. Default main; a new branch needs base_branch.
+    pub branch: Option<String>,
+    /// Branch to start a new branch from (ignored when the branch exists).
+    pub base_branch: Option<String>,
+    /// The head you expect the branch to have (40 hex); the commit is refused if it moved.
+    pub expect_head: Option<String>,
+    /// Commit message.
+    pub message: String,
+    /// The changes, applied together as one commit (at most 1000).
+    pub changes: Vec<Change>,
+}
+
+/// What `git_pr` does.
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum PrAction {
+    /// Open a pull request.
+    Open,
+    /// List pull requests.
+    List,
+    /// Read one pull request.
+    Get,
+    /// Approve or request changes.
+    Review,
+    /// Add a comment.
+    Comment,
+    /// Merge a pull request.
+    Merge,
+    /// Close a pull request without merging.
+    Close,
+}
+
+/// A review's outcome.
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    /// The changes are good to merge.
+    Approve,
+    /// The changes need work first.
+    RequestChanges,
+}
+
+impl Verdict {
+    fn wire(self) -> &'static str {
+        match self {
+            Verdict::Approve => "approve",
+            Verdict::RequestChanges => "request_changes",
+        }
+    }
+}
+
+/// A pull request's state.
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum PrStatus {
+    /// Waiting for review or merge.
+    Open,
+    /// Merged into its target.
+    Merged,
+    /// Closed without merging.
+    Closed,
+}
+
+impl PrStatus {
+    fn wire(self) -> &'static str {
+        match self {
+            PrStatus::Open => "open",
+            PrStatus::Merged => "merged",
+            PrStatus::Closed => "closed",
+        }
+    }
+}
+
+/// Arguments of `git_pr`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct GitPrArgs {
+    /// What to do with pull requests.
+    pub action: PrAction,
+    /// Repo name, or <org>/<name>.
+    pub repo: String,
+    /// PR number (get, review, comment, merge, close).
+    pub id: Option<u64>,
+    /// Title (open).
+    pub title: Option<String>,
+    /// Description (open), review text (review) or comment (comment).
+    pub body: Option<String>,
+    /// Branch with the changes (open).
+    pub source_branch: Option<String>,
+    /// Branch to merge into (open). Default main.
+    pub target_branch: Option<String>,
+    /// Only PRs in this state (list).
+    pub status: Option<PrStatus>,
+    /// approve or request_changes (review).
+    pub verdict: Option<Verdict>,
+    /// The source head you reviewed (review, optional); an approval is refused if the branch moved since.
+    pub head: Option<String>,
+}
+
 /// The repo name in `repo`, which is `name` or `<org_slug>/<name>` in this org.
 pub fn repo_name(p: &Profile, repo: &str) -> Result<String, GitError> {
     let name = match repo.split_once('/') {
@@ -713,6 +865,215 @@ impl GitClient {
     }
 }
 
+/// Most changes one commit takes.
+const MAX_CHANGES: usize = 1000;
+
+/// What a caller is told when a commit lost a race.
+fn cas_message(current_head: &str) -> String {
+    format!("The branch moved; its head is now {current_head}. Read it again, then retry with that expect_head (or without expect_head).")
+}
+
+fn need<T>(v: Option<T>, field: &str, action: &str) -> Result<T, GitError> {
+    v.ok_or_else(|| GitError::Usage(format!("{field} is required for {action}.")))
+}
+
+/// The server's operation for `c`, after checking it locally.
+fn operation(c: Change) -> Result<Value, GitError> {
+    Ok(match c {
+        Change::Put {
+            path,
+            content,
+            content_base64,
+        } => {
+            let b64 = match (content, content_base64) {
+                (Some(t), None) => STANDARD.encode(t.as_bytes()),
+                (None, Some(b)) => {
+                    STANDARD.decode(&b).map_err(|_| {
+                        GitError::Usage(format!("content_base64 for {path} is not valid base64."))
+                    })?;
+                    b
+                }
+                _ => {
+                    return Err(GitError::Usage(format!(
+                        "put {path} needs exactly one of content or content_base64."
+                    )))
+                }
+            };
+            json!({"op": "put", "path": path, "content_b64": b64})
+        }
+        Change::Delete { path } => json!({"op": "delete", "path": path}),
+        Change::Move { from, to } => json!({"op": "move", "from": from, "to": to}),
+    })
+}
+
+impl GitClient {
+    /// `git_commit`: apply changes to a branch as one commit.
+    pub async fn run_commit(&self, a: GitCommitArgs, w: &dyn Waiting) -> Result<Value, GitError> {
+        let p = (self.conn)().1;
+        let name = repo_name(&p, &a.repo)?;
+        if a.changes.is_empty() || a.changes.len() > MAX_CHANGES {
+            return Err(GitError::Usage(format!(
+                "A commit takes 1 to {MAX_CHANGES} changes; got {}.",
+                a.changes.len()
+            )));
+        }
+        let operations = a
+            .changes
+            .into_iter()
+            .map(operation)
+            .collect::<Result<Vec<_>, _>>()?;
+        let branch = a.branch.unwrap_or_else(|| "main".into());
+        let mut body = json!({
+            "target_branch": branch,
+            "operations": operations,
+            "message": a.message,
+            "idempotency_key": uuid::Uuid::new_v4().to_string(),
+        });
+        if a.base_branch.is_some() || a.expect_head.is_some() {
+            let mut base = json!({"branch": a.base_branch.unwrap_or(branch)});
+            if let Some(h) = a.expect_head {
+                base["expect_head"] = json!(h);
+            }
+            body["base"] = base;
+        }
+        let ans = self
+            .server(
+                Access::Write,
+                ServerReq {
+                    method: Method::POST,
+                    path: format!("/repos/{}/{}/changes", enc(&p.org_slug), enc(&name)),
+                    query: vec![],
+                    body: Some(body),
+                },
+                w,
+            )
+            .await
+            .map_err(|e| match e {
+                GitError::Server {
+                    ref code, ref body, ..
+                } if code == "cas_conflict" => {
+                    let head = body["current_head"].as_str().unwrap_or("gone");
+                    GitError::Usage(cas_message(head))
+                }
+                e => e,
+            })?;
+        parse(&ans)
+    }
+
+    /// `git_pr`: open, list, read, review, comment on, merge or close pull requests.
+    pub async fn run_pr(&self, a: GitPrArgs, w: &dyn Waiting) -> Result<Value, GitError> {
+        let p = (self.conn)().1;
+        let name = repo_name(&p, &a.repo)?;
+        let pulls = format!("/repos/{}/{}/pulls", enc(&p.org_slug), enc(&name));
+        let (access, method, path, query, body) = match a.action {
+            PrAction::Open => {
+                let title = need(a.title, "title", "open")?;
+                let source = need(a.source_branch, "source_branch", "open")?;
+                let mut b = json!({
+                    "title": title,
+                    "source_branch": source,
+                    "target_branch": a.target_branch.unwrap_or_else(|| "main".into()),
+                });
+                if let Some(d) = a.body {
+                    b["body"] = json!(d);
+                }
+                (Access::Write, Method::POST, pulls, vec![], Some(b))
+            }
+            PrAction::List => {
+                let q = a
+                    .status
+                    .map(|s| ("status", s.wire().to_string()))
+                    .into_iter()
+                    .collect();
+                (Access::Read, Method::GET, pulls, q, None)
+            }
+            PrAction::Get => {
+                let id = need(a.id, "id", "get")?;
+                (
+                    Access::Read,
+                    Method::GET,
+                    format!("{pulls}/{id}"),
+                    vec![],
+                    None,
+                )
+            }
+            PrAction::Review => {
+                let id = need(a.id, "id", "review")?;
+                let verdict = need(a.verdict, "verdict", "review")?;
+                let mut b = json!({"verdict": verdict.wire()});
+                if let Some(t) = a.body {
+                    b["body"] = json!(t);
+                }
+                if let Some(h) = a.head {
+                    b["head"] = json!(h);
+                }
+                (
+                    Access::Write,
+                    Method::POST,
+                    format!("{pulls}/{id}/reviews"),
+                    vec![],
+                    Some(b),
+                )
+            }
+            PrAction::Comment => {
+                let id = need(a.id, "id", "comment")?;
+                let text = need(a.body, "body", "comment")?;
+                (
+                    Access::Write,
+                    Method::POST,
+                    format!("{pulls}/{id}/comments"),
+                    vec![],
+                    Some(json!({"body": text})),
+                )
+            }
+            PrAction::Merge => {
+                let id = need(a.id, "id", "merge")?;
+                (
+                    Access::Write,
+                    Method::POST,
+                    format!("{pulls}/{id}/merge"),
+                    vec![],
+                    None,
+                )
+            }
+            PrAction::Close => {
+                let id = need(a.id, "id", "close")?;
+                (
+                    Access::Write,
+                    Method::POST,
+                    format!("{pulls}/{id}/close"),
+                    vec![],
+                    None,
+                )
+            }
+        };
+        let ans = self
+            .server(
+                access,
+                ServerReq {
+                    method,
+                    path,
+                    query,
+                    body,
+                },
+                w,
+            )
+            .await?;
+        let mut out = if ans.bytes.is_empty() {
+            json!({})
+        } else {
+            parse(&ans)?
+        };
+        match out.as_object_mut() {
+            Some(o) => {
+                o.insert("note".into(), json!(DATA_NOTE));
+                Ok(out)
+            }
+            None => Ok(json!({"result": out, "note": DATA_NOTE})),
+        }
+    }
+}
+
 fn parse(ans: &ServerAnswer) -> Result<Value, GitError> {
     serde_json::from_slice(&ans.bytes).map_err(|e| {
         GitError::Unreachable(format!(
@@ -762,7 +1123,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use wiremock::matchers::{body_json, header, method, path, query_param};
+    use wiremock::matchers::{body_json, body_partial_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const ORG: &str = "11111111-1111-1111-1111-111111111111";
@@ -1504,5 +1865,402 @@ mod tests {
             m.contains("422") && m.contains("no such ref") && m != NAME_RULE,
             "{m}"
         );
+    }
+
+    const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn put(path: &str, content: Option<&str>, b64: Option<&str>) -> Change {
+        Change::Put {
+            path: path.into(),
+            content: content.map(Into::into),
+            content_base64: b64.map(Into::into),
+        }
+    }
+
+    fn commit_args(changes: Vec<Change>) -> GitCommitArgs {
+        GitCommitArgs {
+            repo: "api".into(),
+            branch: None,
+            base_branch: None,
+            expect_head: None,
+            message: "m".into(),
+            changes,
+        }
+    }
+
+    const CHANGES_PATH: &str = "/acme/-/v1/repos/acme/api/changes";
+
+    fn commit_ok() -> ResponseTemplate {
+        ResponseTemplate::new(201).set_body_json(json!({
+            "commit": "c1", "tree": "t1", "chain_seq": 1, "poc_seq": 2,
+            "branch": "main", "replayed": false
+        }))
+    }
+
+    async fn changes_bodies(s: &MockServer) -> Vec<Value> {
+        s.received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() == CHANGES_PATH)
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn commit_builds_operations() {
+        let (s, git, _) = setup().await;
+        mount_broker(&s, "G1", 300, 1).await;
+        Mock::given(method("POST"))
+            .and(path(CHANGES_PATH))
+            .and(body_partial_json(
+                json!({"target_branch":"main","message":"m","operations":[
+                {"op":"put","path":"a.txt","content_b64":"aGk="},
+                {"op":"delete","path":"b"},
+                {"op":"move","from":"c","to":"d"}]}),
+            ))
+            .respond_with(commit_ok())
+            .expect(1)
+            .mount(&s)
+            .await;
+        let v = git
+            .run_commit(
+                commit_args(vec![
+                    put("a.txt", Some("hi"), None),
+                    Change::Delete { path: "b".into() },
+                    Change::Move {
+                        from: "c".into(),
+                        to: "d".into(),
+                    },
+                ]),
+                &NoProgress,
+            )
+            .await
+            .unwrap();
+        assert_eq!(v["commit"], "c1");
+        assert_eq!(v["replayed"], false);
+        let b = &changes_bodies(&s).await[0];
+        assert!(!b["idempotency_key"].as_str().unwrap().is_empty());
+        assert!(b.get("base").is_none());
+    }
+
+    #[tokio::test]
+    async fn commit_passes_base64_through() {
+        let (s, git, _) = setup().await;
+        mount_broker(&s, "G1", 300, 1).await;
+        Mock::given(method("POST"))
+            .and(path(CHANGES_PATH))
+            .and(body_partial_json(
+                json!({"operations":[{"op":"put","path":"x.bin","content_b64":"AAEC"}]}),
+            ))
+            .respond_with(commit_ok())
+            .expect(1)
+            .mount(&s)
+            .await;
+        git.run_commit(
+            commit_args(vec![put("x.bin", None, Some("AAEC"))]),
+            &NoProgress,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn commit_new_branch_sends_base() {
+        let (s, git, _) = setup().await;
+        mount_broker(&s, "G1", 300, 1).await;
+        Mock::given(method("POST"))
+            .and(path(CHANGES_PATH))
+            .respond_with(commit_ok())
+            .expect(2)
+            .mount(&s)
+            .await;
+        let mut a = commit_args(vec![Change::Delete { path: "b".into() }]);
+        a.branch = Some("feat".into());
+        a.base_branch = Some("main".into());
+        git.run_commit(a, &NoProgress).await.unwrap();
+        let mut a = commit_args(vec![Change::Delete { path: "b".into() }]);
+        a.branch = Some("feat".into());
+        a.expect_head = Some(SHA.into());
+        git.run_commit(a, &NoProgress).await.unwrap();
+        let b = changes_bodies(&s).await;
+        assert_eq!(b[0]["target_branch"], "feat");
+        assert_eq!(b[0]["base"], json!({"branch":"main"}));
+        assert_eq!(b[1]["base"], json!({"branch":"feat","expect_head":SHA}));
+    }
+
+    #[tokio::test]
+    async fn commit_retry_reuses_idempotency_key() {
+        let (s, git, _) = setup().await;
+        mount_broker(&s, "G1", 300, 1).await;
+        Mock::given(method("POST"))
+            .and(path(CHANGES_PATH))
+            .respond_with(ResponseTemplate::new(503).set_body_json(
+                json!({"error": {"code": "auth_unavailable", "message": "starting"}}),
+            ))
+            .up_to_n_times(1)
+            .mount(&s)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(CHANGES_PATH))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"replayed": true})))
+            .mount(&s)
+            .await;
+        let v = git
+            .run_commit(
+                commit_args(vec![Change::Delete { path: "b".into() }]),
+                &NoProgress,
+            )
+            .await
+            .unwrap();
+        assert_eq!(v["replayed"], true);
+        let b = changes_bodies(&s).await;
+        assert_eq!(b.len(), 2);
+        assert_eq!(b[0]["idempotency_key"], b[1]["idempotency_key"]);
+    }
+
+    #[tokio::test]
+    async fn commit_conflict_names_current_head() {
+        let (s, git, _) = setup().await;
+        mount_broker(&s, "G1", 300, 1).await;
+        Mock::given(method("POST"))
+            .and(path(CHANGES_PATH))
+            .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+                "error": {"code": "cas_conflict", "message": "moved"}, "current_head": "abc"
+            })))
+            .mount(&s)
+            .await;
+        let m = git
+            .run_commit(
+                commit_args(vec![Change::Delete { path: "b".into() }]),
+                &NoProgress,
+            )
+            .await
+            .unwrap_err()
+            .message();
+        assert!(m.contains("abc") && m.contains("expect_head"), "{m}");
+    }
+
+    #[tokio::test]
+    async fn commit_rejects_bad_changes_locally() {
+        let (s, git, _) = setup().await;
+        let del = || Change::Delete { path: "b".into() };
+        let cases = vec![
+            vec![],
+            (0..1001).map(|_| del()).collect(),
+            vec![put("a", Some("x"), Some("eA=="))],
+            vec![put("a", None, None)],
+            vec![put("a", None, Some("%%not base64%%"))],
+        ];
+        for changes in cases {
+            let e = git
+                .run_commit(commit_args(changes), &NoProgress)
+                .await
+                .unwrap_err();
+            assert!(matches!(e, GitError::Usage(_)), "{e:?}");
+        }
+        assert!(s.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn commit_protected_main_hints_pr() {
+        let (s, git, _) = setup().await;
+        mount_broker(&s, "G1", 300, 1).await;
+        Mock::given(method("POST"))
+            .and(path(CHANGES_PATH))
+            .respond_with(ResponseTemplate::new(403).set_body_json(
+                json!({"error": {"code": "protected_branch", "message": "protected"}}),
+            ))
+            .mount(&s)
+            .await;
+        let m = git
+            .run_commit(
+                commit_args(vec![Change::Delete { path: "b".into() }]),
+                &NoProgress,
+            )
+            .await
+            .unwrap_err()
+            .message();
+        assert!(m.contains("git_pr"), "{m}");
+    }
+
+    #[test]
+    fn new_hints_by_code() {
+        for (code, want) in [
+            ("base_not_found", "base_branch does not exist"),
+            ("quota_exceeded", "storage is full"),
+            ("too_many_ops", "at most 1000"),
+            ("blob_too_large", "10 MiB"),
+            ("source_moved", "review its new head"),
+            ("approvals_required", "different person"),
+            ("pr_not_open", "not open"),
+            ("merge_conflict", "update the source branch"),
+        ] {
+            let e = GitError::Server {
+                status: 409,
+                code: code.into(),
+                message: "m".into(),
+                body: Value::Null,
+                retry_after: None,
+            };
+            let m = e.message();
+            assert!(m.contains(want), "{code}: {m}");
+        }
+        let e = GitError::Server {
+            status: 403,
+            code: "approver_not_human".into(),
+            message: "only people approve".into(),
+            body: Value::Null,
+            retry_after: None,
+        };
+        assert!(e.message().contains("only people approve"));
+    }
+
+    fn pr_args(action: PrAction) -> GitPrArgs {
+        GitPrArgs {
+            action,
+            repo: "api".into(),
+            id: None,
+            title: None,
+            body: None,
+            source_branch: None,
+            target_branch: None,
+            status: None,
+            verdict: None,
+            head: None,
+        }
+    }
+
+    const PULLS: &str = "/acme/-/v1/repos/acme/api/pulls";
+
+    #[tokio::test]
+    async fn pr_open_defaults_target_main() {
+        let (s, git, _) = setup().await;
+        mount_broker(&s, "G1", 300, 1).await;
+        Mock::given(method("POST"))
+            .and(path(PULLS))
+            .and(body_json(
+                json!({"title":"t","source_branch":"feat","target_branch":"main"}),
+            ))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": 3})))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let mut a = pr_args(PrAction::Open);
+        a.title = Some("t".into());
+        a.source_branch = Some("feat".into());
+        let v = git.run_pr(a, &NoProgress).await.unwrap();
+        assert_eq!(v["id"], 3);
+        assert_eq!(v["note"], DATA_NOTE);
+    }
+
+    #[tokio::test]
+    async fn pr_review_sends_verdict() {
+        let (s, git, _) = setup().await;
+        mount_broker(&s, "G1", 300, 1).await;
+        Mock::given(method("POST"))
+            .and(path(format!("{PULLS}/3/reviews")))
+            .and(body_json(json!({"verdict":"request_changes","body":"x"})))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"ok": true})))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let mut a = pr_args(PrAction::Review);
+        a.id = Some(3);
+        a.verdict = Some(Verdict::RequestChanges);
+        a.body = Some("x".into());
+        let v = git.run_pr(a, &NoProgress).await.unwrap();
+        assert_eq!(v["note"], DATA_NOTE);
+    }
+
+    #[tokio::test]
+    async fn pr_comment_and_get() {
+        let (s, git, _) = setup().await;
+        mount_broker(&s, "G1", 300, 2).await;
+        Mock::given(method("POST"))
+            .and(path(format!("{PULLS}/3/comments")))
+            .and(body_json(json!({"body":"hello"})))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"ok": true})))
+            .expect(1)
+            .mount(&s)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("{PULLS}/3")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": 3})))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let mut a = pr_args(PrAction::Comment);
+        a.id = Some(3);
+        a.body = Some("hello".into());
+        git.run_pr(a, &NoProgress).await.unwrap();
+        let mut a = pr_args(PrAction::Get);
+        a.id = Some(3);
+        let v = git.run_pr(a, &NoProgress).await.unwrap();
+        assert_eq!(v["id"], 3);
+        assert_eq!(v["note"], DATA_NOTE);
+    }
+
+    #[tokio::test]
+    async fn pr_list_filters_status_and_uses_read_scope() {
+        let (s, git, _) = setup().await;
+        Mock::given(method("POST"))
+            .and(path(broker_path()))
+            .and(body_json(json!({"scope": ["repos_read"]})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(token_body("R", 300)))
+            .expect(1)
+            .mount(&s)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(PULLS))
+            .and(query_param("status", "open"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"pulls": []})))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let mut a = pr_args(PrAction::List);
+        a.status = Some(PrStatus::Open);
+        let v = git.run_pr(a, &NoProgress).await.unwrap();
+        assert_eq!(v["pulls"], json!([]));
+        assert_eq!(v["note"], DATA_NOTE);
+    }
+
+    #[tokio::test]
+    async fn pr_merge_and_close_paths() {
+        let (s, git, _) = setup().await;
+        mount_broker(&s, "G1", 300, 1).await;
+        for p in ["merge", "close"] {
+            Mock::given(method("POST"))
+                .and(path(format!("{PULLS}/3/{p}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"state": p})))
+                .expect(1)
+                .mount(&s)
+                .await;
+        }
+        for (action, p) in [(PrAction::Merge, "merge"), (PrAction::Close, "close")] {
+            let mut a = pr_args(action);
+            a.id = Some(3);
+            let v = git.run_pr(a, &NoProgress).await.unwrap();
+            assert_eq!(v["state"], p);
+            assert_eq!(v["note"], DATA_NOTE);
+        }
+    }
+
+    #[tokio::test]
+    async fn pr_missing_fields() {
+        let (s, git, _) = setup().await;
+        let mut a = pr_args(PrAction::Review);
+        a.verdict = Some(Verdict::Approve);
+        let m = git.run_pr(a, &NoProgress).await.unwrap_err().message();
+        assert_eq!(m, "id is required for review.");
+        let mut a = pr_args(PrAction::Open);
+        a.source_branch = Some("feat".into());
+        let m = git.run_pr(a, &NoProgress).await.unwrap_err().message();
+        assert_eq!(m, "title is required for open.");
+        let mut a = pr_args(PrAction::Review);
+        a.id = Some(3);
+        let m = git.run_pr(a, &NoProgress).await.unwrap_err().message();
+        assert_eq!(m, "verdict is required for review.");
+        assert!(s.received_requests().await.unwrap().is_empty());
     }
 }
