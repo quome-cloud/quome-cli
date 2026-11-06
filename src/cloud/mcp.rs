@@ -959,6 +959,32 @@ impl QuomeMcp {
         }
     }
 
+    /// Run a call to a cache pod route, as `call!` does, and also pick up a
+    /// re-run of `quome connect` (retrying once) when the server says this
+    /// connection lacks cache access. Errors go through `cache_hint`.
+    async fn cache_call<T, F, Fut>(&self, action: &str, f: F) -> Result<T, String>
+    where
+        F: Fn(Arc<CloudApi>) -> Fut,
+        Fut: std::future::Future<Output = Result<T, QuomeError>>,
+    {
+        let mut retried = false;
+        loop {
+            let api = self.conn().api.clone();
+            match f(api.clone()).await {
+                Ok(v) => return Ok(v),
+                Err(e)
+                    if !retried
+                        && (is_session_error(&e)
+                            || describe(&e).contains("reconnect_for_caches"))
+                        && self.refresh(&api).await =>
+                {
+                    retried = true;
+                }
+                Err(e) => return Err(cache_hint(fail(e), action)),
+            }
+        }
+    }
+
     /// Call `tool` on the org's auth instance for `env` (what every `auth_*` tool uses).
     async fn auth_call(
         &self,
@@ -2435,8 +2461,12 @@ impl QuomeMcp {
         &self,
         Parameters(a): Parameters<CacheRememberArgs>,
     ) -> Result<String, String> {
-        let id = call!(self, |api| api.cache_remember(&a.cache, &a.text, &a.tags))
-            .map_err(|e| cache_hint(e, "remember the fact"))?;
+        let a = &a;
+        let id = self
+            .cache_call("remember the fact", |api| async move {
+                api.cache_remember(&a.cache, &a.text, &a.tags).await
+            })
+            .await?;
         json(&serde_json::json!({"id": id}))
     }
 
@@ -2447,8 +2477,12 @@ impl QuomeMcp {
         &self,
         Parameters(a): Parameters<CacheRecallArgs>,
     ) -> Result<String, String> {
-        let facts = call!(self, |api| api.cache_recall(&a.cache, &a.tags, a.topk))
-            .map_err(|e| cache_hint(e, "recall facts"))?;
+        let a = &a;
+        let facts = self
+            .cache_call("recall facts", |api| async move {
+                api.cache_recall(&a.cache, &a.tags, a.topk).await
+            })
+            .await?;
         json(&serde_json::json!({"facts": facts}))
     }
 
@@ -2459,8 +2493,12 @@ impl QuomeMcp {
         &self,
         Parameters(a): Parameters<CacheForgetArgs>,
     ) -> Result<String, String> {
-        let forgotten = call!(self, |api| api.cache_forget(&a.cache, a.id))
-            .map_err(|e| cache_hint(e, "forget the fact"))?;
+        let a = &a;
+        let forgotten = self
+            .cache_call("forget the fact", |api| async move {
+                api.cache_forget(&a.cache, a.id).await
+            })
+            .await?;
         json(&serde_json::json!({"id": a.id, "forgotten": forgotten}))
     }
 
@@ -2468,8 +2506,12 @@ impl QuomeMcp {
         description = "Read a key from your pod in a Quome Cloud cache; value is null when the key is not set. The pod is private to you and the person you act for."
     )]
     async fn cache_get(&self, Parameters(a): Parameters<CacheKeyArgs>) -> Result<String, String> {
-        let value = call!(self, |api| api.cache_get(&a.cache, &a.key))
-            .map_err(|e| cache_hint(e, "read the key"))?;
+        let a = &a;
+        let value = self
+            .cache_call("read the key", |api| async move {
+                api.cache_get(&a.cache, &a.key).await
+            })
+            .await?;
         json(&serde_json::json!({"key": a.key, "value": value}))
     }
 
@@ -2477,8 +2519,11 @@ impl QuomeMcp {
         description = "Set a key to a value in your pod in a Quome Cloud cache, optionally expiring after ttl seconds. The pod is private to you and the person you act for."
     )]
     async fn cache_set(&self, Parameters(a): Parameters<CacheSetArgs>) -> Result<String, String> {
-        call!(self, |api| api.cache_set(&a.cache, &a.key, &a.value, a.ttl))
-            .map_err(|e| cache_hint(e, "set the key"))?;
+        let a = &a;
+        self.cache_call("set the key", |api| async move {
+            api.cache_set(&a.cache, &a.key, &a.value, a.ttl).await
+        })
+        .await?;
         json(&serde_json::json!({"key": a.key, "set": true, "ttl": a.ttl}))
     }
 
@@ -2486,8 +2531,12 @@ impl QuomeMcp {
         description = "Delete a key from your pod in a Quome Cloud cache; deleted is false when it was not set. The pod is private to you and the person you act for."
     )]
     async fn cache_del(&self, Parameters(a): Parameters<CacheKeyArgs>) -> Result<String, String> {
-        let deleted = call!(self, |api| api.cache_del(&a.cache, &a.key))
-            .map_err(|e| cache_hint(e, "delete the key"))?;
+        let a = &a;
+        let deleted = self
+            .cache_call("delete the key", |api| async move {
+                api.cache_del(&a.cache, &a.key).await
+            })
+            .await?;
         json(&serde_json::json!({"key": a.key, "deleted": deleted}))
     }
 
@@ -2495,8 +2544,12 @@ impl QuomeMcp {
         description = "Show the size and usage of your pod in a Quome Cloud cache: memory in bytes, keys, facts and connections. The pod is private to you and the person you act for."
     )]
     async fn cache_pod(&self, Parameters(a): Parameters<CachePodArgs>) -> Result<String, String> {
-        let p = call!(self, |api| api.cache_pod(&a.cache))
-            .map_err(|e| cache_hint(e, "read the pod"))?;
+        let a = &a;
+        let p = self
+            .cache_call("read the pod", |api| async move {
+                api.cache_pod(&a.cache).await
+            })
+            .await?;
         json(&serde_json::json!({
             "cache": a.cache,
             "maxmemory": p.maxmemory,
@@ -6796,5 +6849,91 @@ mod tests {
             let d = t["description"].as_str().unwrap();
             assert!(d.contains("private"), "{d}");
         }
+    }
+
+    /// A pod `get` route answering 403 `reconnect_for_caches` to the OLD
+    /// token; with `new_ok`, a 200 to the NEW one.
+    async fn cache_reconnect_server(new_ok: bool) -> MockServer {
+        let s = revoking_server().await;
+        Mock::given(method("POST"))
+            .and(path(pod_path("/get")))
+            .and(wiremock::matchers::header("authorization", "Bearer OLD"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .set_body_json(json!({"detail":"forbidden","reason":"reconnect_for_caches"})),
+            )
+            .mount(&s)
+            .await;
+        let new = ResponseTemplate::new(if new_ok { 200 } else { 403 });
+        let new = if new_ok {
+            new.set_body_json(json!({"value":"dark"}))
+        } else {
+            new.set_body_json(json!({"detail":"forbidden","reason":"reconnect_for_caches"}))
+        };
+        Mock::given(method("POST"))
+            .and(path(pod_path("/get")))
+            .and(wiremock::matchers::header("authorization", "Bearer NEW"))
+            .respond_with(new)
+            .mount(&s)
+            .await;
+        s
+    }
+
+    fn cache_get_args() -> Parameters<CacheKeyArgs> {
+        Parameters(serde_json::from_value(json!({"cache":"mem","key":"theme"})).unwrap())
+    }
+
+    fn pod_get_calls(reqs: &[wiremock::Request]) -> usize {
+        reqs.iter()
+            .filter(|r| r.url.path() == pod_path("/get"))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn cache_call_picks_up_a_reconnect_without_restart() {
+        let s = cache_reconnect_server(true).await;
+        let old = AgentKey::generate();
+        let (home, reload) = cloud_home(&s.uri(), "j", "d", &old);
+        let p = profile(&s.uri());
+        let api = CloudApi::new(&p, TokenSource::new(&p, old, "vrc".into()));
+        let server = QuomeMcp::new(api, p).with_reloader(reload);
+
+        // The user re-ran `quome connect` and allowed caches.
+        write_connection(home.path(), &s.uri(), "j2", "d2", &AgentKey::generate());
+        let text = server.cache_get(cache_get_args()).await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&text).unwrap(),
+            json!({"key":"theme","value":"dark"})
+        );
+        assert_eq!(pod_get_calls(&s.received_requests().await.unwrap()), 2);
+    }
+
+    #[tokio::test]
+    async fn cache_call_still_refused_after_reconnect_gives_the_advice() {
+        let s = cache_reconnect_server(false).await;
+        let old = AgentKey::generate();
+        let (home, reload) = cloud_home(&s.uri(), "j", "d", &old);
+        let p = profile(&s.uri());
+        let api = CloudApi::new(&p, TokenSource::new(&p, old, "vrc".into()));
+        let server = QuomeMcp::new(api, p).with_reloader(reload);
+
+        // Reconnected, but caches still not allowed.
+        write_connection(home.path(), &s.uri(), "j2", "d2", &AgentKey::generate());
+        let e = server.cache_get(cache_get_args()).await.unwrap_err();
+        assert_eq!(e, "Run `quome connect` again and allow caches.");
+        assert_eq!(pod_get_calls(&s.received_requests().await.unwrap()), 2);
+    }
+
+    #[tokio::test]
+    async fn cache_call_without_a_reconnect_gives_the_advice_once() {
+        let s = cache_reconnect_server(true).await;
+        let old = AgentKey::generate();
+        let (_home, reload) = cloud_home(&s.uri(), "j", "d", &old);
+        let p = profile(&s.uri());
+        let api = CloudApi::new(&p, TokenSource::new(&p, old, "vrc".into()));
+        let server = QuomeMcp::new(api, p).with_reloader(reload);
+        let e = server.cache_get(cache_get_args()).await.unwrap_err();
+        assert_eq!(e, "Run `quome connect` again and allow caches.");
+        assert_eq!(pod_get_calls(&s.received_requests().await.unwrap()), 1);
     }
 }
