@@ -181,8 +181,6 @@ pub fn git_hint(e: &str) -> String {
         "Quome Cloud could not issue a Git token; try again in a few seconds.".into()
     } else if has("repo_exists") {
         "A repo with that name already exists.".into()
-    } else if has("422 ") {
-        NAME_RULE.into()
     } else if has("image_unpinned") {
         "Git is not available for this org yet.".into()
     } else {
@@ -574,7 +572,13 @@ impl GitClient {
                         let n = n.clone();
                         async move { api.git_create_repo(&n).await }
                     })
-                    .await?;
+                    .await
+                    .map_err(|e| match e {
+                        GitError::Api(QuomeError::ApiError(m)) if m.starts_with("422") => {
+                            GitError::Usage(NAME_RULE.into())
+                        }
+                        e => e,
+                    })?;
                 Ok(repo_json(&(self.conn)().1, &r))
             }
         }
@@ -1203,7 +1207,10 @@ mod tests {
             git_hint("API error: 409 conflict: repo_exists"),
             "A repo with that name already exists."
         );
-        assert!(git_hint("API error: 422 invalid: bad_repo").starts_with("Repo names are"));
+        assert_eq!(
+            git_hint("The org's git server answered 422 bad_ref: no such ref"),
+            "The org's git server answered 422 bad_ref: no such ref"
+        );
     }
 
     #[tokio::test]
@@ -1454,6 +1461,48 @@ mod tests {
         assert_eq!(
             v["credential_helper"],
             "git config --global credential.https://git.apps.example.helper '!quome git-credential'"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_422_gives_name_rule_but_read_422_keeps_its_message() {
+        let (s, git, _) = setup().await;
+        mount_broker(&s, "G1", 300, 1).await;
+        Mock::given(method("POST"))
+            .and(path(format!("/api/v1/orgs/{ORG}/git/repos")))
+            .respond_with(
+                ResponseTemplate::new(422)
+                    .set_body_json(json!({"detail":"invalid","reason":"bad_repo"})),
+            )
+            .mount(&s)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/acme/-/v1/repos/acme/api/tree"))
+            .respond_with(
+                ResponseTemplate::new(422)
+                    .set_body_json(json!({"error": {"code": "bad_ref", "message": "no such ref"}})),
+            )
+            .mount(&s)
+            .await;
+        let e = git
+            .run_repos(
+                GitReposArgs {
+                    action: ReposAction::Create,
+                    name: Some("ok".into()),
+                },
+                &NoProgress,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(e.message(), NAME_RULE);
+        let e = git
+            .run_read(read_args(ReadAction::Tree, None, None), &NoProgress)
+            .await
+            .unwrap_err();
+        let m = e.message();
+        assert!(
+            m.contains("422") && m.contains("no such ref") && m != NAME_RULE,
+            "{m}"
         );
     }
 }
