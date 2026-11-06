@@ -505,7 +505,7 @@ fn cache_hint(e: String, action: &str) -> String {
     } else if has("pod_full") || has("memory_quota_reached") {
         "Your pod is full. Forget or delete something, or ask for a larger pod.".into()
     } else if has("invalid_tag") {
-        "Tags are lowercase letters, digits, `_`, `.`, `:` or `-`, at most 64 characters.".into()
+        "Tags are lowercase letters, digits, `_`, `.`, `:` or `-`, at most 64 characters each, and a call takes 1 to 16 tags.".into()
     } else {
         format!("Could not {action}: {e}")
     }
@@ -6696,7 +6696,7 @@ mod tests {
             "/recall",
             422,
             "invalid_tag",
-            "Tags are lowercase letters, digits, `_`, `.`, `:` or `-`, at most 64 characters.",
+            "Tags are lowercase letters, digits, `_`, `.`, `:` or `-`, at most 64 characters each, and a call takes 1 to 16 tags.",
         )
         .await;
     }
@@ -6736,7 +6736,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cache_tools_send_no_namespace() {
+    async fn cache_tools_never_send_a_pod_name() {
         let (s, mut c) = start().await;
         Mock::given(method("GET"))
             .and(path(pod_path("")))
@@ -6780,7 +6780,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cache_tool_text_says_pod_not_namespace() {
+    async fn cache_tool_text_only_says_pod() {
         let (_s, mut c) = start().await;
         let v = c.rpc("tools/list", json!({})).await;
         let tools: Vec<&Value> = v["result"]["tools"]
