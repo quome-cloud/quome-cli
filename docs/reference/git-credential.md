@@ -21,7 +21,7 @@ Options:
 
 ## Setup
 
-Run these two lines once. The [`git_clone_url`](mcp.md#git) tool prints the second one for you.
+Run these two lines once. The [`git_clone_url`](mcp.md#git) tool prints the helper line without `--add`; run the empty line first and then the `--add` form shown here, because the plain form would replace the empty entry.
 
 ```bash
 git config --global credential.https://git.quome.cloud.helper ''
@@ -36,7 +36,7 @@ If one computer is connected to several orgs (several profiles), also let git se
 git config --global credential.https://git.quome.cloud.useHttpPath true
 ```
 
-Without it, git sends only the host. The helper then uses the default profile when several connections share that host, and otherwise stops and prints this same `useHttpPath` line.
+Without it, git sends only the host. When several connections serve the host and git sends no path, the helper uses the default profile only if it is one of them; otherwise it gives no credential and names this `useHttpPath` setting on stderr.
 
 Then use git as usual:
 
@@ -55,7 +55,7 @@ password=<token>
 password_expiry_utc=1767225900
 ```
 
-`password` is a token that works for 5 minutes. `password_expiry_utc` is when it stops working, in Unix seconds; git (2.40 and later) uses it to ask again instead of reusing an expired token.
+`password` is a token that works for 5 minutes. `password_expiry_utc` is when it stops working, in Unix seconds; recent versions of git use it to ask again instead of reusing an expired token.
 
 The helper answers only for `https` URLs whose host and org match one of your connections. For anything else it prints nothing and exits successfully, so git moves on to its next helper. `--profile <name>` only narrows which connection is considered; the host, `https` and the org in the path must still match.
 
