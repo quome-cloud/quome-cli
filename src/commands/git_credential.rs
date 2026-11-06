@@ -63,9 +63,10 @@ pub fn pick_profile<'a>(
     req: &Request,
     forced: Option<&str>,
 ) -> std::result::Result<Option<(String, &'a Profile)>, QuomeError> {
-    if let Some(name) = forced {
-        return Ok(Some((name.to_string(), state.profile(Some(name))?)));
-    }
+    let only = match forced {
+        Some(name) => Some((name, state.profile(Some(name))?)),
+        None => None,
+    };
     if req.protocol != "https" {
         return Ok(None);
     }
@@ -78,6 +79,7 @@ pub fn pick_profile<'a>(
     let found: Vec<(&String, &Profile)> = state
         .profiles
         .iter()
+        .filter(|(n, _)| only.is_none_or(|(name, _)| n.as_str() == name))
         .filter(|(_, p)| git_host(p).to_lowercase() == host)
         .filter(|(_, p)| org.is_none_or(|o| p.org_slug == o))
         .collect();
@@ -226,10 +228,36 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        let (name, _) = pick_profile(&st, &req("http", "anything", None), Some("home"))
+    }
+
+    #[test]
+    fn pick_profile_forced_still_checks_host_and_org() {
+        let st = two_profiles("work");
+        let forced = Some("work");
+        assert!(pick_profile(&st, &req("https", "github.com", None), forced)
             .unwrap()
-            .unwrap();
-        assert_eq!(name, "home");
+            .is_none());
+        assert!(pick_profile(
+            &st,
+            &req("https", "git.apps.example", Some("beta/x.git")),
+            forced
+        )
+        .unwrap()
+        .is_none());
+        assert!(
+            pick_profile(&st, &req("http", "git.apps.example", None), forced)
+                .unwrap()
+                .is_none()
+        );
+        let (name, _) = pick_profile(
+            &st,
+            &req("https", "git.apps.example", Some("acme/x.git")),
+            forced,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(name, "work");
+        assert!(pick_profile(&st, &req("https", "git.apps.example", None), Some("nope")).is_err());
     }
 
     #[test]
