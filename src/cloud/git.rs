@@ -261,8 +261,7 @@ impl GitClient {
         }
     }
 
-    /// Send server requests to `base` instead of the org's git host (tests).
-    #[cfg(test)]
+    /// Send server requests to `base` instead of the org's git host (an override).
     pub(crate) fn with_server_base(mut self, base: String) -> Self {
         self.base = Some(base);
         self
