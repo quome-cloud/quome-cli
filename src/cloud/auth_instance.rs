@@ -2,7 +2,7 @@
 //! platform, then one stateless JSON-RPC `tools/call` to the instance's MCP.
 use super::api::{AuthToken, CloudApi};
 use super::auth::{CONNECT_TIMEOUT, REQUEST_TIMEOUT};
-use super::mcp::{fail, is_session_error};
+use super::mcp::{fail, is_session_error, Reconnect};
 use crate::errors::QuomeError;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -54,11 +54,8 @@ impl From<String> for AuthCallError {
     }
 }
 
-impl AuthCallError {
-    /// True when re-reading the stored connection may help: the delegation was
-    /// revoked or is invalid, or it lacks the auth scopes or role (a re-run of
-    /// `quome connect` fixes that).
-    pub fn needs_reconnect(&self) -> bool {
+impl Reconnect for AuthCallError {
+    fn needs_reconnect(&self) -> bool {
         match self {
             AuthCallError::Api(QuomeError::ApiError(m)) => {
                 m.starts_with("403")
@@ -69,8 +66,7 @@ impl AuthCallError {
         }
     }
 
-    /// The message for the agent, with the next step.
-    pub fn message(self) -> String {
+    fn message(self) -> String {
         match self {
             AuthCallError::Api(e) => auth_hint(&fail(e)),
             AuthCallError::Instance(m) => m,
