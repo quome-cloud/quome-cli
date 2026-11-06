@@ -9,7 +9,7 @@ Every command, every flag. All examples assume you've [logged in](../getting-sta
 - **`--force` / `-f`** — destructive commands (`delete`) prompt for confirmation unless you pass this.
 - **Exit codes** — `0` on success, `1` on any error (message on stderr).
 
-> **Two editions.** `quome login` and all the commands above the Quome Cloud rows are **Quome Enterprise** and are unchanged. `connect`, `mcp` and `cloud` are **Quome Cloud** and use their own connection, not your login.
+> **Two editions.** `quome login` and all the commands above the Quome Cloud rows are **Quome Enterprise** and are unchanged. `connect`, `mcp`, `cloud` and `git-credential` are **Quome Cloud** and use their own connection, not your login.
 
 ## Commands
 
@@ -33,3 +33,4 @@ Every command, every flag. All examples assume you've [logged in](../getting-sta
 | [Connect](connect.md) (Quome Cloud) | `connect` |
 | [MCP](mcp.md) (Quome Cloud) | `mcp` |
 | [Cloud](cloud.md) (Quome Cloud) | `cloud status`, `cloud disconnect` |
+| [Git credential](git-credential.md) (Quome Cloud) | `git-credential` |

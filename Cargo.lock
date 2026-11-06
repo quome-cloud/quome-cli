@@ -1475,6 +1475,7 @@ name = "quome-cli"
 version = "0.2.16"
 dependencies = [
  "base64",
+ "bytes",
  "chrono",
  "clap",
  "colored",

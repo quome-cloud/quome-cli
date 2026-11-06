@@ -63,6 +63,39 @@ impl std::fmt::Debug for AuthToken {
     }
 }
 
+/// Per-request timeout for Git routes; the platform may hold a request up to
+/// 60 s while the org's git server starts.
+pub const GIT_REQUEST_TIMEOUT: Duration = Duration::from_secs(75);
+
+/// A short-lived token for the org's git server, brokered by the platform.
+#[derive(Clone, Deserialize, PartialEq)]
+pub struct GitToken {
+    pub access_token: String,
+    pub expires_in: u64,
+}
+
+/// Never prints the token itself.
+impl std::fmt::Debug for GitToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GitToken")
+            .field("access_token", &"<redacted>")
+            .field("expires_in", &self.expires_in)
+            .finish()
+    }
+}
+
+/// A repository on the org's git server.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct GitRepo {
+    pub slug: String,
+    #[serde(default)]
+    pub protection: Option<String>,
+    #[serde(default)]
+    pub required_approvals: Option<u64>,
+    #[serde(default)]
+    pub clone_url: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct Ports {
     pub detected: Vec<u16>,
@@ -474,7 +507,7 @@ pub const UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 /// Path-segment encoding: everything but unreserved characters (no `.`, so `..` cannot survive).
 const SEGMENT: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'_');
 
-fn enc(s: &str) -> String {
+pub(crate) fn enc(s: &str) -> String {
     utf8_percent_encode(s, SEGMENT).to_string()
 }
 
@@ -624,6 +657,17 @@ impl CloudApi {
         build: impl Fn(RequestBuilder) -> RequestBuilder,
         map: fn(u16, &str) -> QuomeError,
     ) -> Result<Response, QuomeError> {
+        check(self.send_raw(m, path, build).await?, map).await
+    }
+
+    /// Send with the 401 handling of `send`; returns the first non-401 answer
+    /// unchecked.
+    async fn send_raw(
+        &self,
+        m: Method,
+        path: &str,
+        build: impl Fn(RequestBuilder) -> RequestBuilder,
+    ) -> Result<Response, QuomeError> {
         let url = format!("{}{}", self.base, path);
         let mut retried = false;
         loop {
@@ -632,7 +676,7 @@ impl CloudApi {
                 .send()
                 .await?;
             if resp.status().as_u16() != 401 {
-                return check(resp, map).await;
+                return Ok(resp);
             }
             let text = resp.text().await.unwrap_or_default();
             let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
@@ -642,6 +686,34 @@ impl CloudApi {
             retried = true;
             self.tokens.invalidate(&token);
         }
+    }
+
+    /// A Git route: `GIT_REQUEST_TIMEOUT`, and a 503 keeps its `Retry-After`.
+    async fn send_git<T: serde::de::DeserializeOwned>(
+        &self,
+        m: Method,
+        path: &str,
+        build: impl Fn(RequestBuilder) -> RequestBuilder,
+    ) -> Result<T, QuomeError> {
+        let resp = self
+            .send_raw(m, path, |b| build(b.timeout(GIT_REQUEST_TIMEOUT)))
+            .await?;
+        if resp.status().as_u16() == 503 {
+            let retry_after = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<u64>().ok());
+            let text = resp.text().await.unwrap_or_default();
+            return Err(match map_error(503, &text) {
+                QuomeError::ApiError(message) => QuomeError::RetryLater {
+                    message,
+                    retry_after,
+                },
+                e => e,
+            });
+        }
+        Ok(check(resp, map_error).await?.json().await?)
     }
 
     fn org_path(&self, rest: &str) -> String {
@@ -1029,6 +1101,36 @@ impl CloudApi {
         let body = serde_json::json!({ "scope": scope });
         self.json(Method::POST, &self.org_path("/auth/token"), |b| {
             b.query(&[("env", env)]).json(&body)
+        })
+        .await
+    }
+
+    /// The org's git repositories.
+    pub async fn git_repos(&self) -> Result<Vec<GitRepo>, QuomeError> {
+        #[derive(Deserialize)]
+        struct List {
+            repos: Vec<GitRepo>,
+        }
+        let l: List = self
+            .send_git(Method::GET, &self.org_path("/git/repos"), |b| b)
+            .await?;
+        Ok(l.repos)
+    }
+
+    /// Create a git repository named `name` in the org.
+    pub async fn git_create_repo(&self, name: &str) -> Result<GitRepo, QuomeError> {
+        let body = serde_json::json!({ "name": name });
+        self.send_git(Method::POST, &self.org_path("/git/repos"), |b| {
+            b.json(&body)
+        })
+        .await
+    }
+
+    /// A token for the org's git server with `scope`.
+    pub async fn git_token(&self, scope: &[&str]) -> Result<GitToken, QuomeError> {
+        let body = serde_json::json!({ "scope": scope });
+        self.send_git(Method::POST, &self.org_path("/git/token"), |b| {
+            b.json(&body)
         })
         .await
     }
@@ -2326,5 +2428,169 @@ mod tests {
                 mcp_url: format!("{}/mcp", s.uri()),
             }
         );
+    }
+
+    #[tokio::test]
+    async fn git_token_posts_scope() {
+        let (s, api) = setup().await;
+        Mock::given(method("POST"))
+            .and(path(format!("/api/v1/orgs/{ORG}/git/token")))
+            .and(header("authorization", "Bearer AT"))
+            .and(wiremock::matchers::body_json(
+                serde_json::json!({"scope": ["repos_read", "repos_write"]}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "G1",
+                "issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
+                "token_type": "Bearer", "expires_in": 300,
+                "scope": "repos_read repos_write"
+            })))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let t = api.git_token(&["repos_read", "repos_write"]).await.unwrap();
+        assert_eq!((t.access_token.as_str(), t.expires_in), ("G1", 300));
+        assert!(!format!("{t:?}").contains("G1"));
+    }
+
+    #[tokio::test]
+    async fn git_503_keeps_retry_after() {
+        let (s, api) = setup().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v1/orgs/{ORG}/git/repos")))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .insert_header("Retry-After", "5")
+                    .set_body_json(
+                        serde_json::json!({"detail":"unavailable","reason":"git_starting"}),
+                    ),
+            )
+            .mount(&s)
+            .await;
+        match api.git_repos().await.unwrap_err() {
+            QuomeError::RetryLater {
+                message,
+                retry_after,
+            } => {
+                assert_eq!(message, "503 unavailable: git_starting");
+                assert_eq!(retry_after, Some(5));
+            }
+            e => panic!("{e:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn git_503_without_retry_after_is_none() {
+        let (s, api) = setup().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v1/orgs/{ORG}/git/repos")))
+            .respond_with(ResponseTemplate::new(503).set_body_json(
+                serde_json::json!({"detail":"unavailable","reason":"git_unavailable"}),
+            ))
+            .mount(&s)
+            .await;
+        match api.git_repos().await.unwrap_err() {
+            QuomeError::RetryLater {
+                message,
+                retry_after,
+            } => {
+                assert_eq!(message, "503 unavailable: git_unavailable");
+                assert_eq!(retry_after, None);
+            }
+            e => panic!("{e:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn git_create_repo_maps_conflict_and_invalid() {
+        let (s, api) = setup().await;
+        let p = format!("/api/v1/orgs/{ORG}/git/repos");
+        Mock::given(method("POST"))
+            .and(path(p.clone()))
+            .and(wiremock::matchers::body_json(
+                serde_json::json!({"name":"dup"}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(409)
+                    .set_body_json(serde_json::json!({"detail":"conflict","reason":"repo_exists"})),
+            )
+            .mount(&s)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(p.clone()))
+            .and(wiremock::matchers::body_json(
+                serde_json::json!({"name":"BAD"}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(422)
+                    .set_body_json(serde_json::json!({"detail":"invalid","reason":"bad_repo"})),
+            )
+            .mount(&s)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(p))
+            .and(wiremock::matchers::body_json(
+                serde_json::json!({"name":"api"}),
+            ))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "slug":"acme/api","class":"native","protection":"direct",
+                "required_approvals":1,"clone_url":"https://git.apps.example/acme/api.git"
+            })))
+            .mount(&s)
+            .await;
+        match api.git_create_repo("dup").await.unwrap_err() {
+            QuomeError::ApiError(m) => {
+                assert!(m.contains("409") && m.contains("repo_exists"), "{m}")
+            }
+            e => panic!("{e:?}"),
+        }
+        match api.git_create_repo("BAD").await.unwrap_err() {
+            QuomeError::ApiError(m) => assert!(m.contains("422") && m.contains("bad_repo"), "{m}"),
+            e => panic!("{e:?}"),
+        }
+        let r = api.git_create_repo("api").await.unwrap();
+        assert_eq!(r.slug, "acme/api");
+        assert_eq!(r.protection.as_deref(), Some("direct"));
+        assert_eq!(r.required_approvals, Some(1));
+        assert_eq!(
+            r.clone_url.as_deref(),
+            Some("https://git.apps.example/acme/api.git")
+        );
+    }
+
+    #[tokio::test]
+    async fn git_repos_lists() {
+        let (s, api) = setup().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v1/orgs/{ORG}/git/repos")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "repos":[{"slug":"acme/api","class":"native","protection":"direct","required_approvals":1}]
+            })))
+            .mount(&s)
+            .await;
+        let repos = api.git_repos().await.unwrap();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].slug, "acme/api");
+        assert_eq!(repos[0].clone_url, None);
+    }
+
+    #[tokio::test]
+    async fn non_git_503_is_unchanged() {
+        let (s, api) = setup().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v1/orgs/{ORG}/sandboxes")))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .insert_header("Retry-After", "5")
+                    .set_body_json(
+                        serde_json::json!({"detail":"unavailable","reason":"git_starting"}),
+                    ),
+            )
+            .mount(&s)
+            .await;
+        match api.list_sandboxes().await.unwrap_err() {
+            QuomeError::ApiError(m) => assert_eq!(m, "503 unavailable: git_starting"),
+            e => panic!("{e:?}"),
+        }
     }
 }
