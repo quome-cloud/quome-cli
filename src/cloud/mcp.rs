@@ -101,6 +101,9 @@ fn failed_rollout_note(failure: Option<&super::api::DeployFailure>, route: &str)
 }
 
 /// What an app is doing: its latest deploy first, then the service status.
+/// A failed deploy leaves the service as it was, so an app still `running`
+/// keeps serving its previous revision: it reads `running`, and the failure
+/// shows on `latest_deploy`. `crashed` is a failed deploy with nothing running.
 fn app_state(service_status: &str, latest: Option<&super::api::DeployRecord>) -> String {
     match latest {
         Some(d) if d.status == "in_progress" => {
@@ -110,7 +113,7 @@ fn app_state(service_status: &str, latest: Option<&super::api::DeployRecord>) ->
                 .any(|s| s.stage == "build" && s.status != "complete");
             if building { "building" } else { "rolling_out" }.to_string()
         }
-        Some(d) if d.status == "failed" => "crashed".to_string(),
+        Some(d) if d.status == "failed" && service_status != "running" => "crashed".to_string(),
         _ => service_status.to_string(),
     }
 }
@@ -2274,7 +2277,7 @@ impl QuomeMcp {
     }
 
     #[tool(
-        description = "Show an app's state by name (building, rolling_out, running, crashed, or the app's status), with its latest build and deploy. The URL is given only once a build has succeeded."
+        description = "Show an app's state by name (building, rolling_out, running, crashed, or the app's status), with its latest build and deploy. A failed deploy that left the previous version serving reads running; its failure is in latest_deploy. The URL is given only once a build has succeeded."
     )]
     async fn app_status(&self, Parameters(a): Parameters<AppArgs>) -> Result<String, String> {
         let Some(app) = self.find_app(&a.name).await? else {
@@ -4189,32 +4192,82 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn app_status_reports_crashed_with_the_latest_deploy() {
+    /// `app_status` for app1 whose service reads `status` and whose latest deploy is `deploy`.
+    async fn app_status_with(status: &str, deploy: Value) -> Value {
         let (s, mut c) = start().await;
-        sequence(&s, "GET", api_path("/services"), vec![svc("running")]).await;
+        sequence(&s, "GET", api_path("/services"), vec![svc(status)]).await;
         sequence(&s, "GET", api_path("/apps/app1/builds"), vec![json!([])]).await;
         sequence(
             &s,
             "GET",
             api_path("/apps/app1/deploys"),
-            vec![json!([deploy_row(
-                "failed",
-                json!("rollout failed"),
-                crash("panic: boom")
-            )])],
+            vec![json!([deploy])],
         )
         .await;
         let (err, text) = c.call("app_status", json!({"name":"web"})).await;
         assert!(!err, "{text}");
-        let v: Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(v["state"], "crashed", "{text}");
-        assert_eq!(v["status"], "running");
+        serde_json::from_str(&text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn app_status_reports_crashed_when_a_failed_deploy_left_nothing_running() {
+        let v = app_status_with(
+            "created",
+            deploy_row("failed", json!("rollout failed"), crash("panic: boom")),
+        )
+        .await;
+        assert_eq!(v["state"], "crashed", "{v}");
+        assert_eq!(v["status"], "created");
         assert_eq!(v["latest_deploy"]["deploy_id"], "d1");
         assert_eq!(v["latest_deploy"]["status"], "failed");
         assert_eq!(v["latest_deploy"]["error"], "rollout failed");
         assert_eq!(v["latest_deploy"]["failure"]["exit_code"], 1);
         assert_eq!(v["latest_deploy"]["failure"]["console_tail"], "panic: boom");
+    }
+
+    #[tokio::test]
+    async fn app_status_stays_running_when_a_failed_rollout_left_the_previous_revision_serving() {
+        let v = app_status_with(
+            "running",
+            deploy_row("failed", json!("rollout failed"), crash("panic: boom")),
+        )
+        .await;
+        assert_eq!(v["state"], "running", "{v}");
+        assert_eq!(v["latest_deploy"]["status"], "failed");
+        assert_eq!(v["latest_deploy"]["failure"]["console_tail"], "panic: boom");
+    }
+
+    #[tokio::test]
+    async fn app_status_stays_running_when_a_deploy_fails_before_its_build() {
+        // A repo deploy whose ref does not exist fails in the source stage; nothing was
+        // built or rolled out, and the previous revision keeps serving.
+        let deploy = json!({"id":"d1","service_id":"app1","status":"failed","source_kind":"repo",
+            "build_id":"b1","revision_id":null,
+            "error":"ref_not_found: acme/web has no branch, tag or commit 'no-such-branch'",
+            "created_at":"2026-11-01T00:00:00Z","finished_at":"2026-11-01T00:00:05Z",
+            "stages":[{"stage":"source","status":"failed","at":"2026-11-01T00:00:05Z"},
+                      {"stage":"build","status":"pending","at":null}],
+            "failure":null});
+        let v = app_status_with("running", deploy).await;
+        assert_eq!(v["state"], "running", "{v}");
+        assert_eq!(v["latest_deploy"]["status"], "failed");
+        assert!(v["latest_deploy"]["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("ref_not_found:"));
+        assert!(v["latest_deploy"]["failure"].is_null());
+    }
+
+    #[tokio::test]
+    async fn app_status_stays_running_when_an_upload_build_fails() {
+        let deploy = json!({"id":"d1","service_id":"app1","status":"failed","source_kind":"upload",
+            "build_id":"b1","revision_id":null,"error":"build failed",
+            "created_at":"2026-11-01T00:00:00Z","finished_at":"2026-11-01T00:01:00Z",
+            "stages":[{"stage":"build","status":"failed","at":"2026-11-01T00:01:00Z"}],
+            "failure":null});
+        let v = app_status_with("running", deploy).await;
+        assert_eq!(v["state"], "running", "{v}");
+        assert_eq!(v["latest_deploy"]["status"], "failed");
     }
 
     #[tokio::test]
