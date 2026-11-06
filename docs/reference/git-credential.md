@@ -21,20 +21,17 @@ Options:
 
 ## Setup
 
-Run these two lines once. The [`git_clone_url`](mcp.md#git) tool prints the helper line without `--add`; run the empty line first and then the `--add` form shown here, because the plain form would replace the empty entry.
+Run these three lines once. The [`git_clone_url`](mcp.md#git) tool prints the helper line without `--add`; run the empty line first and then the `--add` form shown here, because the plain form would replace the empty entry.
 
 ```bash
 git config --global credential.https://git.quome.cloud.helper ''
 git config --global --add credential.https://git.quome.cloud.helper '!quome git-credential'
+git config --global credential.https://git.quome.cloud.useHttpPath true
 ```
 
 The first line is empty on purpose. It clears any helper git would otherwise use for that host, such as the macOS keychain or a credential manager. Those helpers would keep the token, but it expires after 5 minutes, so the next `git push` would fail with a stale password. With only this helper left, git asks for a fresh token each time.
 
-If one computer is connected to several orgs (several profiles), also let git send the repo path, so the helper can tell which org's token to give:
-
-```bash
-git config --global credential.https://git.quome.cloud.useHttpPath true
-```
+The third line lets git send the repo path along with the host. Every org on one platform shares the same git host, so the path (it starts with the org) is what tells the helper which org's token to give. It is needed as soon as one computer is connected to several orgs (several profiles), and harmless with one.
 
 Without it, git sends only the host. When several connections serve the host and git sends no path, the helper uses the default profile only if it is one of them; otherwise it gives no credential and names this `useHttpPath` setting on stderr.
 
