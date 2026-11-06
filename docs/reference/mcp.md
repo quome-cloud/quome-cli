@@ -265,11 +265,22 @@ When a call fails, the tool says what to do:
 | Message | Meaning |
 |---------|---------|
 | Run `quome connect` again and allow caches. | This connection was not allowed to use caches. |
-| This cache has no pod budget left. Ask an org member to raise its pod pool in the console. | The cache cannot hold another pod. |
-| The cache is not running. Start it in the console, then try again. | The cache is stopped. |
+| Agents cannot change caches. Ask the person to do it in the console. | Creating, changing or deleting a cache is for people, in the console. |
+| The person you act for may not use caches in this org. Ask an org owner or admin. | The person's own role does not allow using caches. |
+| There is no cache by that name or id in this org; ask the person which cache to use. | No such cache. |
 | This cache does not support pods. | The cache cannot host pods. |
+| This cache is being deleted. | The cache is going away. |
+| This cache has no pod budget left. Ask an org member to raise its pod pool in the console. | The cache cannot hold another pod. |
+| The cache's app is using the memory pods would need. Ask an org member to raise the cache's size or lower its pod pool. | The first call that sets up a pod found no room next to the app's own data. |
+| The cache is not running. Start it in the console, then try again. | The cache is stopped. |
+| This cache needs a restart to enable pods. Ask an org member to restart it in the console. | The cache was made before pods and has not been restarted since. |
+| Your pod could not be set up on this cache. Ask an org member to check its pods in the console. | The pod is in a state the server will not hand out. |
+| Your pod was not found on this cache; try again. | The pod went away during the call. |
 | Your pod is full. Forget or delete something, or ask for a larger pod. | The pod's memory or fact limit is reached. |
+| This agent is no longer connected to the org. Run `quome connect` again. / The person this agent acts for is no longer a member of the org. | The agent or its person left the org. |
 | Tags start with a lowercase letter or digit and may contain lowercase letters, digits, `_`, `.`, `:` or `-` (at most 64 characters each); a call takes 1 to 16 tags; these words cannot be tags: anyof, since, until, topk, withfields, ts, tag, before, limit. | A tag, or the number of tags, is not allowed. |
+| The text must be 1 to 65,536 characters. / topk must be 1 to 100. / A key must be 1 to 512 bytes of text. / A value must be text of at most 1 MiB. / ttl must be 1 to 31,536,000 seconds. / That is not a fact id; use an id from cache_remember or cache_recall. / The request is too large; a value can be at most 1 MiB. | An argument is out of range. |
+| Quome Cloud is busy; wait a second and try again. / The cache did not answer in time; try again shortly. / The cache could not complete the call; try again shortly. | A passing failure on the server or the cache. |
 
 If calls come too fast (more than 50 a second for one agent) the tool says to wait and try again. Any other error is `Could not <action>: ` followed by the server's message.
 

@@ -489,26 +489,73 @@ fn app_hint(e: String, action: &str) -> String {
     }
 }
 
+/// The server's reason in an error message: the last `: `-separated part,
+/// when it is a reason word (`not_running`, `cache`). The detail before it can
+/// carry a cache's name, so advice never looks there.
+fn error_reason(e: &str) -> Option<&str> {
+    let r = e.rsplit(": ").next()?;
+    let word = !r.is_empty()
+        && r.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    word.then_some(r)
+}
+
+const TAG_RULES: &str = "Tags start with a lowercase letter or digit and may contain lowercase letters, digits, `_`, `.`, `:` or `-` (at most 64 characters each); a call takes 1 to 16 tags; these words cannot be tags: anyof, since, until, topk, withfields, ts, tag, before, limit.";
+
 /// Turn a pod-route error into a sentence for the agent. Errors without
 /// advice keep the server's message after "Could not {action}: ".
 fn cache_hint(e: String, action: &str) -> String {
-    let has = |r: &str| e.contains(r);
-    if has("reconnect_for_caches") {
-        "Run `quome connect` again and allow caches.".into()
-    } else if has("pod_budget_exhausted") {
-        "This cache has no pod budget left. Ask an org member to raise its pod pool in the console."
-            .into()
-    } else if has("not_running") {
-        "The cache is not running. Start it in the console, then try again.".into()
-    } else if has("not_qucache") || has("engine_predates_pods") {
-        "This cache does not support pods.".into()
-    } else if has("pod_full") || has("memory_quota_reached") {
-        "Your pod is full. Forget or delete something, or ask for a larger pod.".into()
-    } else if has("invalid_tag") {
-        "Tags start with a lowercase letter or digit and may contain lowercase letters, digits, `_`, `.`, `:` or `-` (at most 64 characters each); a call takes 1 to 16 tags; these words cannot be tags: anyof, since, until, topk, withfields, ts, tag, before, limit.".into()
-    } else {
-        format!("Could not {action}: {e}")
-    }
+    let not_found = e.starts_with("Not found: ");
+    let advice = match error_reason(&e).unwrap_or("") {
+        "reconnect_for_caches" => "Run `quome connect` again and allow caches.",
+        "agents_cannot_manage_caches" => {
+            "Agents cannot change caches. Ask the person to do it in the console."
+        }
+        "forbidden" => {
+            "The person you act for may not use caches in this org. Ask an org owner or admin."
+        }
+        "agents_only" => "Pods are for agents connected with `quome connect`.",
+        "agent" => "This agent is no longer connected to the org. Run `quome connect` again.",
+        "user" => "The person this agent acts for is no longer a member of the org.",
+        "cache" => {
+            "There is no cache by that name or id in this org; ask the person which cache to use."
+        }
+        "cache_deleting" => "This cache is being deleted.",
+        "pod_budget_exhausted" => {
+            "This cache has no pod budget left. Ask an org member to raise its pod pool in the console."
+        }
+        "hub_in_use" => {
+            "The cache's app is using the memory pods would need. Ask an org member to raise the cache's size or lower its pod pool."
+        }
+        "not_running" => "The cache is not running. Start it in the console, then try again.",
+        "engine_predates_pods" => {
+            "This cache needs a restart to enable pods. Ask an org member to restart it in the console."
+        }
+        "pod_conflict" => {
+            "Your pod could not be set up on this cache. Ask an org member to check its pods in the console."
+        }
+        "pod_not_found" => "Your pod was not found on this cache; try again.",
+        "pod_full" | "memory_quota_reached" => {
+            "Your pod is full. Forget or delete something, or ask for a larger pod."
+        }
+        "invalid_tag" => TAG_RULES,
+        "invalid_text" => "The text must be 1 to 65,536 characters.",
+        "invalid_topk" => "topk must be 1 to 100.",
+        "invalid_fact_id" => {
+            "That is not a fact id; use an id from cache_remember or cache_recall."
+        }
+        "invalid_key" => "A key must be 1 to 512 bytes of text.",
+        "invalid_value" | "value_too_large" => "A value must be text of at most 1 MiB.",
+        "invalid_ttl" => "ttl must be 1 to 31,536,000 seconds.",
+        "body_too_large" => "The request is too large; a value can be at most 1 MiB.",
+        "rate_limiter_unavailable" => "Quome Cloud is busy; wait a second and try again.",
+        "cache_unavailable" => "The cache did not answer in time; try again shortly.",
+        "cache_error" => "The cache could not complete the call; try again shortly.",
+        // The pod routes' one 404 `not_…` reason: a cache of a kind that has no pods.
+        r if not_found && r.starts_with("not_") => "This cache does not support pods.",
+        _ => return format!("Could not {action}: {e}"),
+    };
+    advice.into()
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -975,7 +1022,7 @@ impl QuomeMcp {
                 Err(e)
                     if !retried
                         && (is_session_error(&e)
-                            || describe(&e).contains("reconnect_for_caches"))
+                            || error_reason(&describe(&e)) == Some("reconnect_for_caches"))
                         && self.refresh(&api).await =>
                 {
                     retried = true;
@@ -6399,8 +6446,9 @@ mod tests {
     }
 
     fn pod_usage() -> Value {
-        json!({"namespace":"n1","maxmemory":33554432,"used_memory":1024,"keys":2,
-               "facts":3,"maxfacts":10000,"connected_clients":0})
+        // The server also sends the pod's internal name; the tools never pass it on.
+        json!({"maxmemory":33554432,"used_memory":1024,"keys":2,"facts":3,"maxfacts":10000,
+               "connected_clients":0,"internal":"agent-0123456789abcdef-0123456789abcdef"})
     }
 
     #[tokio::test]
@@ -6696,7 +6744,7 @@ mod tests {
             json!({"cache":"mem","tags":["a"]}),
             "/recall",
             404,
-            "not_qucache",
+            "not_a_pod_cache",
             "This cache does not support pods.",
         )
         .await;
@@ -6710,7 +6758,7 @@ mod tests {
             "/set",
             409,
             "engine_predates_pods",
-            "This cache does not support pods.",
+            "This cache needs a restart to enable pods. Ask an org member to restart it in the console.",
         )
         .await;
     }
@@ -6755,6 +6803,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cache_hint_hub_in_use_on_first_pod_call() {
+        cache_hint_case(
+            "cache_pod",
+            json!({"cache":"mem"}),
+            "",
+            409,
+            "hub_in_use",
+            "The cache's app is using the memory pods would need. Ask an org member to raise the cache's size or lower its pod pool.",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn cache_hint_agents_cannot_manage_caches_is_not_reconnect() {
+        cache_hint_case(
+            "cache_get",
+            json!({"cache":"mem","key":"k"}),
+            "/get",
+            403,
+            "agents_cannot_manage_caches",
+            "Agents cannot change caches. Ask the person to do it in the console.",
+        )
+        .await;
+    }
+
+    /// Every other reason the pod routes give, with its advice.
+    #[tokio::test]
+    async fn cache_hint_every_pod_route_reason() {
+        let forget = ("cache_forget", json!({"cache":"mem","id":1}), "/forget");
+        let set = (
+            "cache_set",
+            json!({"cache":"mem","key":"k","value":"v"}),
+            "/set",
+        );
+        let recall = (
+            "cache_recall",
+            json!({"cache":"mem","tags":["a"]}),
+            "/recall",
+        );
+        let remember = (
+            "cache_remember",
+            json!({"cache":"mem","text":"t","tags":["a"]}),
+            "/remember",
+        );
+        let pod = ("cache_pod", json!({"cache":"mem"}), "");
+        for ((tool, args, rest), status, reason, advice) in [
+            (pod.clone(), 404, "cache", "There is no cache by that name or id in this org; ask the person which cache to use."),
+            (pod.clone(), 409, "cache_deleting", "This cache is being deleted."),
+            (pod.clone(), 409, "pod_conflict", "Your pod could not be set up on this cache. Ask an org member to check its pods in the console."),
+            (pod.clone(), 404, "pod_not_found", "Your pod was not found on this cache; try again."),
+            (pod.clone(), 404, "agent", "This agent is no longer connected to the org. Run `quome connect` again."),
+            (pod.clone(), 404, "user", "The person this agent acts for is no longer a member of the org."),
+            (pod.clone(), 403, "forbidden", "The person you act for may not use caches in this org. Ask an org owner or admin."),
+            (pod.clone(), 403, "agents_only", "Pods are for agents connected with `quome connect`."),
+            (pod.clone(), 503, "rate_limiter_unavailable", "Quome Cloud is busy; wait a second and try again."),
+            (pod.clone(), 503, "cache_unavailable", "The cache did not answer in time; try again shortly."),
+            (pod, 502, "cache_error", "The cache could not complete the call; try again shortly."),
+            (remember.clone(), 422, "invalid_text", "The text must be 1 to 65,536 characters."),
+            (remember, 413, "body_too_large", "The request is too large; a value can be at most 1 MiB."),
+            (recall, 422, "invalid_topk", "topk must be 1 to 100."),
+            (forget, 422, "invalid_fact_id", "That is not a fact id; use an id from cache_remember or cache_recall."),
+            (set.clone(), 422, "invalid_key", "A key must be 1 to 512 bytes of text."),
+            (set.clone(), 422, "invalid_value", "A value must be text of at most 1 MiB."),
+            (set.clone(), 413, "value_too_large", "A value must be text of at most 1 MiB."),
+            (set, 422, "invalid_ttl", "ttl must be 1 to 31,536,000 seconds."),
+        ] {
+            let (s, mut c) = start().await;
+            let verb = if rest.is_empty() { "GET" } else { "POST" };
+            Mock::given(method(verb))
+                .and(path(pod_path(rest)))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .set_body_json(json!({"detail":"refused","reason":reason})),
+                )
+                .mount(&s)
+                .await;
+            let (err, text) = c.call(tool, args).await;
+            assert!(err, "{reason}: {text}");
+            assert_eq!(text, advice, "{reason}");
+        }
+    }
+
+    /// Advice follows the reason, not words the server put in the detail
+    /// (which can carry the cache's name).
+    #[tokio::test]
+    async fn cache_hint_reads_the_reason_not_the_detail() {
+        let (s, mut c) = start().await;
+        Mock::given(method("GET"))
+            .and(path(pod_path("")))
+            .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+                "detail":"no pod budget left on reconnect_for_caches",
+                "reason":"pod_budget_exhausted"
+            })))
+            .mount(&s)
+            .await;
+        let (err, text) = c.call("cache_pod", json!({"cache":"mem"})).await;
+        assert!(err, "{text}");
+        assert_eq!(
+            text,
+            "This cache has no pod budget left. Ask an org member to raise its pod pool in the console."
+        );
+    }
+
+    #[tokio::test]
     async fn cache_rate_limited_says_wait() {
         let (s, mut c) = start().await;
         Mock::given(method("POST"))
@@ -6777,14 +6929,14 @@ mod tests {
         Mock::given(method("POST"))
             .and(path(pod_path("/del")))
             .respond_with(
-                ResponseTemplate::new(503)
-                    .set_body_json(json!({"detail":"no answer","reason":"cache_unavailable"})),
+                ResponseTemplate::new(500)
+                    .set_body_json(json!({"detail":"oops","reason":"something_new"})),
             )
             .mount(&s)
             .await;
         let (err, text) = c.call("cache_del", json!({"cache":"mem","key":"k"})).await;
         assert!(err, "{text}");
-        assert!(text.contains("cache_unavailable"), "{text}");
+        assert!(text.contains("something_new"), "{text}");
         assert!(text.contains("delete the key"), "{text}");
     }
 
@@ -6822,13 +6974,17 @@ mod tests {
         ] {
             let (err, text) = c.call(tool, args).await;
             assert!(!err, "{tool}: {text}");
-            assert!(!text.contains("namespace"), "{tool}: {text}");
+            assert!(!text.contains("agent-"), "{tool}: {text}");
         }
+        let allowed = ["text", "tags", "topk", "id", "key", "value", "ttl"];
         for r in s.received_requests().await.unwrap() {
-            let url = r.url.to_string();
-            let body = String::from_utf8_lossy(&r.body);
-            assert!(!url.contains("namespace"), "{url}");
-            assert!(!body.contains("namespace"), "{url}: {body}");
+            if r.body.is_empty() || !r.url.path().contains("/my-pod") {
+                continue;
+            }
+            let body: Value = serde_json::from_slice(&r.body).unwrap();
+            for k in body.as_object().unwrap().keys() {
+                assert!(allowed.contains(&k.as_str()), "{}: {k}", r.url);
+            }
         }
     }
 
@@ -6844,10 +7000,9 @@ mod tests {
             .collect();
         assert_eq!(tools.len(), 7);
         for t in tools {
-            let text = t.to_string().to_lowercase();
-            assert!(!text.contains("namespace"), "{text}");
             let d = t["description"].as_str().unwrap();
             assert!(d.contains("private"), "{d}");
+            assert!(d.contains("pod in a Quome Cloud cache"), "{d}");
         }
     }
 

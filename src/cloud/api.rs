@@ -37,7 +37,6 @@ pub struct Me {
 /// Size and usage of an agent's private pod in a Quome Cloud cache.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct PodInfo {
-    pub namespace: String,
     pub maxmemory: u64,
     pub used_memory: u64,
     pub keys: u64,
@@ -2750,13 +2749,12 @@ mod tests {
             "GET",
             "",
             serde_json::Value::Null,
-            serde_json::json!({"namespace":"n1","maxmemory":100,"used_memory":10,"keys":2,
+            serde_json::json!({"internal":"agent-x","maxmemory":100,"used_memory":10,"keys":2,
                 "facts":3,"maxfacts":50,"connected_clients":1}),
         )
         .mount(&s)
         .await;
         let p = api.cache_pod("mem").await.unwrap();
-        assert_eq!(p.namespace, "n1");
         assert_eq!((p.maxmemory, p.used_memory, p.keys), (100, 10, 2));
         assert_eq!((p.facts, p.maxfacts, p.connected_clients), (3, 50, 1));
     }
@@ -2900,10 +2898,11 @@ mod tests {
             .and(path(format!(
                 "/api/v1/orgs/{ORG}/caches/my%20cache%2F1/my-pod"
             )))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({"namespace":"n","maxmemory":1,"used_memory":0,"keys":0,
-                    "facts":0,"maxfacts":1,"connected_clients":0}),
-            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"maxmemory":1,"used_memory":0,"keys":0,
+                    "facts":0,"maxfacts":1,"connected_clients":0})),
+            )
             .mount(&s)
             .await;
         api.cache_pod("my cache/1").await.unwrap();
