@@ -101,6 +101,9 @@ enum Commands {
         #[command(subcommand)]
         command: commands::cloud::CloudCommands,
     },
+    /// Git credential helper for the org's Git repos (Quome Cloud)
+    #[command(name = "git-credential")]
+    GitCredential(commands::git_credential::Args),
     /// Upgrade quome to the latest version
     Upgrade,
 }
@@ -130,6 +133,7 @@ async fn main() {
         Commands::Connect(args) => commands::connect::execute(args).await,
         Commands::Mcp(args) => commands::mcp::execute(args).await,
         Commands::Cloud { command } => commands::cloud::execute(command).await,
+        Commands::GitCredential(args) => commands::git_credential::execute(args).await,
         Commands::Upgrade => commands::upgrade::execute().await,
     };
 

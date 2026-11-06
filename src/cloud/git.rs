@@ -450,6 +450,23 @@ impl GitClient {
         Ok(t)
     }
 
+    /// A fresh write token for plain git, waiting while the server starts. A
+    /// connection approved before Git existed lacks the write capability, so
+    /// that one case gets a read token instead; any other error is returned.
+    pub async fn credential_token(&self) -> Result<GitToken, GitError> {
+        let mint = |access: Access| {
+            self.platform(&NoProgress, move |api| async move {
+                api.git_token(access.scopes()).await
+            })
+        };
+        match mint(Access::Write).await {
+            Err(GitError::Api(e)) if e.to_string().contains("capability_missing") => {
+                mint(Access::Read).await
+            }
+            other => other,
+        }
+    }
+
     /// Drop the cached token for `access` if it is still `token`.
     async fn evict(&self, access: Access, token: &str) {
         let mut cache = self.cache.lock().await;
