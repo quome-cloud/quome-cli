@@ -93,7 +93,7 @@ Full walkthrough with expected output: **[Getting started](docs/getting-started.
 | `quome host …` | Run a sandbox host on your own computer | [Host](docs/reference/host.md) |
 | `quome upgrade` | Self-update via Homebrew | [Upgrade](docs/reference/upgrade.md) |
 | `quome connect` | **Quome Cloud:** connect this computer and register it with Claude Code | [Connect](docs/reference/connect.md) |
-| `quome mcp` | **Quome Cloud:** MCP server (sandboxes, previews, app deploys, one-click apps, email inboxes, auth, Git) for Claude Code | [MCP](docs/reference/mcp.md) |
+| `quome mcp` | **Quome Cloud:** MCP server (sandboxes, previews, app deploys, one-click apps, email inboxes, auth, Git, cache pods) for Claude Code | [MCP](docs/reference/mcp.md) |
 | `quome cloud status` / `disconnect` | **Quome Cloud:** check or drop the connection | [Cloud](docs/reference/cloud.md) |
 | `quome git-credential` | **Quome Cloud:** lets plain git sign in to the org's repos | [Git credential](docs/reference/git-credential.md) |
 
