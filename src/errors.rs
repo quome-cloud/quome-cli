@@ -24,6 +24,14 @@ pub enum QuomeError {
     #[error("API error: {0}")]
     ApiError(String),
 
+    /// The service answered 503 and may be ready shortly; `retry_after` is the
+    /// `Retry-After` header in seconds, when sent as an integer.
+    #[error("API error: {message}")]
+    RetryLater {
+        message: String,
+        retry_after: Option<u64>,
+    },
+
     /// A problem the CLI detected itself (bad input, a command the current
     /// credential can never run) — printed verbatim, no "API error" prefix.
     #[error("{0}")]
