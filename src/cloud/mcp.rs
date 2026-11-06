@@ -51,6 +51,9 @@ pub struct Timing {
     pub log_retry: Duration,
 }
 
+/// How long `create_sandbox` waits, once the sandbox runs, for its repo's clone.
+const CLONE_WAIT: Duration = Duration::from_secs(60);
+
 impl Default for Timing {
     fn default() -> Self {
         Timing {
@@ -301,6 +304,11 @@ pub struct CreateSandboxArgs {
     auth_client: Option<String>,
     /// Redirect path for that client. Default /auth/callback.
     auth_redirect_path: Option<String>,
+    /// A repo of the org's Git to clone into /workspace/<name> at creation: `<name>` or `<org>/<name>`. Use it to work on code that is already in the org's Git. The clone is best effort: the result's git_bootstrap says whether it is done, failed or still pending.
+    repo: Option<String>,
+    /// Branch, tag or commit of `repo` to check out. Default: the repo's default branch. Only with `repo`.
+    #[serde(rename = "ref")]
+    git_ref: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -359,10 +367,112 @@ pub struct PreviewArgs {
 pub struct DeployArgs {
     /// App name (2-31 chars: lowercase letter, then lowercase letters, digits or hyphens).
     name: String,
-    /// Local folder containing the app and its Dockerfile.
-    folder: String,
+    /// Local folder containing the app and its Dockerfile. Give exactly one of `folder` and `repo`.
+    folder: Option<String>,
+    /// A repo of the org's Git to deploy instead of a folder: `<name>` or `<org>/<name>`, with a Dockerfile at its root. Use it when the code is already in the org's Git; no local checkout is needed.
+    repo: Option<String>,
+    /// Branch, tag or commit of `repo` to deploy. Default: the repo's default branch. Only with `repo`.
+    #[serde(rename = "ref")]
+    git_ref: Option<String>,
     /// Memory in GB: 0.5, 1, 2, 4, 8, 16, 32 or 64. Default 1.
     memory_gb: Option<f64>,
+}
+
+/// Where `deploy_app` takes the source from.
+enum DeploySource {
+    Folder(String),
+    Repo {
+        repo: String,
+        git_ref: Option<String>,
+    },
+}
+
+const REF_NEEDS_REPO: &str =
+    "ref goes with repo: it names a branch, tag or commit of the repo; give repo too.";
+
+impl DeployArgs {
+    fn source(&self) -> Result<DeploySource, String> {
+        match (&self.folder, &self.repo) {
+            (Some(_), Some(_)) | (None, None) => Err(
+                "Give exactly one of folder and repo: a local folder to upload, or a repo of the org's Git."
+                    .into(),
+            ),
+            (Some(_), None) if self.git_ref.is_some() => Err(REF_NEEDS_REPO.into()),
+            (Some(f), None) => Ok(DeploySource::Folder(f.clone())),
+            (None, Some(r)) => Ok(DeploySource::Repo {
+                repo: r.clone(),
+                git_ref: self.git_ref.clone(),
+            }),
+        }
+    }
+}
+
+/// Turn an error from a call that names a repo of the org's Git (a repo
+/// deploy, a sandbox created from a repo) into a sentence for the agent.
+fn repo_hint(e: String) -> String {
+    let advice = match error_reason(&e).unwrap_or("") {
+        "invalid_repo" => {
+            "repo must be <name> or <org>/<name>: a name of lowercase letters, digits, `.`, `_` or `-` (at most 63, no `.git`); git_repos lists the org's repos."
+        }
+        "repo_owner" => {
+            "That repo is not in this org's Git: <org> in <org>/<name> must be this org, or give just <name>."
+        }
+        "invalid_ref" => "ref is not a valid branch, tag or commit name.",
+        "repo_required" => REF_NEEDS_REPO,
+        "capability_missing" => "Run `quome connect` again and allow Git access.",
+        "deploy_in_progress" => {
+            "That app is already deploying; wait for it (app_status), then try again."
+        }
+        "no_identity" => {
+            "The clone runs as the person this agent acts for, and this connection names none; create the sandbox without repo, or run `quome connect` again."
+        }
+        _ => return e,
+    };
+    advice.into()
+}
+
+/// Advice for a repo deploy whose source could not be fetched from the
+/// org's Git (the build failed before it ran), from the API's reason code or,
+/// failing that, its message forms; `None` for any other build failure.
+fn repo_fetch_note(error: &str) -> Option<&'static str> {
+    // The build error reads `<kind>: <code>: <message>`, or just the message.
+    let code = |c: &str| error.split(": ").any(|part| part == c);
+    let has = |m: &str| error.contains(m);
+    Some(
+        if code("repo_not_found") || has("is not a repository in this org's Git") {
+            "The repo is not in the org's Git; git_repos lists the org's repos."
+        } else if code("ref_not_found")
+            || has("has no branch, tag or commit")
+            || has("has no commits on its default branch")
+        {
+            "No such ref in the repo (or the repo is empty); check ref, or push a commit."
+        } else if code("submodule_unsupported") || has("contains a submodule") {
+            "The repo has a submodule; deploys need a tree without submodules."
+        } else if code("source_too_large") || has("is over 512 MiB") {
+            "The repo's source is over 512 MiB; make it smaller or deploy a folder with a .dockerignore."
+        } else if has("keeps failing to start") {
+            "The org's Git keeps failing to start; ask an org member to check it in the console."
+        } else if code("git_starting")
+            || code("git_unavailable")
+            || (has("the org's Git server") && has("deploy again"))
+        {
+            "The org's Git was not ready; call deploy_app again."
+        } else if [
+            "invalid_ref",
+            "archive_bad_path",
+            "archive_unsupported",
+            "git_rejected",
+            "bad_archive",
+        ]
+        .into_iter()
+        .any(code)
+            || has("the org's Git server")
+        {
+            "The org's Git could not provide the source; see error."
+        } else {
+            return None;
+        },
+    )
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1193,6 +1303,9 @@ impl QuomeMcp {
         a: CreateSandboxArgs,
         progress: &Progress,
     ) -> Result<String, String> {
+        if a.git_ref.is_some() && a.repo.is_none() {
+            return Err(REF_NEEDS_REPO.into());
+        }
         let name = a.name.unwrap_or_else(|| {
             format!("agent-{}", &uuid::Uuid::new_v4().simple().to_string()[..6])
         });
@@ -1202,13 +1315,16 @@ impl QuomeMcp {
             runtime: a.runtime.as_deref().unwrap_or("claude"),
             auth_client: a.auth_client.as_deref(),
             auth_redirect_path: a.auth_redirect_path.as_deref(),
-        }))?;
+            repo: a.repo.as_deref(),
+            git_ref: a.git_ref.as_deref(),
+        }))
+        .map_err(|e| if a.repo.is_some() { repo_hint(e) } else { e })?;
         progress.note(format!("Created sandbox {name}")).await;
         let deadline = Instant::now() + self.timing.sandbox_wait;
         let mut cur = sb;
         loop {
             match cur.status.as_str() {
-                "running" => return json(&sandbox_json(&cur)),
+                "running" => return json(&self.clone_wait(cur, progress).await?),
                 "failed" | "stopped" | "stopping" | "deleting" => {
                     return Err(format!(
                         "Sandbox {} is {}{}",
@@ -1236,6 +1352,58 @@ impl QuomeMcp {
             tokio::time::sleep(self.timing.poll).await;
             cur = call!(self, |api| api.get_sandbox(&cur.id))?;
         }
+    }
+
+    /// A running sandbox's result. One created from a repo also carries the
+    /// clone's state, polled while it is pending for up to `CLONE_WAIT`; a
+    /// failed or unfinished clone is reported, never an error.
+    async fn clone_wait(
+        &self,
+        mut cur: Sandbox,
+        progress: &Progress,
+    ) -> Result<serde_json::Value, String> {
+        let deadline = Instant::now() + CLONE_WAIT.min(self.timing.sandbox_wait);
+        while cur
+            .git_bootstrap
+            .as_ref()
+            .is_some_and(|b| b.status == "pending")
+            && Instant::now() < deadline
+        {
+            progress
+                .note(format!("Sandbox {} is cloning its repo", cur.name))
+                .await;
+            tokio::time::sleep(self.timing.poll).await;
+            cur = call!(self, |api| api.get_sandbox(&cur.id))?;
+        }
+        let mut out = sandbox_json(&cur);
+        let Some(b) = &cur.git_bootstrap else {
+            return Ok(out);
+        };
+        let dir = format!(
+            "/workspace/{}",
+            b.repo.rsplit('/').next().unwrap_or(&b.repo)
+        );
+        out["git_bootstrap"] = serde_json::json!({
+            "repo": b.repo, "ref": b.git_ref, "status": b.status, "error": b.error, "path": dir});
+        match b.status.as_str() {
+            "failed" => {
+                out["note"] = format!(
+                    "The sandbox is running, but cloning {} into {dir} failed: {}. Clone it yourself with exec (git_clone_url gives the URL), or create a sandbox without repo.",
+                    b.repo,
+                    b.error.as_deref().unwrap_or("no reason given")
+                )
+                .into();
+            }
+            "pending" => {
+                out["note"] = format!(
+                    "The sandbox is running and still cloning {} into {dir}; check with list_files or list_sandboxes shortly.",
+                    b.repo
+                )
+                .into();
+            }
+            _ => {}
+        }
+        Ok(out)
     }
 
     /// The end of a failed build's log; `None` when there is none or it
@@ -1298,41 +1466,116 @@ impl QuomeMcp {
 
     async fn deploy_run(&self, a: DeployArgs, progress: &Progress) -> Result<String, String> {
         let deadline = Instant::now() + self.timing.build_wait;
-        progress.note("Packing the folder").await;
-        let folder = std::path::PathBuf::from(&a.folder);
-        let packed = tokio::task::spawn_blocking(move || pack_folder(&folder))
-            .await
-            .map_err(|e| e.to_string())?
-            .map_err(fail)?;
+        let source = a.source()?;
+        let packed = match &source {
+            DeploySource::Folder(folder) => {
+                progress.note("Packing the folder").await;
+                let folder = std::path::PathBuf::from(folder);
+                let packed = tokio::task::spawn_blocking(move || pack_folder(&folder))
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .map_err(fail)?;
+                Some(packed)
+            }
+            DeploySource::Repo { .. } => None,
+        };
         let app = match self.find_app(&a.name).await? {
             Some(app) => app,
             None => call!(self, |api| api
                 .create_app(&a.name, a.memory_gb.unwrap_or(1.0)))?,
         };
-        progress
-            .note(format!("Uploading {} bytes of source", packed.size))
-            .await;
-        let up = call!(self, |api| api.upload_source(&app.id, packed.path()))?;
-        let dep = call!(self, |api| api.deploy(&app.id, &up.source_key))?;
-        let log = self.build_log_route(&app.id, &dep.build_id);
+        let (dep, repo) = match (&source, &packed) {
+            (DeploySource::Repo { repo, git_ref }, _) => {
+                progress
+                    .note(format!("Deploying {repo} from the org's Git"))
+                    .await;
+                let dep = call!(self, |api| api.deploy_repo(
+                    &app.id,
+                    repo,
+                    git_ref.as_deref()
+                ))
+                .map_err(repo_hint)?;
+                (dep, Some((repo.clone(), git_ref.clone())))
+            }
+            (DeploySource::Folder(_), Some(packed)) => {
+                progress
+                    .note(format!("Uploading {} bytes of source", packed.size))
+                    .await;
+                let up = call!(self, |api| api.upload_source(&app.id, packed.path()))?;
+                (
+                    call!(self, |api| api.deploy(&app.id, &up.source_key))?,
+                    None,
+                )
+            }
+            (DeploySource::Folder(_), None) => unreachable!("a folder is packed above"),
+        };
+        let mut row = None;
+        let mut out = self
+            .deploy_wait(
+                &app.id,
+                &a.name,
+                &dep,
+                repo.is_some(),
+                &mut row,
+                deadline,
+                progress,
+            )
+            .await?;
+        if let Some((asked, git_ref)) = repo {
+            // The API's `<org>/<name>` when it gave one, else the repo as asked.
+            let (seen, commit) = row.map(|d| (d.repo, d.commit)).unwrap_or_default();
+            let repo = seen.or(dep.repo.clone()).unwrap_or(asked);
+            out["source"] = serde_json::json!({"repo": repo, "ref": git_ref, "commit": commit});
+        }
+        json(&out)
+    }
+
+    /// Wait for a requested deploy's build, then its rollout; the result for
+    /// `deploy_app`. `row` is the deploy row last read (a repo deploy's source).
+    #[allow(clippy::too_many_arguments)]
+    async fn deploy_wait(
+        &self,
+        app_id: &str,
+        name: &str,
+        dep: &super::api::Deploy,
+        from_repo: bool,
+        row: &mut Option<super::api::DeployRecord>,
+        deadline: Instant,
+        progress: &Progress,
+    ) -> Result<serde_json::Value, String> {
+        let log = self.build_log_route(app_id, &dep.build_id);
 
         // The build.
         loop {
-            let b = call!(self, |api| api.build(&app.id, &dep.build_id))?;
+            let b = call!(self, |api| api.build(app_id, &dep.build_id))?;
             progress.note(format!("Build {}", b.status)).await;
             match b.status.as_str() {
                 "succeeded" => break,
                 "failed" => {
-                    let tail = self.log_tail(&app.id, &b.id).await;
-                    return json(&serde_json::json!({
+                    // A repo whose source could not be fetched never built: say why instead.
+                    let fetch = b
+                        .error
+                        .as_deref()
+                        .filter(|_| from_repo)
+                        .and_then(repo_fetch_note);
+                    let tail = match fetch {
+                        Some(_) => None,
+                        None => self.log_tail(app_id, &b.id).await,
+                    };
+                    let note = match fetch {
+                        Some(n) => {
+                            format!("The source could not be fetched from the org's Git. {n}")
+                        }
+                        None => failed_build_note(tail.is_some(), &log),
+                    };
+                    return Ok(serde_json::json!({
                         "status": "failed", "build_id": b.id, "error": b.error, "url": null,
-                        "log_tail": tail,
-                        "note": failed_build_note(tail.is_some(), &log)}));
+                        "log_tail": tail, "note": note}));
                 }
                 _ => {}
             }
             if Instant::now() >= deadline {
-                return json(&serde_json::json!({
+                return Ok(serde_json::json!({
                     "status": "building", "build_id": dep.build_id, "url": null,
                     "note": "Still building after 10 minutes; check app_status later."}));
             }
@@ -1341,21 +1584,22 @@ impl QuomeMcp {
 
         // The image is built; the deploy row settles once the rollout does.
         loop {
-            let d = call!(self, |api| api.get_deploy(&app.id, &dep.deploy_id))?;
+            let d = call!(self, |api| api.get_deploy(app_id, &dep.deploy_id))?;
+            *row = Some(d.clone());
             progress
                 .note(format!("Build succeeded; deploy {}", d.status))
                 .await;
             match d.status.as_str() {
                 "succeeded" => {
-                    return json(&serde_json::json!({
+                    return Ok(serde_json::json!({
                         "status": "running", "build_status": "succeeded",
-                        "url": self.app_url(&a.name), "build_id": dep.build_id,
+                        "url": self.app_url(name), "build_id": dep.build_id,
                         "deploy_id": dep.deploy_id}));
                 }
                 "failed" => {
                     let f = d.failure.as_ref();
                     let output = f.map(|f| f.console_tail.as_str()).unwrap_or("");
-                    return json(&serde_json::json!({
+                    return Ok(serde_json::json!({
                         "status": "failed", "build_status": "succeeded",
                         "build_id": dep.build_id, "deploy_id": dep.deploy_id,
                         "error": f
@@ -1371,7 +1615,7 @@ impl QuomeMcp {
                 _ => {}
             }
             if Instant::now() >= deadline {
-                return json(&serde_json::json!({
+                return Ok(serde_json::json!({
                     "status": "deploying", "build_status": "succeeded",
                     "build_id": dep.build_id, "deploy_id": dep.deploy_id, "url": null,
                     "note": "The build succeeded but the app is still deploying after 10 minutes; check app_status later."}));
@@ -1852,7 +2096,7 @@ impl QuomeMcp {
     }
 
     #[tool(
-        description = "Create a sandbox (a Linux workspace with a coding-agent runtime) and wait until it is running."
+        description = "Create a sandbox (a Linux workspace with a coding-agent runtime) and wait until it is running. To work on code that is already in the org's Git, pass repo (`<name>` or `<org>/<name>`) and optionally ref (default: the repo's default branch): the repo is cloned into /workspace/<name>, no local checkout needed. The clone is best effort: git_bootstrap in the result says done, failed (with the error; the sandbox still runs) or pending."
     )]
     async fn create_sandbox(
         &self,
@@ -2018,7 +2262,7 @@ impl QuomeMcp {
     }
 
     #[tool(
-        description = "Deploy a local folder with a Dockerfile as a Quome Cloud app: create the app if needed, upload the source, build, then wait for the new revision to run, up to 10 minutes in all. Returns status running with the app URL when it is live; otherwise the build or rollout state and where to read the logs. When the container does not stay up, error says what was observed and container_output is its last lines."
+        description = "Deploy a local folder, or a repo of the org's Git, with a Dockerfile as a Quome Cloud app: create the app if needed, upload the folder (a repo needs no upload), build, then wait for the new revision to run, up to 10 minutes in all. Returns status running with the app URL when it is live; otherwise the build or rollout state and where to read the logs. When the container does not stay up, error says what was observed and container_output is its last lines. Give exactly one of folder and repo. Use repo (`<name>` or `<org>/<name>`, with optional ref: branch, tag or commit, default the repo's default branch) when the code already lives in the org's Git and there is no local checkout; the result's source gives the repo, ref and resolved commit."
     )]
     async fn deploy_app(
         &self,
@@ -3590,6 +3834,359 @@ mod tests {
         assert_eq!(v["build_status"], "succeeded");
         assert_eq!(v["deploy_id"], "d1");
         assert_eq!(v["url"], "https://web-acme.apps.example");
+    }
+
+    #[tokio::test]
+    async fn deploy_app_needs_exactly_one_source_before_any_request() {
+        let (s, mut c) = start().await;
+        let dir = docker_dir();
+        let folder = dir.path().to_str().unwrap();
+        for (args, want) in [
+            (json!({"name":"web"}), "exactly one of folder and repo"),
+            (
+                json!({"name":"web","folder":folder,"repo":"site"}),
+                "exactly one of folder and repo",
+            ),
+            (
+                json!({"name":"web","folder":folder,"ref":"main"}),
+                "ref goes with repo",
+            ),
+        ] {
+            let (err, text) = c.call("deploy_app", args.clone()).await;
+            assert!(err, "{args}");
+            assert!(text.contains(want), "{args}: {text}");
+        }
+        assert!(s.received_requests().await.unwrap().is_empty());
+    }
+
+    /// A repo deploy row: the deploy row with its source.
+    fn repo_row(status: &str, commit: Value) -> Value {
+        let mut r = deploy_row(status, Value::Null, Value::Null);
+        r["source_kind"] = json!("repo");
+        r["repo"] = json!("acme/site");
+        r["ref"] = json!("main");
+        r["commit"] = commit;
+        r
+    }
+
+    #[tokio::test]
+    async fn deploy_app_from_a_repo_skips_the_upload_and_reports_the_commit() {
+        let (s, mut c) = start().await;
+        deploy_setup(&s, &["created"], &["building", "succeeded"]).await;
+        deploy_rows(
+            &s,
+            vec![
+                repo_row("in_progress", Value::Null),
+                repo_row("succeeded", json!("0123abc")),
+            ],
+        )
+        .await;
+        let (err, text) = c
+            .call(
+                "deploy_app",
+                json!({"name":"web","repo":"site","ref":"main"}),
+            )
+            .await;
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["status"], "running", "{text}");
+        assert_eq!(v["url"], "https://web-acme.apps.example");
+        assert_eq!(
+            v["source"],
+            json!({"repo":"acme/site","ref":"main","commit":"0123abc"}),
+            "{text}"
+        );
+        let reqs = s.received_requests().await.unwrap();
+        assert!(!reqs.iter().any(|r| r.method.as_str() == "PUT"), "uploaded");
+        let dep = reqs
+            .iter()
+            .find(|r| r.url.path().ends_with("/apps/app1/deploy"))
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&dep.body).unwrap(),
+            json!({"repo":"site","ref":"main"})
+        );
+    }
+
+    #[tokio::test]
+    async fn deploy_app_from_a_repo_omits_ref_and_creates_the_app() {
+        let (s, mut c) = start().await;
+        sequence(&s, "GET", api_path("/services"), vec![json!([])]).await;
+        Mock::given(method("POST"))
+            .and(path(api_path("/services")))
+            .respond_with(ResponseTemplate::new(201).set_body_json(
+                json!({"id":"app1","kind":"app","name":"web","memory_gb":0.5,"status":"created"}),
+            ))
+            .expect(1)
+            .mount(&s)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(api_path("/apps/app1/deploy")))
+            .and(body_json(json!({"repo":"acme/site"})))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({
+                "deploy_id":"d1","build_id":"b1","workflow_id":"w1",
+                "repo":"acme/site","ref":null})))
+            .expect(1)
+            .mount(&s)
+            .await;
+        sequence(
+            &s,
+            "GET",
+            api_path("/apps/app1/builds/b1"),
+            vec![build("succeeded")],
+        )
+        .await;
+        let mut row = repo_row("succeeded", json!("0123abc"));
+        row["ref"] = Value::Null;
+        deploy_rows(&s, vec![row]).await;
+        let (err, text) = c
+            .call(
+                "deploy_app",
+                json!({"name":"web","repo":"acme/site","memory_gb":0.5}),
+            )
+            .await;
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["status"], "running", "{text}");
+        assert_eq!(
+            v["source"],
+            json!({"repo":"acme/site","ref":null,"commit":"0123abc"})
+        );
+    }
+
+    #[tokio::test]
+    async fn deploy_app_from_a_repo_explains_the_api_reasons() {
+        for (status, reason, want) in [
+            (422, "invalid_repo", "<name> or <org>/<name>"),
+            (422, "repo_owner", "this org"),
+            (422, "invalid_ref", "not a valid branch, tag or commit"),
+            (403, "capability_missing", "allow Git access"),
+            (409, "deploy_in_progress", "already deploying"),
+        ] {
+            let (s, mut c) = start().await;
+            sequence(&s, "GET", api_path("/services"), vec![svc("running")]).await;
+            Mock::given(method("POST"))
+                .and(path(api_path("/apps/app1/deploy")))
+                .respond_with(ResponseTemplate::new(status).set_body_json(
+                    json!({"detail": if status == 422 { "invalid" } else { "forbidden" },
+                           "reason": reason}),
+                ))
+                .mount(&s)
+                .await;
+            let (err, text) = c
+                .call("deploy_app", json!({"name":"web","repo":"site"}))
+                .await;
+            assert!(err, "{reason}");
+            assert!(text.contains(want), "{reason}: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn deploy_app_from_a_repo_explains_a_failed_source_fetch() {
+        for (error, want) in [
+            (
+                "acme/zzz is not a repository in this org's Git server",
+                "git_repos",
+            ),
+            ("acme/site has no branch, tag or commit 'nope'", "ref"),
+            (
+                "ArchiveError: ref_not_found: acme/site has no branch, tag or commit 'nope'",
+                "check ref",
+            ),
+            ("ArchiveError: git_starting: try later", "deploy_app again"),
+            ("ArchiveError: source_too_large: too big", "512 MiB"),
+            (
+                "acme/site@main contains a submodule; deploys need a tree without submodules",
+                "submodule",
+            ),
+            (
+                "the org's Git server did not start in time; deploy again",
+                "deploy_app again",
+            ),
+        ] {
+            let (s, mut c) = start().await;
+            deploy_setup(&s, &["created"], &[]).await;
+            sequence(
+                &s,
+                "GET",
+                api_path("/apps/app1/builds/b1"),
+                vec![json!({"id":"b1","status":"failed","error":error})],
+            )
+            .await;
+            let (err, text) = c
+                .call("deploy_app", json!({"name":"web","repo":"site"}))
+                .await;
+            assert!(!err, "{text}");
+            let v: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(v["status"], "failed");
+            assert_eq!(v["error"], error);
+            assert!(v["note"].as_str().unwrap().contains(want), "{text}");
+            assert_eq!(v["source"]["repo"], "site", "{text}");
+        }
+    }
+
+    fn sb(status: &str, bootstrap: Value) -> Value {
+        json!({"id":SB,"name":"mine","status":status,"runtime":"claude","memory_gb":1.0,
+               "git_bootstrap": bootstrap})
+    }
+
+    fn clone_state(status: &str, error: Value) -> Value {
+        json!({"repo":"site","ref":"main","status":status,"error":error})
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_from_a_repo_waits_for_the_clone() {
+        let (s, mut c) = start().await;
+        Mock::given(method("POST"))
+            .and(path(api_path("/sandboxes")))
+            .and(body_json(
+                json!({"name":"mine","memory_gb":1.0,"runtime":"claude",
+                                  "repo":"acme/site","ref":"main"}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_body_json(sb("provisioning", clone_state("pending", Value::Null))),
+            )
+            .expect(1)
+            .mount(&s)
+            .await;
+        sequence(
+            &s,
+            "GET",
+            api_path(&format!("/sandboxes/{SB}")),
+            vec![
+                sb("running", clone_state("pending", Value::Null)),
+                sb("running", clone_state("pending", Value::Null)),
+                sb("running", clone_state("done", Value::Null)),
+            ],
+        )
+        .await;
+        let (err, text) = c
+            .call(
+                "create_sandbox",
+                json!({"name":"mine","memory_gb":1,"repo":"acme/site","ref":"main"}),
+            )
+            .await;
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["status"], "running", "{text}");
+        assert_eq!(v["git_bootstrap"]["status"], "done", "{text}");
+        assert_eq!(v["git_bootstrap"]["path"], "/workspace/site", "{text}");
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_reports_a_failed_clone_without_failing() {
+        let (s, mut c) = start().await;
+        Mock::given(method("POST"))
+            .and(path(api_path("/sandboxes")))
+            .respond_with(ResponseTemplate::new(201).set_body_json(sb(
+                "running",
+                clone_state("failed", json!("repository not found")),
+            )))
+            .mount(&s)
+            .await;
+        let (err, text) = c
+            .call("create_sandbox", json!({"name":"mine","repo":"site"}))
+            .await;
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["status"], "running");
+        assert_eq!(v["git_bootstrap"]["status"], "failed");
+        let note = v["note"].as_str().unwrap();
+        assert!(note.contains("repository not found"), "{text}");
+        assert!(note.contains("site"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_reports_a_clone_still_pending_after_the_wait() {
+        let (s, mut c) = start_with(Timing {
+            poll: Duration::from_millis(5),
+            sandbox_wait: Duration::from_millis(200),
+            build_wait: Duration::from_secs(5),
+            email_backoff: Duration::from_millis(5),
+            log_wait: Duration::from_millis(200),
+            log_retry: Duration::from_millis(5),
+        })
+        .await;
+        Mock::given(method("POST"))
+            .and(path(api_path("/sandboxes")))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_body_json(sb("running", clone_state("pending", Value::Null))),
+            )
+            .mount(&s)
+            .await;
+        sequence(
+            &s,
+            "GET",
+            api_path(&format!("/sandboxes/{SB}")),
+            vec![sb("running", clone_state("pending", Value::Null))],
+        )
+        .await;
+        let (err, text) = c
+            .call("create_sandbox", json!({"name":"mine","repo":"site"}))
+            .await;
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["git_bootstrap"]["status"], "pending", "{text}");
+        assert!(
+            v["note"].as_str().unwrap().contains("still cloning"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_without_repo_has_no_clone_state() {
+        let (s, mut c) = start().await;
+        Mock::given(method("POST"))
+            .and(path(api_path("/sandboxes")))
+            .and(body_json(
+                json!({"name":"mine","memory_gb":4.0,"runtime":"claude"}),
+            ))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!(
+                {"id":SB,"name":"mine","status":"running","runtime":"claude","memory_gb":4.0})))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let (err, text) = c.call("create_sandbox", json!({"name":"mine"})).await;
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert!(v.get("git_bootstrap").is_none(), "{text}");
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_ref_needs_repo_before_any_request() {
+        let (s, mut c) = start().await;
+        let (err, text) = c
+            .call("create_sandbox", json!({"name":"mine","ref":"main"}))
+            .await;
+        assert!(err);
+        assert!(text.contains("ref goes with repo"), "{text}");
+        assert!(s.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_from_a_repo_explains_the_api_reasons() {
+        for (status, reason, want) in [
+            (422, "repo_owner", "this org"),
+            (403, "capability_missing", "allow Git access"),
+            (422, "no_identity", "person"),
+        ] {
+            let (s, mut c) = start().await;
+            Mock::given(method("POST"))
+                .and(path(api_path("/sandboxes")))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .set_body_json(json!({"detail":"invalid","reason":reason})),
+                )
+                .mount(&s)
+                .await;
+            let (err, text) = c
+                .call("create_sandbox", json!({"name":"mine","repo":"other/site"}))
+                .await;
+            assert!(err, "{reason}");
+            assert!(text.contains(want), "{reason}: {text}");
+        }
     }
 
     #[tokio::test]

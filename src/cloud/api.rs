@@ -130,6 +130,23 @@ pub struct CreateSandbox<'a> {
     pub runtime: &'a str,
     pub auth_client: Option<&'a str>,
     pub auth_redirect_path: Option<&'a str>,
+    /// A repo of the org's Git (`<name>` or `<org>/<name>`) to clone into
+    /// `/workspace/<name>` once the sandbox runs.
+    pub repo: Option<&'a str>,
+    /// The branch, tag or commit of `repo`; the default branch when `None`.
+    pub git_ref: Option<&'a str>,
+}
+
+/// A create-from-repo clone's progress: `pending`, then `done` or `failed`
+/// (a failed clone leaves the sandbox running).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct GitBootstrap {
+    pub repo: String,
+    #[serde(default, rename = "ref")]
+    pub git_ref: Option<String>,
+    pub status: String,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -141,6 +158,9 @@ pub struct Sandbox {
     pub memory_gb: f64,
     #[serde(default)]
     pub failure_reason: Option<String>,
+    /// Set when the sandbox was created from a repo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_bootstrap: Option<GitBootstrap>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -189,6 +209,9 @@ pub struct Deploy {
     pub deploy_id: String,
     pub build_id: String,
     pub workflow_id: String,
+    /// A repo deploy's repo as `<org>/<name>`.
+    #[serde(default)]
+    pub repo: Option<String>,
 }
 
 /// What Quome Cloud observed of a container that did not stay up.
@@ -227,6 +250,12 @@ pub struct DeployRecord {
     pub revision_id: Option<String>,
     #[serde(default)]
     pub stages: Vec<DeployStage>,
+    /// A repo deploy's repo as `<org>/<name>`.
+    #[serde(default)]
+    pub repo: Option<String>,
+    /// A repo deploy's commit, once the source stage resolved it.
+    #[serde(default)]
+    pub commit: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -775,6 +804,8 @@ impl CloudApi {
             runtime,
             auth_client,
             auth_redirect_path,
+            repo,
+            git_ref,
         } = req;
         check_name_size(name, memory_gb)?;
         if !RUNTIMES.contains(&runtime) {
@@ -790,6 +821,12 @@ impl CloudApi {
         }
         if let Some(p) = auth_redirect_path {
             body["auth_redirect_path"] = p.into();
+        }
+        if let Some(r) = repo {
+            body["repo"] = r.into();
+        }
+        if let Some(r) = git_ref {
+            body["ref"] = r.into();
         }
         self.json(Method::POST, &self.org_path("/sandboxes"), |b| {
             b.json(&body)
@@ -1374,6 +1411,22 @@ impl CloudApi {
         self.json(Method::POST, &p, |b| b.json(&body)).await
     }
 
+    /// Deploy `repo` (`<name>` or `<org>/<name>` in the org's Git) at `git_ref`,
+    /// or at its default branch when `None`.
+    pub async fn deploy_repo(
+        &self,
+        app_id: &str,
+        repo: &str,
+        git_ref: Option<&str>,
+    ) -> Result<Deploy, QuomeError> {
+        let p = self.org_path(&format!("/apps/{}/deploy", enc(app_id)));
+        let mut body = serde_json::json!({"repo": repo});
+        if let Some(r) = git_ref {
+            body["ref"] = r.into();
+        }
+        self.json(Method::POST, &p, |b| b.json(&body)).await
+    }
+
     pub async fn get_deploy(
         &self,
         app_id: &str,
@@ -1696,6 +1749,8 @@ mod tests {
             runtime,
             auth_client: None,
             auth_redirect_path: None,
+            repo: None,
+            git_ref: None,
         }
     }
 
