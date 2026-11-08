@@ -326,9 +326,11 @@ async fn me_with_retry(
 }
 
 pub async fn run(opts: Options, deps: &Deps<'_>) -> Result<Outcome> {
-    let api_url = opts.api_url.trim_end_matches('/').to_string();
+    let api_url = crate::url_policy::validate_api_url(&opts.api_url, "API URL")?;
     let console = console_url(&api_url, opts.console.as_deref());
     let issuer = issuer_url(&api_url, opts.issuer.as_deref());
+    crate::url_policy::validate_api_url(&console, "console URL")?;
+    crate::url_policy::validate_api_url(&issuer, "issuer URL")?;
     let name = agent_name(opts.name.as_deref(), &deps.hostname);
     let profile_name = opts.profile.clone();
 

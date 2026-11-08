@@ -45,17 +45,21 @@ impl QuomeClient {
             headers.insert("X-API-Key", key_value);
         }
 
+        // Load settings and determine base URL; refuse cleartext http to
+        // anything but loopback before a credential is attached to a request.
+        let settings = Settings::load().unwrap_or_default();
+        let base_url = match base_url {
+            Some(u) => crate::url_policy::validate_api_url(u, "API base URL")?,
+            None => settings.checked_api_url()?,
+        };
+
         let http = reqwest::Client::builder()
             .user_agent(USER_AGENT)
             .default_headers(headers)
             .timeout(Duration::from_secs(30))
+            // A redirect must not downgrade to http.
+            .https_only(!crate::url_policy::is_loopback_http(&base_url))
             .build()?;
-
-        // Load settings and determine base URL
-        let settings = Settings::load().unwrap_or_default();
-        let base_url = base_url
-            .map(String::from)
-            .unwrap_or_else(|| settings.get_api_url());
 
         Ok(Self { http, base_url })
     }

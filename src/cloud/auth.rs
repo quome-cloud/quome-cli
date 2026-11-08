@@ -51,6 +51,7 @@ impl TokenSource {
     ) -> TokenSource {
         TokenSource {
             http: reqwest::Client::builder()
+                .https_only(!crate::url_policy::is_loopback_http(&profile.issuer))
                 .connect_timeout(CONNECT_TIMEOUT)
                 .timeout(timeout)
                 .build()

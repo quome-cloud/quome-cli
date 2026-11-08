@@ -1496,7 +1496,7 @@ dependencies = [
 
 [[package]]
 name = "quome-cli"
-version = "0.2.22"
+version = "0.2.23"
 dependencies = [
  "base64",
  "bytes",
@@ -1524,6 +1524,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tiny_http",
  "tokio",
+ "url",
  "uuid",
  "wiremock",
 ]

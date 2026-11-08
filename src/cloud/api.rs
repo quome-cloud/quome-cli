@@ -662,6 +662,7 @@ impl CloudApi {
     ) -> CloudApi {
         CloudApi {
             http: reqwest::Client::builder()
+                .https_only(!crate::url_policy::is_loopback_http(&profile.api_url))
                 .connect_timeout(CONNECT_TIMEOUT)
                 .timeout(timeout)
                 .build()

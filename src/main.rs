@@ -7,6 +7,7 @@ mod errors;
 mod manifest;
 mod settings;
 mod ui;
+mod url_policy;
 
 use clap::Parser;
 use colored::Colorize;
