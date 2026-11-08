@@ -36,6 +36,22 @@ pub struct Me {
     pub api_origin: String,
 }
 
+/// A search of one column of a database branch: by `text` or by `vector`,
+/// never both. Unset fields are not sent.
+#[derive(Serialize, Debug, Clone, Default)]
+pub struct DatabaseSearch {
+    pub table: String,
+    pub column: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector: Option<Vec<f64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metric: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub k: Option<u32>,
+}
+
 /// Size and usage of an agent's private pod in a Quome Cloud cache.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct PodInfo {
@@ -1419,6 +1435,81 @@ impl CloudApi {
             })
             .await?;
         Ok(r.deleted)
+    }
+
+    fn branch_path(&self, database: &str, rest: &str) -> String {
+        self.org_path(&format!("/databases/{}/my-branch{}", enc(database), rest))
+    }
+
+    async fn branch_post(
+        &self,
+        database: &str,
+        rest: &str,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, QuomeError> {
+        self.json(Method::POST, &self.branch_path(database, rest), |b| {
+            b.json(&body)
+        })
+        .await
+    }
+
+    /// The caller's branch of a database (name or id) and its grant.
+    pub async fn database_my_branch(
+        &self,
+        database: &str,
+    ) -> Result<serde_json::Value, QuomeError> {
+        self.json(Method::GET, &self.branch_path(database, ""), |b| b)
+            .await
+    }
+
+    /// Ask for a grant on the caller's branch, from the stated intent.
+    pub async fn database_enroll(
+        &self,
+        database: &str,
+        intent: &str,
+    ) -> Result<serde_json::Value, QuomeError> {
+        self.branch_post(database, "/enroll", serde_json::json!({"intent": intent}))
+            .await
+    }
+
+    /// Run one SQL statement on the caller's branch.
+    pub async fn database_query(
+        &self,
+        database: &str,
+        sql: &str,
+    ) -> Result<serde_json::Value, QuomeError> {
+        self.branch_post(database, "/query", serde_json::json!({"sql": sql}))
+            .await
+    }
+
+    /// Search a column of the caller's branch by text or by vector.
+    pub async fn database_search(
+        &self,
+        database: &str,
+        req: &DatabaseSearch,
+    ) -> Result<serde_json::Value, QuomeError> {
+        let body = serde_json::to_value(req).map_err(|e| QuomeError::ApiError(e.to_string()))?;
+        self.branch_post(database, "/search", body).await
+    }
+
+    /// Ask a question in words, answered from the caller's branch.
+    pub async fn database_ask(
+        &self,
+        database: &str,
+        question: &str,
+    ) -> Result<serde_json::Value, QuomeError> {
+        self.branch_post(database, "/ask", serde_json::json!({"question": question}))
+            .await
+    }
+
+    /// Commit the caller's branch.
+    pub async fn database_commit(
+        &self,
+        database: &str,
+        message: &str,
+    ) -> Result<serde_json::Value, QuomeError> {
+        self.branch_post(database, "/commit", serde_json::json!({"message": message}))
+            .await
     }
 
     pub async fn create_app(&self, name: &str, memory_gb: f64) -> Result<Service, QuomeError> {
@@ -3001,5 +3092,128 @@ mod tests {
             .mount(&s)
             .await;
         api.cache_pod("my cache/1").await.unwrap();
+    }
+
+    fn branch_mock(verb: &str, rest: &str, body: serde_json::Value) -> Mock {
+        let m = Mock::given(method(verb)).and(path(format!(
+            "/api/v1/orgs/{ORG}/databases/my%20db/my-branch{rest}"
+        )));
+        let m = if verb == "POST" {
+            m.and(body_json(body))
+        } else {
+            m
+        };
+        m.respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .expect(1)
+    }
+
+    #[tokio::test]
+    async fn database_my_branch_reads() {
+        let (s, api) = setup().await;
+        branch_mock("GET", "", serde_json::Value::Null)
+            .mount(&s)
+            .await;
+        api.database_my_branch("my db").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn database_enroll_sends_intent() {
+        let (s, api) = setup().await;
+        branch_mock(
+            "POST",
+            "/enroll",
+            serde_json::json!({"intent":"add a column"}),
+        )
+        .mount(&s)
+        .await;
+        api.database_enroll("my db", "add a column").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn database_query_sends_sql() {
+        let (s, api) = setup().await;
+        branch_mock("POST", "/query", serde_json::json!({"sql":"select 1"}))
+            .mount(&s)
+            .await;
+        api.database_query("my db", "select 1").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn database_ask_sends_question() {
+        let (s, api) = setup().await;
+        branch_mock("POST", "/ask", serde_json::json!({"question":"how many?"}))
+            .mount(&s)
+            .await;
+        api.database_ask("my db", "how many?").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn database_commit_sends_message() {
+        let (s, api) = setup().await;
+        branch_mock("POST", "/commit", serde_json::json!({"message":"done"}))
+            .mount(&s)
+            .await;
+        api.database_commit("my db", "done").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn database_search_text_sends_no_vector_and_omits_unset() {
+        let (s, api) = setup().await;
+        branch_mock(
+            "POST",
+            "/search",
+            serde_json::json!({"table":"t","column":"c","text":"tea"}),
+        )
+        .mount(&s)
+        .await;
+        let req = DatabaseSearch {
+            table: "t".into(),
+            column: "c".into(),
+            text: Some("tea".into()),
+            ..Default::default()
+        };
+        api.database_search("my db", &req).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn database_search_vector_with_metric_and_k() {
+        let (s, api) = setup().await;
+        let v: Vec<f64> = (0..1536).map(|i| i as f64 * 0.5).collect();
+        branch_mock(
+            "POST",
+            "/search",
+            serde_json::json!({"table":"t","column":"c","vector":v,"metric":"l2","k":5}),
+        )
+        .mount(&s)
+        .await;
+        let req = DatabaseSearch {
+            table: "t".into(),
+            column: "c".into(),
+            vector: Some(v.clone()),
+            metric: Some("l2".into()),
+            k: Some(5),
+            ..Default::default()
+        };
+        api.database_search("my db", &req).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn database_conflict_surfaces_its_reason() {
+        let (s, api) = setup().await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/api/v1/orgs/{ORG}/databases/my%20db/my-branch/query"
+            )))
+            .respond_with(ResponseTemplate::new(409).set_body_json(
+                serde_json::json!({"detail":"grant expired","reason":"grant_expired"}),
+            ))
+            .mount(&s)
+            .await;
+        match api.database_query("my db", "select 1").await.unwrap_err() {
+            QuomeError::ApiError(m) => {
+                assert!(m.contains("409") && m.ends_with("grant_expired"), "{m}")
+            }
+            e => panic!("{e:?}"),
+        }
     }
 }
