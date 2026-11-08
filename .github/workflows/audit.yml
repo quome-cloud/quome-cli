@@ -1,0 +1,30 @@
+name: Audit
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  schedule:
+    # Weekly, so advisories published after a merge are noticed.
+    - cron: "17 6 * * 1"
+
+jobs:
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      # Audit the lockfile in the repo; generate one when it is absent.
+      - name: Lockfile
+        run: test -f Cargo.lock || cargo generate-lockfile
+
+      - name: Audit dependencies
+        run: cargo audit --deny warnings

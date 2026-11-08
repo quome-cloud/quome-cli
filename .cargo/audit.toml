@@ -1,0 +1,18 @@
+# cargo audit configuration. Every ignored advisory needs a reason here.
+# Vulnerabilities are never ignored without a written justification; the
+# entries below are "unmaintained" notices with no known vulnerability.
+[advisories]
+ignore = [
+    # fxhash: unmaintained, used for in-memory hashing by `inquire` (interactive
+    # prompts). No vulnerability; goes away when inquire drops it.
+    "RUSTSEC-2025-0057",
+    # number_prefix: unmaintained, formats byte counts in `indicatif` progress
+    # bars. No vulnerability; newer indicatif releases replace it.
+    "RUSTSEC-2025-0119",
+    # pin-utils: unmaintained, pulled in by `hyper`. Pinning macros only, no
+    # vulnerability; tracked upstream.
+    "RUSTSEC-2026-0441",
+    # proc-macro-error2: unmaintained, compile-time only (the `tabled` derive
+    # macro); not part of the shipped binary.
+    "RUSTSEC-2026-0173",
+]
