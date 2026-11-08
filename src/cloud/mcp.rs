@@ -1,6 +1,7 @@
 //! The `quome mcp` server: Quome Cloud tools for Claude Code over MCP stdio.
 use super::api::{
-    CloudApi, CreateSandbox, Download, Sandbox, WaitStep, MAX_EMAIL_WAIT, MAX_EXEC_TIMEOUT,
+    CloudApi, CreateSandbox, DatabaseSearch, Download, Sandbox, WaitStep, MAX_EMAIL_WAIT,
+    MAX_EXEC_TIMEOUT,
 };
 use super::auth::TokenSource;
 use super::auth_instance::{check_env, AuthCallError, AuthInstances, Scope, NOT_STARTED};
@@ -703,6 +704,119 @@ fn cache_hint(e: String, action: &str) -> String {
     advice.into()
 }
 
+/// Turn a database-branch route error into a sentence for the agent. Errors
+/// without advice keep the server's message after "Could not {action}: ".
+fn database_hint(e: String, action: &str) -> String {
+    let not_found = e.starts_with("Not found: ");
+    let advice = match error_reason(&e).unwrap_or("") {
+        "reconnect_for_databases" => "Run `quome connect` again and allow databases.",
+        "no_charter" => {
+            "This database has no agent rules yet. Ask an org admin to set them on the database's Agents tab."
+        }
+        "models_not_connected" => {
+            "No reasoning model key is connected. Ask an org admin to connect one in Secrets."
+        }
+        "engine_predates_agents" => {
+            "This database needs an update before agents can use it. Ask an org member to update it in the console."
+        }
+        "intent_refused" => {
+            "Your stated intent is outside this database's agent rules. Restate what you mean to do, or ask a person."
+        }
+        "not_enrolled" => "You have no grant here yet. Call database_enroll first.",
+        "grant_expired" => {
+            "Your grant has expired. Call database_enroll again, with a new intent if your work has changed."
+        }
+        "revoked" => "A person revoked this agent's access to this database.",
+        "revoke_pending" => "Your access to this database is being revoked.",
+        "branch_gone" => "Your branch was removed. Call database_enroll to get a new one.",
+        "branch_conflict" => "Your branch could not be updated because of a conflict.",
+        "one_statement" => "Send one SQL statement per call.",
+        "statement_too_large" => "That statement is too large; send a smaller one.",
+        "statement_refused" => "Your grant does not cover that statement.",
+        "busy" => "The database is busy; try again shortly.",
+        "timed_out" => "The database did not answer in time.",
+        "database_deleting" => "This database is being deleted.",
+        "not_running" => "The database is not running. Ask an org member to start it in the console.",
+        "invalid_intent" => "The intent must be plain text describing what you mean to do.",
+        "invalid_question" => "The question must be plain text.",
+        "invalid_message" => "The commit message must be plain text.",
+        "invalid_text" => "Search text may not contain a backslash or a NUL character.",
+        "invalid_vector" => "The vector must be a list of numbers of the column's dimension.",
+        "invalid_identifier" => "The table or column name is not valid.",
+        "invalid_metric" => "metric must be l2, cosine or inner_product.",
+        "invalid_k" => "k must be 1 to 100.",
+        "text_too_long" => "The search text is too long.",
+        "exactly_one_of_text_or_vector" => "Give exactly one of text or vector.",
+        "search_failed" => "The search could not be completed.",
+        "agents_only" => "Database branches are for agents connected with `quome connect`.",
+        "delegation_revoked" => {
+            "The person revoked this agent's access. Run `quome connect` again."
+        }
+        // The one 404 `not_…` reason: a database of a kind that has no agent branches.
+        r if not_found && r.starts_with("not_") => {
+            "This database type does not support agent branches."
+        }
+        _ => return format!("Could not {action}: {e}"),
+    };
+    advice.into()
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct DatabaseArg {
+    /// The database's name or id; ask the person if you do not know it.
+    database: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct DatabaseEnrollArgs {
+    /// The database's name or id; ask the person if you do not know it.
+    database: String,
+    /// An honest description of what you mean to do with the database. Your grant is judged from it and covers only that.
+    intent: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct DatabaseQueryArgs {
+    /// The database's name or id; ask the person if you do not know it.
+    database: String,
+    /// One SQL statement.
+    sql: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct DatabaseSearchArgs {
+    /// The database's name or id; ask the person if you do not know it.
+    database: String,
+    /// The table to search.
+    table: String,
+    /// The column to search.
+    column: String,
+    /// Text to search for. Give exactly one of text or vector.
+    text: Option<String>,
+    /// A vector to search with. Give exactly one of text or vector.
+    vector: Option<Vec<f64>>,
+    /// l2, cosine or inner_product (default cosine).
+    metric: Option<String>,
+    /// Most rows to return, 1 to 100 (default 10).
+    k: Option<u32>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct DatabaseAskArgs {
+    /// The database's name or id; ask the person if you do not know it.
+    database: String,
+    /// A question about the data, in plain words.
+    question: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct DatabaseCommitArgs {
+    /// The database's name or id; ask the person if you do not know it.
+    database: String,
+    /// A message describing the change.
+    message: String,
+}
+
 #[derive(Deserialize, JsonSchema)]
 pub struct CachePodArgs {
     /// The Quome Cloud cache's name or id; ask the person if you do not know it.
@@ -1200,6 +1314,32 @@ impl QuomeMcp {
                     retried = true;
                 }
                 Err(e) => return Err(cache_hint(fail(e), action)),
+            }
+        }
+    }
+
+    /// Run a call to a database branch route, as `cache_call` does: a 403
+    /// `reconnect_for_databases` picks up a re-run of `quome connect` and
+    /// retries once. Errors go through `database_hint`.
+    async fn database_call<T, F, Fut>(&self, action: &str, f: F) -> Result<T, String>
+    where
+        F: Fn(Arc<CloudApi>) -> Fut,
+        Fut: std::future::Future<Output = Result<T, QuomeError>>,
+    {
+        let mut retried = false;
+        loop {
+            let api = self.conn().api.clone();
+            match f(api.clone()).await {
+                Ok(v) => return Ok(v),
+                Err(e)
+                    if !retried
+                        && (is_session_error(&e)
+                            || error_reason(&describe(&e)) == Some("reconnect_for_databases"))
+                        && self.refresh(&api).await =>
+                {
+                    retried = true;
+                }
+                Err(e) => return Err(database_hint(fail(e), action)),
             }
         }
     }
@@ -2922,6 +3062,120 @@ impl QuomeMcp {
             "connected_clients": p.connected_clients,
         }))
     }
+
+    #[tool(
+        description = "Ask for access to your own branch of a database (name or id). You work on your own branch, never on the main data: enroll first, with an honest description of what you mean to do, and the grant you get is judged from it. Returns the grant's actions, tables and expiry. Each grant expires; when a call says so, enroll again. A person merges your branch; you never merge.",
+        annotations(read_only_hint = false, destructive_hint = false)
+    )]
+    async fn database_enroll(
+        &self,
+        Parameters(a): Parameters<DatabaseEnrollArgs>,
+    ) -> Result<String, String> {
+        let a = &a;
+        let v = self
+            .database_call("enroll on the database", |api| async move {
+                api.database_enroll(&a.database, &a.intent).await
+            })
+            .await?;
+        json(&v)
+    }
+
+    #[tool(
+        description = "Show your own branch of a database (name or id) and your current grant: its actions, tables and expiry. Enroll first with database_enroll if you have none; when a grant has expired, enroll again.",
+        annotations(read_only_hint = true)
+    )]
+    async fn database_my_branch(
+        &self,
+        Parameters(a): Parameters<DatabaseArg>,
+    ) -> Result<String, String> {
+        let a = &a;
+        let v = self
+            .database_call("read your branch", |api| async move {
+                api.database_my_branch(&a.database).await
+            })
+            .await?;
+        json(&v)
+    }
+
+    #[tool(
+        description = "Run one SQL statement on your own branch of a database (name or id), within your grant. One statement per query. Returns columns, rows, row_count and truncated (results are capped at 1,000 rows and 1 MiB). You work on your own branch; enroll first with database_enroll, and enroll again when the grant expires. A person merges your branch; you never merge."
+    )]
+    async fn database_query(
+        &self,
+        Parameters(a): Parameters<DatabaseQueryArgs>,
+    ) -> Result<String, String> {
+        let a = &a;
+        let mut v = self
+            .database_call("run the query", |api| async move {
+                api.database_query(&a.database, &a.sql).await
+            })
+            .await?;
+        if v["truncated"] == true {
+            v["note"] = "The result was cut off at the server's limit (1,000 rows or 1 MiB); narrow the query to see the rest.".into();
+        }
+        json(&v)
+    }
+
+    #[tool(
+        description = "Search a column of a table on your own branch of a database (name or id), by text or by vector (give exactly one). metric is l2, cosine (default) or inner_product; k is 1 to 100 (default 10). Needs a grant: enroll first with database_enroll, and enroll again when it expires.",
+        annotations(read_only_hint = true)
+    )]
+    async fn database_search(
+        &self,
+        Parameters(a): Parameters<DatabaseSearchArgs>,
+    ) -> Result<String, String> {
+        if a.text.is_some() == a.vector.is_some() {
+            return Err("Give exactly one of text or vector to database_search.".into());
+        }
+        let req = DatabaseSearch {
+            table: a.table,
+            column: a.column,
+            text: a.text,
+            vector: a.vector,
+            metric: a.metric,
+            k: a.k,
+        };
+        let (database, req) = (&a.database, &req);
+        let v = self
+            .database_call("search the database", |api| async move {
+                api.database_search(database, req).await
+            })
+            .await?;
+        json(&v)
+    }
+
+    #[tool(
+        description = "Ask a question about the data on your own branch of a database (name or id) in plain words; it is answered within your grant. Enroll first with database_enroll, and enroll again when the grant expires. A person merges your branch; you never merge."
+    )]
+    async fn database_ask(
+        &self,
+        Parameters(a): Parameters<DatabaseAskArgs>,
+    ) -> Result<String, String> {
+        let a = &a;
+        let v = self
+            .database_call("ask the database", |api| async move {
+                api.database_ask(&a.database, &a.question).await
+            })
+            .await?;
+        json(&v)
+    }
+
+    #[tool(
+        description = "Commit your changes on your own branch of a database (name or id) with a message. It commits to your branch only: a person merges your branch, and you never merge. Enroll first with database_enroll, and enroll again when the grant expires.",
+        annotations(read_only_hint = false, destructive_hint = false)
+    )]
+    async fn database_commit(
+        &self,
+        Parameters(a): Parameters<DatabaseCommitArgs>,
+    ) -> Result<String, String> {
+        let a = &a;
+        let v = self
+            .database_call("commit your branch", |api| async move {
+                api.database_commit(&a.database, &a.message).await
+            })
+            .await?;
+        json(&v)
+    }
 }
 
 /// The local scope of a new server: its start directory, or under test the
@@ -3236,6 +3490,12 @@ mod tests {
             "cache_set",
             "cache_del",
             "cache_pod",
+            "database_enroll",
+            "database_my_branch",
+            "database_query",
+            "database_search",
+            "database_ask",
+            "database_commit",
         ];
         want.sort();
         assert_eq!(names, want);
@@ -8261,5 +8521,381 @@ mod tests {
         let e = server.cache_get(cache_get_args()).await.unwrap_err();
         assert_eq!(e, "Run `quome connect` again and allow caches.");
         assert_eq!(pod_get_calls(&s.received_requests().await.unwrap()), 1);
+    }
+
+    fn branch_path(rest: &str) -> String {
+        api_path(&format!("/databases/my%20db/my-branch{rest}"))
+    }
+
+    async fn branch_route(s: &MockServer, rest: &str, body: Value, reply: Value) {
+        Mock::given(method("POST"))
+            .and(path(branch_path(rest)))
+            .and(body_json(body))
+            .respond_with(ResponseTemplate::new(200).set_body_json(reply))
+            .expect(1)
+            .mount(s)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn database_enroll_sends_intent() {
+        let (s, mut c) = start().await;
+        let reply =
+            json!({"actions":["select"],"tables":["t"],"expires_at":"2026-11-09T00:00:00Z"});
+        branch_route(&s, "/enroll", json!({"intent":"read t"}), reply.clone()).await;
+        let (err, text) = c
+            .call(
+                "database_enroll",
+                json!({"database":"my db","intent":"read t"}),
+            )
+            .await;
+        assert!(!err, "{text}");
+        assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), reply);
+    }
+
+    #[tokio::test]
+    async fn database_my_branch_reads() {
+        let (s, mut c) = start().await;
+        Mock::given(method("GET"))
+            .and(path(branch_path("")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"enrolled":true})))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let (err, text) = c
+            .call("database_my_branch", json!({"database":"my db"}))
+            .await;
+        assert!(!err, "{text}");
+        assert_eq!(text.replace([' ', '\n'], ""), r#"{"enrolled":true}"#);
+    }
+
+    #[tokio::test]
+    async fn database_query_sends_sql_and_notes_truncation() {
+        let (s, mut c) = start().await;
+        branch_route(
+            &s,
+            "/query",
+            json!({"sql":"select 1"}),
+            json!({"columns":["a"],"rows":[[1]],"row_count":1,"truncated":true}),
+        )
+        .await;
+        let (err, text) = c
+            .call(
+                "database_query",
+                json!({"database":"my db","sql":"select 1"}),
+            )
+            .await;
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["rows"], json!([[1]]));
+        assert!(v["note"].as_str().unwrap().contains("cut off"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn database_query_untruncated_has_no_note() {
+        let (s, mut c) = start().await;
+        branch_route(
+            &s,
+            "/query",
+            json!({"sql":"select 1"}),
+            json!({"columns":["a"],"rows":[[1]],"row_count":1,"truncated":false}),
+        )
+        .await;
+        let (_, text) = c
+            .call(
+                "database_query",
+                json!({"database":"my db","sql":"select 1"}),
+            )
+            .await;
+        assert!(serde_json::from_str::<Value>(&text)
+            .unwrap()
+            .get("note")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn database_search_text_body() {
+        let (s, mut c) = start().await;
+        branch_route(
+            &s,
+            "/search",
+            json!({"table":"t","column":"c","text":"tea","k":3}),
+            json!({"rows":[]}),
+        )
+        .await;
+        let (err, text) = c
+            .call(
+                "database_search",
+                json!({"database":"my db","table":"t","column":"c","text":"tea","k":3}),
+            )
+            .await;
+        assert!(!err, "{text}");
+    }
+
+    #[tokio::test]
+    async fn database_search_vector_body_keeps_every_dimension() {
+        let (s, mut c) = start().await;
+        let v: Vec<f64> = (0..1536).map(|i| i as f64 * 0.25).collect();
+        branch_route(
+            &s,
+            "/search",
+            json!({"table":"t","column":"c","vector":v,"metric":"cosine"}),
+            json!({"rows":[]}),
+        )
+        .await;
+        let (err, text) = c
+            .call(
+                "database_search",
+                json!({"database":"my db","table":"t","column":"c","vector":v,"metric":"cosine"}),
+            )
+            .await;
+        assert!(!err, "{text}");
+    }
+
+    #[tokio::test]
+    async fn database_search_needs_exactly_one_of_text_and_vector() {
+        let (s, mut c) = start().await;
+        for extra in [json!({"text":"a","vector":[1.0]}), json!({})] {
+            let mut args = json!({"database":"my db","table":"t","column":"c"});
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let (err, text) = c.call("database_search", args).await;
+            assert!(err);
+            assert!(text.contains("exactly one of text or vector"), "{text}");
+        }
+        let api_calls = s
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path().starts_with("/api/"))
+            .count();
+        assert_eq!(api_calls, 0);
+    }
+
+    #[tokio::test]
+    async fn database_ask_sends_question() {
+        let (s, mut c) = start().await;
+        branch_route(
+            &s,
+            "/ask",
+            json!({"question":"how many?"}),
+            json!({"answer":"3"}),
+        )
+        .await;
+        let (err, text) = c
+            .call(
+                "database_ask",
+                json!({"database":"my db","question":"how many?"}),
+            )
+            .await;
+        assert!(!err, "{text}");
+        assert!(text.contains("\"3\""));
+    }
+
+    #[tokio::test]
+    async fn database_commit_sends_message() {
+        let (s, mut c) = start().await;
+        branch_route(
+            &s,
+            "/commit",
+            json!({"message":"add rows"}),
+            json!({"committed":true}),
+        )
+        .await;
+        let (err, text) = c
+            .call(
+                "database_commit",
+                json!({"database":"my db","message":"add rows"}),
+            )
+            .await;
+        assert!(!err, "{text}");
+    }
+
+    async fn database_hint_case(rest: &str, status: u16, reason: &str, expect: &str) {
+        let (s, mut c) = start().await;
+        Mock::given(method("POST"))
+            .and(path(branch_path(rest)))
+            .respond_with(
+                ResponseTemplate::new(status)
+                    .set_body_json(json!({"detail":"refused","reason":reason})),
+            )
+            .mount(&s)
+            .await;
+        let (err, text) = c
+            .call(
+                "database_query",
+                json!({"database":"my db","sql":"select 1"}),
+            )
+            .await;
+        assert!(err, "{text}");
+        assert!(text.contains(expect), "{reason}: {text}");
+    }
+
+    #[tokio::test]
+    async fn database_grant_expired_says_to_enroll_again_and_does_not_retry() {
+        let (s, mut c) = start().await;
+        Mock::given(method("POST"))
+            .and(path(branch_path("/query")))
+            .respond_with(
+                ResponseTemplate::new(409)
+                    .set_body_json(json!({"detail":"expired","reason":"grant_expired"})),
+            )
+            .expect(1)
+            .mount(&s)
+            .await;
+        let (err, text) = c
+            .call(
+                "database_query",
+                json!({"database":"my db","sql":"select 1"}),
+            )
+            .await;
+        assert!(err);
+        assert!(text.contains("database_enroll"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn database_every_reason_has_advice() {
+        for (status, reason) in [
+            (403, "reconnect_for_databases"),
+            (409, "no_charter"),
+            (409, "models_not_connected"),
+            (409, "engine_predates_agents"),
+            (403, "intent_refused"),
+            (409, "not_enrolled"),
+            (409, "revoked"),
+            (409, "revoke_pending"),
+            (409, "branch_gone"),
+            (409, "branch_conflict"),
+            (422, "one_statement"),
+            (422, "statement_too_large"),
+            (403, "statement_refused"),
+            (503, "busy"),
+            (504, "timed_out"),
+            (409, "database_deleting"),
+            (409, "not_running"),
+            (422, "invalid_intent"),
+            (422, "invalid_question"),
+            (422, "invalid_message"),
+            (422, "invalid_text"),
+            (422, "invalid_vector"),
+            (422, "invalid_identifier"),
+            (422, "invalid_metric"),
+            (422, "invalid_k"),
+            (422, "text_too_long"),
+            (422, "search_failed"),
+            (502, "search_failed"),
+            (403, "agents_only"),
+        ] {
+            // Advice never falls through to the "Could not" form.
+            let (s, mut c) = start().await;
+            Mock::given(method("POST"))
+                .and(path(branch_path("/query")))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .set_body_json(json!({"detail":"refused","reason":reason})),
+                )
+                .mount(&s)
+                .await;
+            let (err, text) = c
+                .call(
+                    "database_query",
+                    json!({"database":"my db","sql":"select 1"}),
+                )
+                .await;
+            assert!(err, "{reason}: {text}");
+            assert!(!text.starts_with("Could not"), "{reason}: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn database_hint_texts() {
+        database_hint_case("/query", 409, "not_enrolled", "database_enroll").await;
+        database_hint_case("/query", 422, "one_statement", "one SQL statement").await;
+        database_hint_case("/query", 403, "intent_refused", "Restate").await;
+        database_hint_case("/query", 409, "no_charter", "Agents tab").await;
+        database_hint_case("/query", 409, "models_not_connected", "Secrets").await;
+    }
+
+    #[tokio::test]
+    async fn database_not_a_branch_database_404() {
+        database_hint_case(
+            "/query",
+            404,
+            "not_supported",
+            "does not support agent branches",
+        )
+        .await;
+    }
+
+    fn database_reconnect_args() -> Parameters<DatabaseQueryArgs> {
+        Parameters(serde_json::from_value(json!({"database":"my db","sql":"select 1"})).unwrap())
+    }
+
+    async fn database_reconnect_server(new_ok: bool) -> MockServer {
+        let s = revoking_server().await;
+        let refused = || {
+            ResponseTemplate::new(403)
+                .set_body_json(json!({"detail":"forbidden","reason":"reconnect_for_databases"}))
+        };
+        Mock::given(method("POST"))
+            .and(path(branch_path("/query")))
+            .and(wiremock::matchers::header("authorization", "Bearer OLD"))
+            .respond_with(refused())
+            .mount(&s)
+            .await;
+        let new = if new_ok {
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"columns":[],"rows":[],"row_count":0,"truncated":false}))
+        } else {
+            refused()
+        };
+        Mock::given(method("POST"))
+            .and(path(branch_path("/query")))
+            .and(wiremock::matchers::header("authorization", "Bearer NEW"))
+            .respond_with(new)
+            .mount(&s)
+            .await;
+        s
+    }
+
+    fn branch_query_calls(reqs: &[wiremock::Request]) -> usize {
+        reqs.iter()
+            .filter(|r| r.url.path() == branch_path("/query"))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn database_call_picks_up_a_reconnect_and_retries_once() {
+        let s = database_reconnect_server(true).await;
+        let old = AgentKey::generate();
+        let (home, reload) = cloud_home(&s.uri(), "j", "d", &old);
+        let p = profile(&s.uri());
+        let api = CloudApi::new(&p, TokenSource::new(&p, old, "vrc".into()));
+        let server = QuomeMcp::new(api, p).with_reloader(reload);
+        write_connection(home.path(), &s.uri(), "j2", "d2", &AgentKey::generate());
+        server
+            .database_query(database_reconnect_args())
+            .await
+            .unwrap();
+        assert_eq!(branch_query_calls(&s.received_requests().await.unwrap()), 2);
+    }
+
+    #[tokio::test]
+    async fn database_call_second_refusal_is_returned_not_retried_again() {
+        let s = database_reconnect_server(false).await;
+        let old = AgentKey::generate();
+        let (home, reload) = cloud_home(&s.uri(), "j", "d", &old);
+        let p = profile(&s.uri());
+        let api = CloudApi::new(&p, TokenSource::new(&p, old, "vrc".into()));
+        let server = QuomeMcp::new(api, p).with_reloader(reload);
+        write_connection(home.path(), &s.uri(), "j2", "d2", &AgentKey::generate());
+        let e = server
+            .database_query(database_reconnect_args())
+            .await
+            .unwrap_err();
+        assert_eq!(e, "Run `quome connect` again and allow databases.");
+        assert_eq!(branch_query_calls(&s.received_requests().await.unwrap()), 2);
     }
 }

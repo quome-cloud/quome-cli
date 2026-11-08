@@ -75,6 +75,12 @@ Sandbox and app arguments marked "name or id" accept either. Email `address` arg
 | `cache_set` | `cache`, `key`, `value`, `ttl?` | Sets a key to a value in your pod. `value`: at most 1 MiB of text. `ttl`: seconds until the key expires, 1 to 31536000; without it the key stays until deleted. Returns `{"key", "set": true, "ttl"}` (never the value). |
 | `cache_del` | `cache`, `key` | Deletes a key from your pod. Returns `{"key", "deleted"}`; `deleted` is `false` when it was not set. |
 | `cache_pod` | `cache` | Shows the size and usage of your pod: memory in bytes (`maxmemory`, `used_memory`), `keys`, `facts` (with `maxfacts`) and `connected_clients`. |
+| `database_enroll` | `database`, `intent` | Asks for access to your own branch of a database (name or id). Describe honestly what you mean to do; the grant is judged from it and returns its actions, tables and expiry. Each grant expires; enroll again then. |
+| `database_my_branch` | `database` | Shows your branch and current grant. |
+| `database_query` | `database`, `sql` | Runs one SQL statement on your branch, within your grant. Returns `columns`, `rows`, `row_count` and `truncated` (capped at 1,000 rows and 1 MiB; a `note` says so when cut off). |
+| `database_search` | `database`, `table`, `column`, `text?`, `vector?`, `metric?`, `k?` | Searches a column by `text` or by `vector` (exactly one). `metric`: `l2`, `cosine` (default) or `inner_product`. `k`: 1 to 100, default 10. |
+| `database_ask` | `database`, `question` | Asks a question about the data on your branch in plain words. |
+| `database_commit` | `database`, `message` | Commits your branch. A person merges it; you never merge. |
 
 ### Long-running commands
 

@@ -86,6 +86,12 @@ pub const TOOL_NAMES: &[&str] = &[
     "cache_set",
     "cache_del",
     "cache_pod",
+    "database_enroll",
+    "database_my_branch",
+    "database_query",
+    "database_search",
+    "database_ask",
+    "database_commit",
     "playbook",
 ];
 
