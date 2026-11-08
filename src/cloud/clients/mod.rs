@@ -2,7 +2,7 @@
 pub mod paths;
 
 #[allow(unused_imports)]
-pub use super::playbooks::render_skill;
+pub use super::playbooks::{render_skill, render_skills};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -45,7 +45,10 @@ pub trait ClientAdapter {
         program: &str,
         profile: &str,
     ) -> Result<RegisterOutcome, String>;
-    fn skills_root(&self, home: &Path) -> PathBuf;
+    /// Directory that directly holds skill folders (for Claude, `<plugin root>/skills`).
+    fn skills_dir(&self, home: &Path) -> PathBuf;
+    /// Plugin root that needs a `.claude-plugin/plugin.json`; Claude only.
+    fn plugin_root(&self, home: &Path) -> Option<PathBuf>;
 }
 
 struct Adapter(ClientId);
@@ -60,8 +63,11 @@ impl ClientAdapter for Adapter {
     fn register_mcp(&self, _: &Path, _: &str, _: &str) -> Result<RegisterOutcome, String> {
         Err("not implemented".into())
     }
-    fn skills_root(&self, home: &Path) -> PathBuf {
-        paths::skills_root(self.0, home)
+    fn skills_dir(&self, home: &Path) -> PathBuf {
+        paths::skills_dir(self.0, home)
+    }
+    fn plugin_root(&self, home: &Path) -> Option<PathBuf> {
+        paths::plugin_root(self.0, home)
     }
 }
 
@@ -72,12 +78,12 @@ pub fn adapters() -> Vec<Box<dyn ClientAdapter>> {
         .collect()
 }
 
-/// Skill roots to write for the installed clients, each root once. Codex and
+/// Skill directories to write for the installed clients, each root once. Codex and
 /// OpenCode share a root and render identically, so the first one wins.
 pub fn skill_targets(installed: &[ClientId], home: &Path) -> Vec<(PathBuf, ClientId)> {
     let mut out: Vec<(PathBuf, ClientId)> = Vec::new();
     for c in installed {
-        let root = paths::skills_root(*c, home);
+        let root = paths::skills_dir(*c, home);
         if !out.iter().any(|(r, _)| *r == root) {
             out.push((root, *c));
         }

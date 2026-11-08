@@ -5,8 +5,10 @@ use std::path::{Path, PathBuf};
 
 pub struct PathRow {
     pub client: ClientId,
-    /// Skills root, relative to the home directory.
-    pub skills_root: &'static str,
+    /// Directory that directly holds skill folders, relative to home.
+    pub skills_dir: &'static str,
+    /// Plugin root relative to home (Claude only); skills go under `<root>/skills`.
+    pub plugin_root: Option<&'static str>,
     /// Binary names that mark the client as installed when found on PATH.
     pub binaries: &'static [&'static str],
     /// Home-relative directories that mark the client as installed.
@@ -19,7 +21,8 @@ pub const TABLE: &[PathRow] = &[
     // https://code.claude.com/docs/en/plugins/create.md
     PathRow {
         client: ClientId::Claude,
-        skills_root: ".claude/skills/quome",
+        skills_dir: ".claude/skills/quome/skills",
+        plugin_root: Some(".claude/skills/quome"),
         binaries: &["claude"],
         config_dirs: &[".claude"],
     },
@@ -27,7 +30,8 @@ pub const TABLE: &[PathRow] = &[
     // https://developers.openai.com/codex/skills
     PathRow {
         client: ClientId::Codex,
-        skills_root: ".agents/skills",
+        skills_dir: ".agents/skills",
+        plugin_root: None,
         binaries: &["codex"],
         config_dirs: &[".codex"],
     },
@@ -36,17 +40,21 @@ pub const TABLE: &[PathRow] = &[
     // https://opencode.ai/docs/skills
     PathRow {
         client: ClientId::OpenCode,
-        skills_root: ".agents/skills",
+        skills_dir: ".agents/skills",
+        plugin_root: None,
         binaries: &["opencode"],
         config_dirs: &[".config/opencode"],
     },
     // Antigravity: global skills for App, CLI and IDE in ~/.gemini/config/skills.
     // https://antigravity.google/docs/skills (docs only; not exercised)
+    // Detection is `agy`/`antigravity` or ~/.gemini/antigravity, not bare
+    // ~/.gemini, which Gemini CLI users also have.
     PathRow {
         client: ClientId::Antigravity,
-        skills_root: ".gemini/config/skills",
-        binaries: &[],
-        config_dirs: &[".gemini"],
+        skills_dir: ".gemini/config/skills",
+        plugin_root: None,
+        binaries: &["agy", "antigravity"],
+        config_dirs: &[".gemini/antigravity"],
     },
 ];
 
@@ -57,14 +65,32 @@ pub fn row(client: ClientId) -> &'static PathRow {
         .expect("a row per client")
 }
 
-pub fn skills_root(client: ClientId, home: &Path) -> PathBuf {
-    home.join(row(client).skills_root)
+pub fn skills_dir(client: ClientId, home: &Path) -> PathBuf {
+    home.join(row(client).skills_dir)
 }
 
-/// True if `name` is an executable file in a PATH directory.
+pub fn plugin_root(client: ClientId, home: &Path) -> Option<PathBuf> {
+    row(client).plugin_root.map(|r| home.join(r))
+}
+
+/// True if `name` is a regular file in a PATH directory (and executable, on unix).
+fn is_exec(p: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        p.metadata()
+            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        p.is_file()
+    }
+}
+
 pub fn on_real_path(name: &str) -> bool {
     std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).any(|d| d.join(name).is_file()))
+        .map(|p| std::env::split_paths(&p).any(|d| is_exec(&d.join(name))))
         .unwrap_or(false)
 }
 
@@ -95,6 +121,9 @@ mod tests {
         assert!(installed_with(ClientId::Codex, home.path(), &|b| b == "codex"));
         assert!(!installed_with(ClientId::Claude, home.path(), &|b| b == "codex"));
         std::fs::create_dir_all(home.path().join(".gemini")).unwrap();
+        assert!(!installed_with(ClientId::Antigravity, home.path(), &none));
+        assert!(installed_with(ClientId::Antigravity, home.path(), &|b| b == "agy"));
+        std::fs::create_dir_all(home.path().join(".gemini/antigravity")).unwrap();
         assert!(installed_with(ClientId::Antigravity, home.path(), &none));
         std::fs::create_dir_all(home.path().join(".config/opencode")).unwrap();
         assert!(installed_with(ClientId::OpenCode, home.path(), &none));

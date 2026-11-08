@@ -114,14 +114,37 @@ fn yaml_quote(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+const SKILL_NAME_MAX: usize = 64;
 const DESCRIPTION_MAX: usize = 500;
 
 /// Render the thin SKILL.md for one playbook. Playbook text comes from the
 /// server: it is flattened to one line and quoted, never trusted as YAML.
-pub fn render_skill(pb: &Playbook, client: ClientId) -> SkillFile {
-    let slug = skill_slug(&pb.name);
+///
+/// Returns None when no safe skill can be made: the name does not survive the
+/// tool-name filter unchanged (the skill would call a playbook that does not
+/// exist), or its slug is empty. Over-long slugs are truncated so the final
+/// folder and `name` stay within 64 characters, then re-trimmed of hyphens.
+pub fn render_skill(pb: &Playbook, client: ClientId) -> Option<SkillFile> {
+    let call_name = pb.name.as_str();
+    if call_name.is_empty()
+        || !call_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return None;
+    }
+    let max = match client {
+        ClientId::Claude => SKILL_NAME_MAX,
+        _ => SKILL_NAME_MAX - "quome-".len(),
+    };
+    let mut slug = skill_slug(call_name);
+    slug.truncate(max);
+    let slug = slug.trim_end_matches('-').to_string();
+    if slug.is_empty() {
+        return None;
+    }
     let dir_name = match client {
-        ClientId::Claude => slug.clone(),
+        ClientId::Claude => slug,
         _ => format!("quome-{slug}"),
     };
     let title = one_line(&pb.title);
@@ -139,11 +162,6 @@ pub fn render_skill(pb: &Playbook, client: ClientId) -> SkillFile {
             .collect::<String>()
             + "\u{2026}";
     }
-    let call_name: String = pb
-        .name
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-        .collect();
     // Codex, OpenCode and Antigravity key the skill by folder name; Claude's
     // plugin namespace supplies the prefix, so its name is the bare slug.
     let contents = format!(
@@ -152,7 +170,29 @@ pub fn render_skill(pb: &Playbook, client: ClientId) -> SkillFile {
         yaml_quote(&description),
         call_name
     );
-    SkillFile { dir_name, contents }
+    Some(SkillFile { dir_name, contents })
+}
+
+/// Render every playbook for a client. Playbooks that cannot be rendered, or
+/// whose folder name collides with an earlier one, are dropped; each drop adds
+/// a warning to the second list.
+pub fn render_skills(pbs: &[Playbook], client: ClientId) -> (Vec<SkillFile>, Vec<String>) {
+    let mut files: Vec<SkillFile> = Vec::new();
+    let mut warnings = Vec::new();
+    for pb in pbs {
+        match render_skill(pb, client) {
+            None => warnings.push(format!(
+                "skipped playbook {:?}: no safe skill name",
+                pb.name
+            )),
+            Some(f) if files.iter().any(|x| x.dir_name == f.dir_name) => warnings.push(format!(
+                "skipped playbook {:?}: folder {} already used",
+                pb.name, f.dir_name
+            )),
+            Some(f) => files.push(f),
+        }
+    }
+    (files, warnings)
 }
 
 #[cfg(test)]
@@ -298,7 +338,7 @@ mod tests {
 
     #[test]
     fn skill_frontmatter_and_body() {
-        let s = render_skill(&pb(), ClientId::Codex);
+        let s = render_skill(&pb(), ClientId::Codex).unwrap();
         assert_eq!(s.dir_name, "quome-run-code");
         let lines: Vec<&str> = s.contents.lines().collect();
         assert_eq!(lines[0], "---");
@@ -319,7 +359,7 @@ mod tests {
     #[test]
     fn skill_has_no_urls_or_ids() {
         for c in ClientId::ALL {
-            let s = render_skill(&pb(), c).contents;
+            let s = render_skill(&pb(), c).unwrap().contents;
             assert!(!s.contains("http"));
             assert!(!s.contains("org_") && !s.contains("org-id"));
         }
@@ -327,20 +367,67 @@ mod tests {
 
     #[test]
     fn claude_skill_lives_in_plugin_dir() {
-        assert_eq!(render_skill(&pb(), ClientId::Claude).dir_name, "run-code");
-        let s = render_skill(&pb(), ClientId::Claude).contents;
+        assert_eq!(
+            render_skill(&pb(), ClientId::Claude).unwrap().dir_name,
+            "run-code"
+        );
+        let s = render_skill(&pb(), ClientId::Claude).unwrap().contents;
         assert!(s.contains("name: run-code\n"));
     }
 
     #[test]
     fn hostile_text_stays_one_quoted_line() {
         let mut p = pb();
-        p.title = "Evil\n---\nname: x".into();
+        p.title = "Evil\n---\nname: x\u{2028}y\u{0085}z\u{2029}".into();
         p.description = "say \"hi\" \\ now\r\nmore".into();
-        p.name = "Bad Name!\n`x`".into();
-        let s = render_skill(&p, ClientId::Antigravity);
-        assert_eq!(s.dir_name, "quome-bad-name-x");
+        p.name = "bad-name".into();
+        let s = render_skill(&p, ClientId::Antigravity).unwrap();
+        assert_eq!(s.dir_name, "quome-bad-name");
         assert_eq!(s.contents.lines().count(), 7);
         assert!(s.contents.contains("\\\"hi\\\""));
+    }
+
+    #[test]
+    fn hostile_text_has_no_control_chars() {
+        let mut p = pb();
+        p.title = "Evil\u{2028}a\u{0085}b\u{2029}c\u{7}d".into();
+        let c = render_skill(&p, ClientId::Codex).unwrap().contents;
+        assert!(c
+            .chars()
+            .all(|ch| ch == '\n' || (!ch.is_control() && ch != '\u{2028}' && ch != '\u{2029}')));
+    }
+
+    #[test]
+    fn unsafe_names_render_nothing() {
+        for n in ["!!!", "../x", "", "a/b", "-", "bad name"] {
+            let mut p = pb();
+            p.name = n.into();
+            for c in ClientId::ALL {
+                assert!(render_skill(&p, c).is_none(), "{n:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn long_names_fit_64_chars() {
+        let mut p = pb();
+        p.name = "a".repeat(200);
+        let claude = render_skill(&p, ClientId::Claude).unwrap();
+        assert_eq!(claude.dir_name.len(), 64);
+        let codex = render_skill(&p, ClientId::Codex).unwrap();
+        assert_eq!(codex.dir_name.len(), 64);
+        assert!(codex
+            .contents
+            .contains(&format!("name: {}\n", codex.dir_name)));
+    }
+
+    #[test]
+    fn colliding_folders_are_dropped_with_warning() {
+        let mut a = pb();
+        a.name = "run_code".into();
+        let b = pb();
+        let (files, warnings) = render_skills(&[a, b], ClientId::Codex);
+        assert_eq!(files.len(), 1);
+        assert_eq!(warnings.len(), 1);
     }
 }
