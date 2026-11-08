@@ -30,11 +30,11 @@ Reports go to `target/evals-report.html` and `target/evals-results/`.
 
 ## Cases
 
-- `playbook-<name>`: one for each of the 19 playbooks. The prompt asks Claude to
+- `playbook-<name>`: one for each of the 24 playbooks. The prompt asks Claude to
   fetch the playbook by name with the `playbook` tool and report its first
   step. Graders check the tool was called with that name and that the answer
   reflects the rendered steps. These work while the playbooks are unlisted.
-- `after-listing/skill-<name>`: one for each of the 13 specific playbooks. A
+- `after-listing/skill-<name>`: one for each of the 17 specific playbooks. A
   natural request ("add Google sign-in to my recipes app") whose graders check
   that the `quome:<name>` skill fired and `playbook` was called. **These need the
   playbook to be listed on the server and `quome skills sync` to have written
