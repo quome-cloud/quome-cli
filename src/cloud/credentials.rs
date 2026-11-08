@@ -96,6 +96,12 @@ impl CredError {
 
 /// The next step for a credentials error. Never includes a token.
 pub fn cred_hint(e: CredError) -> String {
+    cred_hint_for(e, CredAccess::Use)
+}
+
+/// `cred_hint` for a call made with `access`: a missing capability on the
+/// Admin path asks for Credentials admin access.
+pub fn cred_hint_for(e: CredError, access: CredAccess) -> String {
     let (code, text) = match e {
         CredError::Api(e) => {
             let m = match &e {
@@ -107,6 +113,8 @@ pub fn cred_hint(e: CredError) -> String {
                 "capability_missing"
             } else if forbidden && m.contains("role_required") {
                 "role_required"
+            } else if forbidden && m.contains("person_required") {
+                "person_required"
             } else {
                 return super::mcp::fail(e);
             };
@@ -122,6 +130,9 @@ pub fn cred_hint(e: CredError) -> String {
         }
     };
     match code.as_str() {
+        "capability_missing" if access == CredAccess::Admin => {
+            "Run `quome connect` again and allow Credentials admin access.".into()
+        }
         "capability_missing" => "Run `quome connect` again and allow Credentials access.".into(),
         "role_required" => "An org Owner or Admin must have connected this agent with Credentials admin access; ask one to run `quome connect` again and allow it.".into(),
         "grant_missing" => "Ask for access with credentials_request.".into(),
@@ -269,7 +280,12 @@ impl CredentialsClient {
                 let err = &parsed["error"];
                 return Err(CredError::Refused {
                     code: err["code"].as_str().unwrap_or("").to_string(),
-                    message: err["message"].as_str().unwrap_or("").to_string(),
+                    message: err["message"]
+                        .as_str()
+                        .unwrap_or("")
+                        .chars()
+                        .take(SNIPPET)
+                        .collect(),
                     retry_after,
                     detail: err.clone(),
                 });
@@ -684,5 +700,52 @@ mod tests {
             "403 forbidden: capability_missing".into(),
         )));
         assert_eq!(t, "Run `quome connect` again and allow Credentials access.");
+    }
+
+    #[test]
+    fn hint_for_person_required_and_admin_wording() {
+        let e = || {
+            CredError::Api(QuomeError::ApiError(
+                "403 forbidden: person_required".into(),
+            ))
+        };
+        assert_eq!(cred_hint(e()), "A person must do this in the console.");
+        let cm = || {
+            CredError::Api(QuomeError::ApiError(
+                "403 forbidden: capability_missing".into(),
+            ))
+        };
+        assert_eq!(
+            cred_hint_for(cm(), CredAccess::Admin),
+            "Run `quome connect` again and allow Credentials admin access."
+        );
+        let long = CredError::Refused {
+            code: "x".into(),
+            message: "é".repeat(1000),
+            retry_after: None,
+            detail: Value::Null,
+        };
+        assert!(cred_hint(long).len() < 2200);
+    }
+
+    #[tokio::test]
+    async fn refused_message_is_capped_on_a_char_boundary() {
+        let (s, c, _) = setup().await;
+        mount_broker(&s, "C1", 300, 1).await;
+        Mock::given(method("GET"))
+            .and(path("/acme/_v1/routes"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(
+                json!({"error": {"code": "invalid_request", "message": "é".repeat(1000)}}),
+            ))
+            .mount(&s)
+            .await;
+        let e = c
+            .get(CredAccess::Use, "/_v1/routes", &NoProgress)
+            .await
+            .unwrap_err();
+        match e {
+            CredError::Refused { message, .. } => assert_eq!(message.chars().count(), SNIPPET),
+            other => panic!("{other:?}"),
+        }
     }
 }

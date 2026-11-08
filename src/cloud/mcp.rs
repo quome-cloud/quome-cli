@@ -5,7 +5,7 @@ use super::api::{
 };
 use super::auth::TokenSource;
 use super::auth_instance::{check_env, AuthCallError, AuthInstances, Scope, NOT_STARTED};
-use super::credentials::{cred_hint, CredAccess, CredError, CredentialsClient};
+use super::credentials::{cred_hint, cred_hint_for, CredAccess, CredError, CredentialsClient};
 use super::email::{
     backoff, email_hint, normalize_address, AddressArgs, AddressKind, CreateAddressArgs,
     ListMessagesArgs, ReadArgs, WaitArgs, LIST_NOTE,
@@ -889,6 +889,7 @@ pub struct CacheSetArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CredentialsRequestArgs {
     /// A route id from credentials_routes to ask for. Give exactly one of route, repo or git_exception.
     route: Option<String>,
@@ -903,6 +904,7 @@ pub struct CredentialsRequestArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CredentialsGitException {
     /// `github.com/<owner>/<name>`.
     repo: String,
@@ -930,6 +932,7 @@ pub struct CredentialsProvidersArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CredentialsProviderSet {
     /// The provider's id.
     id: String,
@@ -940,6 +943,7 @@ pub struct CredentialsProviderSet {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CredentialsProviderRequest {
     /// The provider's id.
     provider_id: String,
@@ -954,6 +958,7 @@ pub struct CredentialsProviderRequest {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CredentialsGrantArgs {
     /// The grant's id.
     id: String,
@@ -965,11 +970,14 @@ pub struct CredentialsGrantArgs {
     git: Option<CredentialsGrantGit>,
     /// Days until the grant expires, 1 to 365. Without it the grant does not expire.
     ttl_days: Option<u32>,
+    /// Grant-wide caps as a JSON object (for example requests_per_min, requests_per_day, bytes_per_day); the service checks them.
+    caps: Option<serde_json::Value>,
     /// Why, for the audit trail.
     reason: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CredentialsGrantSubject {
     /// The agent client id.
     agent: Option<String>,
@@ -983,11 +991,9 @@ pub struct CredentialsGrantSubject {
 #[serde(deny_unknown_fields)]
 pub struct CredentialsGrantGit {
     /// Host-qualified repo globs such as `github.com/acme/*`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    repos: Option<Vec<String>>,
+    repos: Vec<String>,
     /// Branch globs that may be pushed; empty means fetch only.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    push_branches: Option<Vec<String>>,
+    push_branches: Vec<String>,
     /// Only `agent/*` branches may be pushed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pr_only: Option<bool>,
@@ -1026,7 +1032,16 @@ fn github_repo(input: &str) -> Result<(String, String), String> {
     }
 }
 
-/// Minutes to wait, from a `Retry-After` in seconds (60 s when absent).
+/// Refuse a blank or whitespace-only value.
+fn nonblank(field: &str, v: &str) -> Result<(), String> {
+    if v.trim().is_empty() {
+        Err(format!("{field} must not be blank."))
+    } else {
+        Ok(())
+    }
+}
+
+/// Minutes to wait, from a `Retry-After` in seconds (60 minutes when absent).
 fn cooldown_minutes(retry_after: Option<u64>) -> u64 {
     retry_after.map_or(60, |s| s.div_ceil(60).max(1))
 }
@@ -1036,7 +1051,13 @@ fn provider_view(p: &serde_json::Value) -> serde_json::Value {
     let mut out = serde_json::Map::new();
     for k in ["id", "kind", "status", "secret_name"] {
         if let Some(v) = p.get(k) {
-            out.insert(k.into(), v.clone());
+            let mut v = v.clone();
+            if k == "kind" {
+                if let Some(o) = v.as_object_mut() {
+                    o.remove("template");
+                }
+            }
+            out.insert(k.into(), v);
         }
     }
     serde_json::Value::Object(out)
@@ -1476,6 +1497,31 @@ impl QuomeMcp {
         }
     }
 
+    /// A platform call for the credentials providers routes, which need admin
+    /// access: a session or access error picks up a re-run of `quome connect`
+    /// and retries once; errors go through `cred_hint_for`.
+    async fn prov_call<T, F, Fut>(&self, f: F) -> Result<T, String>
+    where
+        F: Fn(Arc<CloudApi>) -> Fut,
+        Fut: std::future::Future<Output = Result<T, QuomeError>>,
+    {
+        let mut retried = false;
+        loop {
+            let api = self.conn().api.clone();
+            match f(api.clone()).await {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    let e = CredError::Api(e);
+                    if !retried && e.needs_reconnect() && self.refresh(&api).await {
+                        retried = true;
+                    } else {
+                        return Err(cred_hint_for(e, CredAccess::Admin));
+                    }
+                }
+            }
+        }
+    }
+
     async fn cred_call(
         &self,
         access: CredAccess,
@@ -1486,7 +1532,7 @@ impl QuomeMcp {
     ) -> Result<(reqwest::StatusCode, serde_json::Value), String> {
         self.cred_raw(access, method, path, body, w)
             .await
-            .map_err(cred_hint)
+            .map_err(|e| cred_hint_for(e, access))
     }
 
     /// Run a call to the org's auth instance or Git. When the broker says the
@@ -3218,6 +3264,17 @@ impl QuomeMcp {
         if a.push.is_some() && a.repo.is_none() {
             return Err("push is only valid with repo.".into());
         }
+        nonblank("reason", &a.reason)?;
+        if let Some(r) = &a.route {
+            nonblank("route", r)?;
+        }
+        if let Some(r) = &a.repo {
+            nonblank("repo", r)?;
+        }
+        if let Some(x) = &a.git_exception {
+            nonblank("git_exception.repo", &x.repo)?;
+            nonblank("git_exception.ref", &x.git_ref)?;
+        }
         let mut body = serde_json::Map::new();
         if let Some(r) = &a.route {
             body.insert("route".into(), r.clone().into());
@@ -3294,7 +3351,7 @@ impl QuomeMcp {
     }
 
     #[tool(
-        description = "Work with the org's credential providers. With no arguments, list them (id, kind, status, secret name; never a value). With `set` ({id, kind, secret_name}), create or replace one. With `request` ({provider_id, kind, secret_name, instructions, recipient_email}), ask a person to put the credential in Secrets; you never send or see a secret value. Changes by an agent may wait for a person's approval, and deleting stays in the console.",
+        description = "Work with the org's credential providers. Needs Credentials admin access, even to list. With no arguments, list them (id, kind, status, secret name; never a value). With `set` ({id, kind, secret_name}), create or replace one. With `request` ({provider_id, kind, secret_name, instructions, recipient_email}), ask a person to put the credential in Secrets; you never send or see a secret value. Changes by an agent may wait for a person's approval, and deleting stays in the console.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     async fn credentials_providers(
@@ -3304,7 +3361,9 @@ impl QuomeMcp {
         match (a.set, a.request) {
             (Some(_), Some(_)) => Err("Give set or request, not both.".into()),
             (None, None) => {
-                let v = call!(self, |api| api.credential_providers())?;
+                let v = self
+                    .prov_call(|api| async move { api.credential_providers().await })
+                    .await?;
                 let list = v.get("providers").unwrap_or(&v);
                 let list: Vec<serde_json::Value> = list
                     .as_array()
@@ -3313,17 +3372,27 @@ impl QuomeMcp {
                 json(&serde_json::json!({"providers": list}))
             }
             (Some(s), None) => {
+                nonblank("set.id", &s.id)?;
                 if !s.kind.is_object() {
                     return Err("set.kind must be a JSON object.".into());
                 }
-                let v = call!(self, |api| api.put_credential_provider(
-                    &s.id,
-                    &s.kind,
-                    s.secret_name.as_deref()
-                ))?;
+                let s = &s;
+                let v = self
+                    .prov_call(|api| async move {
+                        api.put_credential_provider(&s.id, &s.kind, s.secret_name.as_deref())
+                            .await
+                    })
+                    .await?;
                 json(&provider_view(&v))
             }
             (None, Some(r)) => {
+                nonblank("request.provider_id", &r.provider_id)?;
+                nonblank("request.secret_name", &r.secret_name)?;
+                nonblank("request.instructions", &r.instructions)?;
+                nonblank("request.recipient_email", &r.recipient_email)?;
+                if !r.kind.is_object() {
+                    return Err("request.kind must be a JSON object.".into());
+                }
                 let body = serde_json::json!({
                     "provider_id": r.provider_id,
                     "kind": r.kind,
@@ -3331,7 +3400,10 @@ impl QuomeMcp {
                     "instructions": r.instructions,
                     "recipient_email": r.recipient_email,
                 });
-                let v = call!(self, |api| api.create_credential_request(&body))?;
+                let body = &body;
+                let v = self
+                    .prov_call(|api| async move { api.create_credential_request(body).await })
+                    .await?;
                 json(&serde_json::json!({
                     "id": v.get("id").or_else(|| v["request"].get("id")),
                     "message": "A person must provide this. You will not be notified.",
@@ -3341,7 +3413,7 @@ impl QuomeMcp {
     }
 
     #[tool(
-        description = "Create or replace a grant: who (subject: {agent, user} where user is a user id or `*` for any user, or {app}) may use which routes, with optional git rules (repos, push_branches, pr_only, force_push, delete_branch, tags) and ttl_days (1 to 365). Needs Credentials admin access. Changes by an agent may wait for a person's approval, and deleting stays in the console.",
+        description = "Create or replace a grant: who (subject: {agent, user} where user is a user id or `*` for any user, or {app}) may use which routes, with optional git rules (repos, push_branches, pr_only, force_push, delete_branch, tags) and ttl_days (1 to 365), and optional caps (a JSON object). A write replaces the whole grant, so anything you do not send, including caps, is cleared. Needs Credentials admin access. Changes by an agent may wait for a person's approval, and deleting stays in the console.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     async fn credentials_grant(
@@ -3349,6 +3421,21 @@ impl QuomeMcp {
         Parameters(a): Parameters<CredentialsGrantArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<String, String> {
+        nonblank("id", &a.id)?;
+        for (f, v) in [
+            ("subject.agent", &a.subject.agent),
+            ("subject.user", &a.subject.user),
+            ("subject.app", &a.subject.app),
+        ] {
+            if let Some(v) = v {
+                nonblank(f, v)?;
+            }
+        }
+        if let Some(c) = &a.caps {
+            if !c.is_object() {
+                return Err("caps must be a JSON object.".into());
+            }
+        }
         let subject = match (&a.subject.agent, &a.subject.user, &a.subject.app) {
             (Some(agent), Some(user), None) => serde_json::json!({
                 "kind": "agent_client", "client_id": agent, "user_sub": user,
@@ -3376,6 +3463,9 @@ impl QuomeMcp {
                 "expires_at".into(),
                 at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true).into(),
             );
+        }
+        if let Some(c) = &a.caps {
+            body.insert("caps".into(), c.clone());
         }
         if let Some(r) = &a.reason {
             body.insert("reason".into(), r.clone().into());
@@ -9588,6 +9678,9 @@ mod tests {
             ("person_required", "a person must do this in the console"),
             ("already_granted", "already"),
             ("no_base_grant", "grant"),
+            ("too_many_requests", "too many"),
+            ("invalid_request", "not valid"),
+            ("exceptions_read_only", "exceptions cannot be"),
         ] {
             let (s, mut c) = start_creds().await;
             Mock::given(method("POST"))
@@ -9674,7 +9767,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path(api_path("/credentials/providers")))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-                {"id":"stripe","kind":{"api_key":{}},"status":"ready","secret_name":"STRIPE_KEY",
+                {"id":"stripe","kind":{"type":"bearer","template":"SECRETTEMPLATE"},"status":"ready","secret_name":"STRIPE_KEY",
                  "value":"sk_live_LEAK","token":"LEAK2","extra":{"x":1}}
             ])))
             .expect(1)
@@ -9682,11 +9775,14 @@ mod tests {
             .await;
         let (err, text) = c.call("credentials_providers", json!({})).await;
         assert!(!err, "{text}");
-        assert!(!text.contains("LEAK"), "{text}");
+        assert!(
+            !text.contains("LEAK") && !text.contains("SECRETTEMPLATE"),
+            "{text}"
+        );
         let v: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(
             v["providers"][0],
-            json!({"id":"stripe","kind":{"api_key":{}},"status":"ready","secret_name":"STRIPE_KEY"})
+            json!({"id":"stripe","kind":{"type":"bearer"},"status":"ready","secret_name":"STRIPE_KEY"})
         );
     }
 
@@ -9695,14 +9791,16 @@ mod tests {
         let (s, mut c) = start_creds().await;
         Mock::given(method("PUT"))
             .and(path(api_path("/credentials/providers/my%20id")))
-            .and(body_json(json!({"kind":{"api_key":{}},"secret_name":null})))
+            .and(body_json(
+                json!({"kind":{"type":"bearer"},"secret_name":null}),
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"my id"})))
             .expect(1)
             .mount(&s)
             .await;
         Mock::given(method("POST"))
             .and(path(api_path("/credentials/requests")))
-            .and(body_json(json!({"provider_id":"p","kind":{"api_key":{}},"secret_name":"S","instructions":"i","recipient_email":"a@b.c"})))
+            .and(body_json(json!({"provider_id":"p","kind":{"type":"bearer"},"secret_name":"S","instructions":"i","recipient_email":"a@b.c"})))
             .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id":"q1"})))
             .expect(1)
             .mount(&s)
@@ -9710,14 +9808,14 @@ mod tests {
         let (err, text) = c
             .call(
                 "credentials_providers",
-                json!({"set":{"id":"my id","kind":{"api_key":{}}}}),
+                json!({"set":{"id":"my id","kind":{"type":"bearer"}}}),
             )
             .await;
         assert!(!err, "{text}");
         let (err, text) = c
             .call(
                 "credentials_providers",
-                json!({"request":{"provider_id":"p","kind":{"api_key":{}},"secret_name":"S","instructions":"i","recipient_email":"a@b.c"}}),
+                json!({"request":{"provider_id":"p","kind":{"type":"bearer"},"secret_name":"S","instructions":"i","recipient_email":"a@b.c"}}),
             )
             .await;
         assert!(!err, "{text}");
@@ -9769,7 +9867,7 @@ mod tests {
                 "credentials_grant",
                 json!({"id":"g1","subject":{"agent":"cl","user":"u1"},"routes":["a"],
                        "git":{"repos":["github.com/o/*"],"push_branches":["f/*"],"pr_only":false},
-                       "ttl_days":7,"reason":"why"}),
+                       "ttl_days":7,"reason":"why","caps":{"requests_per_min":5}}),
             )
             .await;
         assert!(!err, "{text}");
@@ -9790,6 +9888,8 @@ mod tests {
             json!({"kind":"agent_client","client_id":"cl","user_sub":"u1"})
         );
         assert_eq!(b1["reason"], "why");
+        assert_eq!(b1["routes"], json!(["a"]));
+        assert_eq!(b1["caps"], json!({"requests_per_min":5}));
         assert_eq!(b1["git"]["repos"], json!(["github.com/o/*"]));
         assert!(
             b1.get("id").is_none() && b1.get("version").is_none() && b1.get("ttl_days").is_none()
@@ -9889,5 +9989,178 @@ mod tests {
         let (err, text) = c.call("credentials_routes", json!({})).await;
         assert!(err);
         assert_eq!(text, "Ask for access with credentials_request.");
+    }
+
+    /// A server whose broker (and platform providers routes) answer `status`
+    /// with `reason`, and a client that counts reconnect attempts.
+    async fn start_refusing(
+        reason: &str,
+    ) -> (MockServer, Client, Arc<std::sync::atomic::AtomicUsize>) {
+        let s = MockServer::start().await;
+        let old = AgentKey::generate();
+        let (home, reload) = cloud_home(&s.uri(), "j", "d", &old);
+        std::mem::forget(home);
+        let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n2 = n.clone();
+        let reload: Reloader = Arc::new(move || {
+            n2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            reload()
+        });
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"token_endpoint": format!("{}/oauth/token", s.uri())})),
+            )
+            .mount(&s)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"access_token":"AT","token_type":"Bearer","expires_in":3600}),
+            ))
+            .mount(&s)
+            .await;
+        let refuse =
+            ResponseTemplate::new(403).set_body_json(json!({"detail":"forbidden","reason":reason}));
+        Mock::given(method("POST"))
+            .and(path(api_path("/credentials/token")))
+            .respond_with(refuse.clone())
+            .mount(&s)
+            .await;
+        Mock::given(wiremock::matchers::any())
+            .and(wiremock::matchers::path_regex(
+                "/credentials/(providers|requests)",
+            ))
+            .respond_with(refuse)
+            .mount(&s)
+            .await;
+        let p = profile(&s.uri());
+        let api = CloudApi::new(&p, TokenSource::new(&p, old, "vrc".into()));
+        let c = client_for(QuomeMcp::new(api, p).with_reloader(reload)).await;
+        (s, c, n)
+    }
+
+    #[tokio::test]
+    async fn grant_capability_missing_asks_for_admin_access_once() {
+        let (_s, mut c, n) = start_refusing("capability_missing").await;
+        let (err, text) = c
+            .call(
+                "credentials_grant",
+                json!({"id":"g","subject":{"app":"x"},"routes":[]}),
+            )
+            .await;
+        assert!(err);
+        assert_eq!(
+            text,
+            "Run `quome connect` again and allow Credentials admin access."
+        );
+        assert_eq!(n.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let (err, text) = c.call("credentials_routes", json!({})).await;
+        assert!(err);
+        assert_eq!(
+            text,
+            "Run `quome connect` again and allow Credentials access."
+        );
+    }
+
+    #[tokio::test]
+    async fn providers_hints_per_code_with_one_reconnect() {
+        for (reason, want) in [
+            (
+                "capability_missing",
+                "Run `quome connect` again and allow Credentials admin access.",
+            ),
+            (
+                "role_required",
+                "An org Owner or Admin must have connected this agent",
+            ),
+            ("person_required", "A person must do this in the console."),
+        ] {
+            for args in [
+                json!({}),
+                json!({"set":{"id":"p","kind":{"type":"bearer"}}}),
+                json!({"request":{"provider_id":"p","kind":{"type":"bearer"},"secret_name":"S","instructions":"i","recipient_email":"a@b.c"}}),
+            ] {
+                let (_s, mut c, n) = start_refusing(reason).await;
+                // Providers go straight to the platform; refuse there too.
+                let (err, text) = c.call("credentials_providers", args.clone()).await;
+                assert!(err, "{reason} {args}");
+                assert!(text.contains(want), "{reason} {args}: {text}");
+                let want_n = usize::from(reason != "person_required");
+                assert_eq!(
+                    n.load(std::sync::atomic::Ordering::SeqCst),
+                    want_n,
+                    "{reason} {args}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_and_blank_arguments_are_refused_with_no_request() {
+        let (s, mut c) = start_creds().await;
+        let cases = [
+            (
+                "credentials_grant",
+                json!({"id":"g","subject":{"app":"x"},"routes":[],"ttl":7}),
+            ),
+            (
+                "credentials_grant",
+                json!({"id":"g","subject":{"agent":"a","user":"*","user_sub":"u1"},"routes":[]}),
+            ),
+            (
+                "credentials_grant",
+                json!({"id":"g","subject":{"app":"x"},"routes":[],"git":{"repos":[],"push_branches":[],"exceptions":[]}}),
+            ),
+            (
+                "credentials_grant",
+                json!({"id":"g","subject":{"app":"x"},"routes":[],"git":{"repos":[]}}),
+            ),
+            (
+                "credentials_grant",
+                json!({"id":" ","subject":{"app":"x"},"routes":[]}),
+            ),
+            (
+                "credentials_grant",
+                json!({"id":"g","subject":{"app":" "},"routes":[]}),
+            ),
+            (
+                "credentials_grant",
+                json!({"id":"g","subject":{"app":"x"},"routes":[],"caps":[1]}),
+            ),
+            (
+                "credentials_providers",
+                json!({"set":{"id":"p","kind":{"type":"bearer"},"secret_value":"v"}}),
+            ),
+            (
+                "credentials_providers",
+                json!({"request":{"provider_id":"p","kind":"x","secret_name":"S","instructions":"i","recipient_email":"a@b.c"}}),
+            ),
+            (
+                "credentials_providers",
+                json!({"request":{"provider_id":"p","kind":{},"secret_name":"S","instructions":"  ","recipient_email":"a@b.c"}}),
+            ),
+            (
+                "credentials_request",
+                json!({"route":"r","reason":"x","extra":1}),
+            ),
+            ("credentials_request", json!({"route":"r","reason":"  "})),
+            ("credentials_request", json!({"route":" ","reason":"x"})),
+            (
+                "credentials_request",
+                json!({"git_exception":{"repo":"github.com/o/n","ref":"","allow":"tag","extra":1},"reason":"x"}),
+            ),
+        ];
+        for (tool, args) in cases {
+            let (err, text) = c.call(tool, args.clone()).await;
+            assert!(err, "{tool} {args}: {text}");
+        }
+        let calls = s.received_requests().await.unwrap();
+        assert!(
+            calls.iter().all(|r| r.url.path().starts_with("/.well-known")
+                || r.url.path() == "/oauth/token"),
+            "{calls:?}"
+        );
     }
 }
