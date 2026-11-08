@@ -46,6 +46,17 @@ pub enum RegisterOutcome {
 pub struct Ctx<'a> {
     pub home: &'a Path,
     pub runner: &'a dyn CommandRunner,
+    /// Environment lookup (real: `std::env::var`), injected for hermetic tests.
+    pub env: &'a dyn Fn(&str) -> Option<String>,
+}
+
+pub fn real_env(k: &str) -> Option<String> {
+    std::env::var(k).ok()
+}
+
+#[cfg(test)]
+pub fn no_env(_: &str) -> Option<String> {
+    None
 }
 
 /// One agent client.
@@ -113,59 +124,72 @@ mod tests {
 #[cfg(test)]
 mod layout_tests {
     use super::*;
+    use std::collections::BTreeMap;
 
-    /// Files OpenCode would load as skills from its global roots (each root is
-    /// scanned recursively for `SKILL.md`).
-    fn opencode_skill_files(home: &Path) -> Vec<PathBuf> {
-        fn walk(d: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(d) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    walk(&p, out);
-                } else if p.file_name().is_some_and(|n| n == "SKILL.md") {
-                    out.push(p);
-                }
+    /// OpenCode's discovery rule for a global skills root (docs: opencode.ai/docs/skills,
+    /// "Discovery"): SKILL.md files may be nested in grouping directories; a directory
+    /// holding SKILL.md is one skill and is not searched further; the skill ID is that
+    /// directory's name. Returns ID -> SKILL.md paths.
+    fn opencode_skills(root: &Path, out: &mut BTreeMap<String, Vec<PathBuf>>) {
+        let Ok(rd) = std::fs::read_dir(root) else {
+            return;
+        };
+        if root.join("SKILL.md").is_file() {
+            let id = root.file_name().unwrap().to_string_lossy().into_owned();
+            out.entry(id).or_default().push(root.join("SKILL.md"));
+            return;
+        }
+        for e in rd.flatten() {
+            if e.path().is_dir() {
+                opencode_skills(&e.path(), out);
             }
         }
-        let mut out = Vec::new();
+    }
+
+    fn write_skill(root: &Path, dir: &str) {
+        let d = root.join(dir);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("SKILL.md"), "x").unwrap();
+    }
+
+    /// OpenCode scans `~/.claude/skills` and `~/.agents/skills` recursively, so it
+    /// sees the Claude plugin's skills (`<name>`) as well as the shared copies
+    /// (`quome-<name>`). Different IDs, same playbook: harmless, and the layout
+    /// keeps Claude skills out of `~/.claude/skills/<x>/SKILL.md`.
+    #[test]
+    fn opencode_sees_claude_plugin_skills_too() {
+        let home = tempfile::tempdir().unwrap();
+        let names = ["deploy", "sandbox"];
+        let targets = skill_targets(&[ClientId::Claude, ClientId::OpenCode], home.path());
+        assert_eq!(targets.len(), 2);
+        for (root, client) in &targets {
+            for n in names {
+                let dir = match client {
+                    ClientId::Claude => n.to_string(),
+                    _ => format!("quome-{n}"),
+                };
+                write_skill(root, &dir);
+            }
+        }
+        let mut seen = BTreeMap::new();
         for root in [
             ".config/opencode/skills",
             ".claude/skills",
             ".agents/skills",
         ] {
-            walk(&home.join(root), &mut out);
+            opencode_skills(&home.path().join(root), &mut seen);
         }
-        out
-    }
-
-    #[test]
-    fn no_double_load_claude_and_opencode() {
-        let home = tempfile::tempdir().unwrap();
-        let installed = [ClientId::Claude, ClientId::OpenCode];
-        let targets = skill_targets(&installed, home.path());
-        assert_eq!(targets.len(), 2);
-        // Claude's skills sit one level below the plugin root, never at
-        // ~/.claude/skills/<x>/SKILL.md, so they are not a root-level skill.
-        let claude = paths::skills_dir(ClientId::Claude, home.path());
-        assert_eq!(
-            claude,
-            home.path().join(".claude/skills/quome/skills"),
-            "claude skills live inside the plugin"
-        );
-        for (root, _) in &targets {
-            let dir = root.join("check");
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join("SKILL.md"), "x").unwrap();
-        }
-        for f in opencode_skill_files(home.path()) {
-            let rel = f.strip_prefix(home.path().join(".claude/skills")).ok();
-            if let Some(rel) = rel {
-                // ~/.claude/skills/<plugin>/skills/<name>/SKILL.md: depth 4, not 2.
+        // Every ID once; each playbook reachable as exactly two IDs.
+        let ids: Vec<_> = seen.keys().cloned().collect();
+        assert_eq!(ids, ["deploy", "quome-deploy", "quome-sandbox", "sandbox"]);
+        assert!(seen.values().all(|v| v.len() == 1));
+        // Nothing sits at ~/.claude/skills/<x>/SKILL.md (depth 2), which would add a
+        // stray root-level `/quome`-style skill.
+        for p in seen.values().flatten() {
+            if let Ok(rel) = p.strip_prefix(home.path().join(".claude/skills")) {
                 assert_eq!(rel.components().count(), 4, "{rel:?}");
             }
         }
-        assert_eq!(opencode_skill_files(home.path()).len(), 2);
         // Codex and OpenCode share one root, written once.
         let t = skill_targets(&[ClientId::Codex, ClientId::OpenCode], home.path());
         assert_eq!(t.len(), 1);

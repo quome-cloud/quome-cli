@@ -8,8 +8,21 @@ use std::path::{Path, PathBuf};
 
 pub struct OpenCode;
 
-pub fn config_path(home: &Path) -> PathBuf {
-    home.join(".config/opencode/opencode.json")
+/// The config file the CLI reads and writes: `$XDG_CONFIG_HOME/opencode` when set and
+/// non-empty, else `~/.config/opencode`; `opencode.json`, or `opencode.jsonc` when
+/// only that exists (the CLI edits `.json` first if both are present).
+pub fn config_path(home: &Path, env: &dyn Fn(&str) -> Option<String>) -> PathBuf {
+    let dir = match env("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        Some(x) => PathBuf::from(x).join("opencode"),
+        None => home.join(".config/opencode"),
+    };
+    let json = dir.join("opencode.json");
+    let jsonc = dir.join("opencode.jsonc");
+    if !json.exists() && jsonc.exists() {
+        jsonc
+    } else {
+        json
+    }
 }
 
 enum Current {
@@ -18,8 +31,8 @@ enum Current {
     Different,
 }
 
-fn current(home: &Path, program: &str, profile: &str) -> Result<Current, String> {
-    let path = config_path(home);
+fn current(ctx: &Ctx, program: &str, profile: &str) -> Result<Current, String> {
+    let path = config_path(ctx.home, ctx.env);
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Current::Missing),
@@ -57,7 +70,7 @@ impl ClientAdapter for OpenCode {
         program: &str,
         profile: &str,
     ) -> Result<RegisterOutcome, String> {
-        let cur = current(ctx.home, program, profile)?;
+        let cur = current(ctx, program, profile)?;
         if matches!(cur, Current::Same) {
             return Ok(RegisterOutcome::Unchanged);
         }
@@ -100,11 +113,19 @@ mod tests {
     use crate::cloud::clients::runner::fake::{fail, ok, Fake};
 
     fn reg(r: &Fake, h: &Path) -> Result<RegisterOutcome, String> {
-        OpenCode.register_mcp(&Ctx { home: h, runner: r }, "quome", "dev")
+        OpenCode.register_mcp(
+            &Ctx {
+                home: h,
+                runner: r,
+                env: &crate::cloud::clients::no_env,
+            },
+            "quome",
+            "dev",
+        )
     }
 
     fn write(h: &Path, text: &str) -> PathBuf {
-        let p = config_path(h);
+        let p = config_path(h, &crate::cloud::clients::no_env);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(&p, text).unwrap();
         p
@@ -121,7 +142,7 @@ mod tests {
             r.calls(),
             vec!["opencode mcp add quome --global -- quome mcp --profile dev"]
         );
-        assert!(!config_path(h.path()).exists());
+        assert!(!config_path(h.path(), &crate::cloud::clients::no_env).exists());
     }
 
     #[test]
@@ -169,6 +190,71 @@ mod tests {
         let r = Fake::new(|_, _| RunResult::NotFound);
         assert!(reg(&r, h.path()).is_err());
         assert_eq!(std::fs::read_dir(h.path()).unwrap().count(), 0);
+    }
+
+    fn reg_env(
+        r: &Fake,
+        h: &Path,
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<RegisterOutcome, String> {
+        OpenCode.register_mcp(
+            &Ctx {
+                home: h,
+                runner: r,
+                env,
+            },
+            "quome",
+            "dev",
+        )
+    }
+
+    #[test]
+    fn xdg_config_home_wins_over_stale_home_config() {
+        let h = tempfile::tempdir().unwrap();
+        let x = tempfile::tempdir().unwrap();
+        // A stale entry under ~/.config would give a false Unchanged.
+        write(h.path(), SAME);
+        let xp = x.path().to_string_lossy().into_owned();
+        let env = move |k: &str| (k == "XDG_CONFIG_HOME").then(|| xp.clone());
+        let r = Fake::new(|_, _| ok(""));
+        assert_eq!(reg_env(&r, h.path(), &env), Ok(RegisterOutcome::Added));
+        assert_eq!(r.calls().len(), 1);
+        // The guard reads the XDG file too.
+        let p = x.path().join("opencode/opencode.json");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, "{ not json").unwrap();
+        assert!(reg_env(&r, h.path(), &env).is_err());
+        assert_eq!(r.calls().len(), 1);
+        std::fs::write(&p, SAME).unwrap();
+        assert_eq!(reg_env(&r, h.path(), &env), Ok(RegisterOutcome::Unchanged));
+    }
+
+    #[test]
+    fn empty_xdg_config_home_falls_back_to_home() {
+        let h = tempfile::tempdir().unwrap();
+        write(h.path(), SAME);
+        let env = |k: &str| (k == "XDG_CONFIG_HOME").then(String::new);
+        let r = Fake::new(|_, _| ok(""));
+        assert_eq!(reg_env(&r, h.path(), &env), Ok(RegisterOutcome::Unchanged));
+    }
+
+    #[test]
+    fn jsonc_is_read_when_it_is_the_only_config() {
+        let h = tempfile::tempdir().unwrap();
+        let d = h.path().join(".config/opencode");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("opencode.jsonc"), SAME).unwrap();
+        let r = Fake::new(|_, _| ok(""));
+        assert_eq!(
+            reg_env(&r, h.path(), &crate::cloud::clients::no_env),
+            Ok(RegisterOutcome::Unchanged)
+        );
+        // With both present the CLI edits .json, so that is the one we read.
+        std::fs::write(d.join("opencode.json"), "{}").unwrap();
+        assert_eq!(
+            reg_env(&r, h.path(), &crate::cloud::clients::no_env),
+            Ok(RegisterOutcome::Added)
+        );
     }
 
     #[test]

@@ -10,7 +10,14 @@ fn write(path: &Path, text: &str) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
-    std::fs::write(path, text).map_err(|e| format!("cannot write {}: {e}", path.display()))
+    // Temp file in the same directory, then rename, so a crash never leaves a
+    // half-written config.
+    let tmp = path.with_extension("json.quome-tmp");
+    let res = std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, path));
+    res.map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("cannot write {}: {e}", path.display())
+    })
 }
 
 pub fn config_path(home: &Path) -> PathBuf {
@@ -81,7 +88,15 @@ mod tests {
 
     fn reg(home: &Path, p: &str) -> Result<RegisterOutcome, String> {
         let r = Fake::new(|_, _| ok(""));
-        Antigravity.register_mcp(&Ctx { home, runner: &r }, "quome", p)
+        Antigravity.register_mcp(
+            &Ctx {
+                home,
+                runner: &r,
+                env: &crate::cloud::clients::no_env,
+            },
+            "quome",
+            p,
+        )
     }
 
     const FIXTURE: &str = "{\n    \"theme\": \"dark\",\n    \"mcpServers\": {\n        \"other\": {\n            \"command\": \"x\",\n            \"args\": [\"a\", \"b\"]\n        }\n    },\n    \"zeta\": [1, 2.5, true]\n}\n";
@@ -162,6 +177,38 @@ mod tests {
             reg(h.path(), "dev").unwrap();
             assert_eq!(std::fs::read_to_string(&p).unwrap(), after);
         }
+    }
+
+    #[test]
+    fn crlf_files_get_crlf_insertions() {
+        let h = tempfile::tempdir().unwrap();
+        let p = config_path(h.path());
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(
+            &p,
+            "{\r\n  \"mcpServers\": {\r\n    \"o\": 1\r\n  }\r\n}\r\n",
+        )
+        .unwrap();
+        reg(h.path(), "dev").unwrap();
+        let after = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            after.starts_with("{\r\n  \"mcpServers\": {\r\n    \"o\": 1,\r\n    \"quome\": {\r\n")
+        );
+        assert!(
+            !after.replace("\r\n", "").contains('\n'),
+            "bare LF in {after:?}"
+        );
+    }
+
+    #[test]
+    fn write_leaves_no_temp_file() {
+        let h = tempfile::tempdir().unwrap();
+        reg(h.path(), "dev").unwrap();
+        let names: Vec<_> = std::fs::read_dir(config_path(h.path()).parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["mcp_config.json"]);
     }
 
     #[test]

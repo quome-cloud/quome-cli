@@ -39,8 +39,11 @@ impl ClientAdapter for Codex {
         program: &str,
         profile: &str,
     ) -> Result<RegisterOutcome, String> {
-        let (exists, out, _) = run(ctx.runner, &argv(&["mcp", "get", "quome", "--json"]))?;
-        if exists && matches(&out, program, profile) {
+        let (found, out, err) = run(ctx.runner, &argv(&["mcp", "get", "quome", "--json"]))?;
+        // `get` failing for any reason other than "no such server" leaves us unsure the
+        // entry is absent, so assume it exists: replace it and report Updated.
+        let exists = found || !err.to_lowercase().contains("no mcp server");
+        if found && matches(&out, program, profile) {
             return Ok(RegisterOutcome::Unchanged);
         }
         if exists {
@@ -74,13 +77,27 @@ mod tests {
     const SAME: &str = r#"{"name":"quome","transport":{"type":"stdio","command":"quome","args":["mcp","--profile","dev"]}}"#;
 
     fn reg(r: &Fake, h: &Path) -> Result<RegisterOutcome, String> {
-        Codex.register_mcp(&Ctx { home: h, runner: r }, "quome", "dev")
+        Codex.register_mcp(
+            &Ctx {
+                home: h,
+                runner: r,
+                env: &crate::cloud::clients::no_env,
+            },
+            "quome",
+            "dev",
+        )
     }
 
     #[test]
     fn adds_when_absent_with_exact_argv() {
         let h = tempfile::tempdir().unwrap();
-        let r = Fake::new(|_, a| if a[1] == "get" { fail("none") } else { ok("") });
+        let r = Fake::new(|_, a| {
+            if a[1] == "get" {
+                fail("Error: No MCP server named 'quome' found.")
+            } else {
+                ok("")
+            }
+        });
         assert_eq!(reg(&r, h.path()), Ok(RegisterOutcome::Added));
         assert_eq!(
             r.calls(),
@@ -113,6 +130,20 @@ mod tests {
                 "codex mcp add quome -- quome mcp --profile dev"
             ]
         );
+    }
+
+    #[test]
+    fn unknown_get_failure_reports_updated_never_added() {
+        let h = tempfile::tempdir().unwrap();
+        let r = Fake::new(|_, a| {
+            if a[1] == "get" {
+                fail("config.toml is locked")
+            } else {
+                ok("")
+            }
+        });
+        assert_eq!(reg(&r, h.path()), Ok(RegisterOutcome::Updated));
+        assert_eq!(r.calls().len(), 3);
     }
 
     #[test]

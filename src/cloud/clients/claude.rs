@@ -57,6 +57,7 @@ mod tests {
             &Ctx {
                 home: h.path(),
                 runner: r,
+                env: &crate::cloud::clients::no_env,
             },
             "quome",
             "dev",

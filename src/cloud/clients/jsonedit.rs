@@ -219,11 +219,13 @@ pub fn splice_set(text: &str, path: &[&str], value: &Value) -> Option<String> {
     if text.as_bytes().get(root) != Some(&b'{') {
         return None;
     }
-    splice_in(text, root, path, 0, value, &unit, multiline)
+    let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    splice_in(text, root, path, 0, value, &(unit, eol), multiline)
 }
 
-fn render_value(v: &Value, unit: &str, multiline: bool, depth: usize) -> String {
+fn render_value(v: &Value, ue: &(String, &str), multiline: bool, depth: usize) -> String {
     use serde::Serialize;
+    let (unit, eol) = (ue.0.as_str(), ue.1);
     if !multiline {
         return serde_json::to_string(v).expect("json serializes");
     }
@@ -233,7 +235,7 @@ fn render_value(v: &Value, unit: &str, multiline: bool, depth: usize) -> String 
     v.serialize(&mut ser).expect("json serializes");
     String::from_utf8(buf)
         .expect("json is utf-8")
-        .replace('\n', &format!("\n{}", unit.repeat(depth)))
+        .replace('\n', &format!("{eol}{}", unit.repeat(depth)))
 }
 
 fn splice_in(
@@ -242,9 +244,10 @@ fn splice_in(
     path: &[&str],
     depth: usize,
     value: &Value,
-    unit: &str,
+    ue: &(String, &str),
     multiline: bool,
 ) -> Option<String> {
+    let (unit, eol) = (ue.0.as_str(), ue.1);
     let (ms, close) = members(text, open)?;
     let key = path[0];
     let leaf = path.len() == 1;
@@ -256,13 +259,13 @@ fn splice_in(
     };
     if let Some(m) = ms.iter().find(|m| m.key == key) {
         if leaf {
-            let new = render_value(value, unit, multiline, depth + 1);
+            let new = render_value(value, ue, multiline, depth + 1);
             return Some(format!("{}{}{}", &text[..m.val.0], new, &text[m.val.1..]));
         }
         if text.as_bytes()[m.val.0] != b'{' {
             return None;
         }
-        return splice_in(text, m.val.0, &path[1..], depth + 1, value, unit, multiline);
+        return splice_in(text, m.val.0, &path[1..], depth + 1, value, ue, multiline);
     }
     // Key absent: append a member (with any missing parents) to this object.
     let v = if leaf {
@@ -272,9 +275,9 @@ fn splice_in(
     };
     let kj = serde_json::to_string(key).ok()?;
     let sep = if multiline { ": " } else { ":" };
-    let member = format!("{kj}{sep}{}", render_value(&v, unit, multiline, depth + 1));
+    let member = format!("{kj}{sep}{}", render_value(&v, ue, multiline, depth + 1));
     let pad = if multiline {
-        format!("\n{}", unit.repeat(depth + 1))
+        format!("{eol}{}", unit.repeat(depth + 1))
     } else {
         String::new()
     };
@@ -285,7 +288,7 @@ fn splice_in(
         }
         None => {
             let tail = if multiline {
-                format!("\n{}", unit.repeat(depth))
+                format!("{eol}{}", unit.repeat(depth))
             } else {
                 String::new()
             };
