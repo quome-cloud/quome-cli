@@ -1,7 +1,7 @@
 ---
 type: tool_used
 tool: Skill
-input_match: "quome:signup-inbox"
+input_match: '\Wquome:signup-inbox\W'
 min: 1
 arm: with-only
 ---

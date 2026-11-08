@@ -1,6 +1,6 @@
 ---
 type: tool_used
 tool: mcp__quome__playbook
-input_match: "sandboxes"
+input_match: '\bname\W+sandboxes\W'
 min: 1
 ---

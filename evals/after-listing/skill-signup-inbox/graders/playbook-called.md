@@ -1,6 +1,6 @@
 ---
 type: tool_used
 tool: mcp__quome__playbook
-input_match: "signup-inbox"
+input_match: '\bname\W+signup-inbox\W'
 min: 1
 ---

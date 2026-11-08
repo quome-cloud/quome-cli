@@ -1,6 +1,6 @@
 ---
 type: tool_used
 tool: mcp__quome__playbook
-input_match: "apps"
+input_match: '\bname\W+apps\W'
 min: 1
 ---

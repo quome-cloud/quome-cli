@@ -12,7 +12,11 @@
 # ~/.claude or any other client directory is written.
 #
 # Usage:
-#   scripts/run-evals.sh [--after-listing] [--from-installed] [--dry-run] [-- extra eval flags]
+#   scripts/run-evals.sh --profile NAME [--yes] [--after-listing] [--from-installed] [--dry-run] [-- extra eval flags]
+#     --profile NAME    REQUIRED for a real run (or QUOME_PROFILE=NAME): the quome
+#                       profile whose org the cases run against. The script prints
+#                       the profile and its org (quome cloud status) and asks you
+#                       to confirm; --yes skips the question (non-interactive).
 #     (default)         run the playbook-* cases (they work while playbooks are unlisted)
 #     --after-listing   run the skill-* cases instead (need the playbooks listed
 #                       and `quome skills sync` done first; see evals/README.md)
@@ -20,19 +24,22 @@
 #                       plugin, read-only copy) so the real skills are under test
 #     --dry-run         build and validate the scratch plugin, print the eval
 #                       command, do not run it (no model calls)
-#   QUOME_PROFILE=name  profile the MCP server uses (default: the active one)
 set -euo pipefail
 
 repo=$(cd "$(dirname "$0")/.." && pwd)
 case_glob='playbook-*'
 from_installed=0
 dry=0
+yes=0
+profile=${QUOME_PROFILE:-}
 extra=()
 while [ $# -gt 0 ]; do
   case $1 in
     --after-listing) case_glob='skill-*' ;;
     --from-installed) from_installed=1 ;;
     --dry-run) dry=1 ;;
+    --yes) yes=1 ;;
+    --profile) shift; profile=${1:?--profile needs a name} ;;
     --) shift; extra=("$@"); break ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
@@ -41,6 +48,21 @@ done
 
 command -v claude >/dev/null || { echo "claude not found on PATH" >&2; exit 2; }
 command -v quome >/dev/null || { echo "quome not found on PATH" >&2; exit 2; }
+
+# The profile ends up inside JSON and on a command line: keep it boring.
+if [ -n "$profile" ] && ! printf '%s' "$profile" | grep -Eq '^[A-Za-z0-9._-]+$'; then
+  echo "invalid profile name (allowed: letters, digits, . _ -): $profile" >&2; exit 2
+fi
+if [ "$dry" = 0 ]; then
+  [ -n "$profile" ] || { echo "refusing to run without --profile NAME (or QUOME_PROFILE): the cases call the real quome MCP server in that profile's org. Use a TEST org." >&2; exit 2; }
+  echo "== About to run the evals against this connection (use a TEST org only):"
+  quome cloud status --profile "$profile" || { echo "profile $profile is not connected" >&2; exit 2; }
+  if [ "$yes" = 0 ]; then
+    [ -t 0 ] || { echo "not a terminal; pass --yes to confirm" >&2; exit 2; }
+    read -r -p "Run against this org? [y/N] " ans
+    case $ans in y|Y|yes) ;; *) echo "aborted" >&2; exit 1 ;; esac
+  fi
+fi
 
 plugin=$(mktemp -d "${TMPDIR:-/tmp}/quome-plugin-eval.XXXXXX")
 trap 'rm -rf "$plugin"' EXIT
@@ -59,7 +81,7 @@ fi
 # The real MCP server the cases call. The plugin ships it so the eval child
 # starts it; the flags below opt in to that.
 args='["mcp"]'
-[ -n "${QUOME_PROFILE:-}" ] && args="[\"mcp\",\"--profile\",\"$QUOME_PROFILE\"]"
+[ -n "$profile" ] && args="[\"mcp\",\"--profile\",\"$profile\"]"
 printf '{ "mcpServers": { "quome": { "command": "quome", "args": %s } } }\n' "$args" > "$plugin/.mcp.json"
 
 rm -rf "$plugin/evals"
@@ -76,12 +98,11 @@ claude plugin validate "$plugin"
 #                          mock for `quome`, so without this the server would
 #                          not start. This lets the plugin's real `quome mcp`
 #                          run, as you, against your test org.
-#  --allow-tools mcp__quome__*  operator grant: MCP tools are gated; the cases
-#                          list `playbook` in allowed_tools, this grants the
-#                          server's tools so a run that wanders is not blocked
-#                          in odd ways. Narrow to mcp__quome__playbook to
-#                          forbid any other tool (the playbook-* cases only
-#                          need that one).
+#  --allow-tools           operator grant, least privilege: only
+#                          mcp__quome__playbook (plus Skill for the skill-*
+#                          cases). Every other quome tool stays gated, so a run
+#                          that wanders cannot act on the org. Widen only by
+#                          passing your own --allow-tools after "--".
 #  --ablation none         the with/without-plugin baseline arm has no `quome`
 #                          server, so it cannot score; skip it.
 #  --no-publish            keep the HTML report local.
@@ -89,10 +110,12 @@ claude plugin validate "$plugin"
 #  --max-cost-usd 5        hard ceiling for a by-hand run; raise it deliberately.
 #  --trust-plugin          NOT passed: the first run asks you to confirm, which is
 #                          what a by-hand run should do. Add it after "--" for CI.
+grants=(mcp__quome__playbook)
+[ "$case_glob" = 'skill-*' ] && grants+=(Skill)
 cmd=(claude plugin eval "$plugin"
   --case "$case_glob"
   --allow-real-servers
-  --allow-tools 'mcp__quome__*'
+  --allow-tools "${grants[@]}"
   --ablation none
   --no-publish
   --max-cost-usd 5

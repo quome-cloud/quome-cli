@@ -5,13 +5,15 @@
 # For each installed client among Codex, OpenCode and Antigravity this runs the
 # client's non-interactive mode with
 #     "Use your quome-build-app skill to tell me its first step"
-# and checks the output mentions `playbook`. It prints a pass/fail table, skips
+# and checks the output contains the quome-build-app first-step marker
+# (`list_sandboxes` or `create_sandbox`, the tools its first step names), which
+# only appears if the skill ran and the playbook was fetched. It prints a pass/fail table, skips
 # clients that are not installed, and exits non-zero if any installed client
 # fails.
 #
 # Non-interactive modes (from each client's --help):
 #   Codex        codex exec --skip-git-repo-check -o <file> "<prompt>"
-#   OpenCode     opencode run "<prompt>"
+#   OpenCode     opencode run --standalone "<prompt>"  (private server, no leftover service)
 #   Antigravity  agy -p "<prompt>"   (UNVERIFIED: Antigravity was not available
 #                                     when this was written; adjust if its
 #                                     headless flag differs)
@@ -25,7 +27,7 @@
 #   --fixture   nothing is listed yet, so instead write ONE fixture skill
 #               (quome-smoke) into a scratch home (HOME, CODEX_HOME and
 #               XDG_CONFIG_HOME/XDG_DATA_HOME overridden) whose body says to
-#               answer "playbook". This proves skill discovery per client
+#               answer "playbook" (checked as a whole word). This proves skill discovery per client
 #               without touching the real home. The client still needs model
 #               credentials; a scratch home has none, so either log in inside
 #               the scratch home or expect an auth failure (reported as FAIL
@@ -46,6 +48,11 @@ done
 if [ "$fixture" = 1 ]; then
   skill=quome-smoke
   prompt="Use your quome-smoke skill and follow its instruction exactly."
+  marker='(^|[^a-z])playbook([^a-z]|$)'
+  marker_desc="answered playbook"
+  # Drop any client config-dir overrides so nothing real is read.
+  unset OPENCODE_CONFIG_DIR OPENCODE_CONFIG OPENCODE_CONFIG_CONTENT CLAUDE_CONFIG_DIR \
+    GEMINI_CONFIG_DIR GEMINI_HOME ANTIGRAVITY_CONFIG_DIR AGENTS_HOME
   scratch=$(mktemp -d "${TMPDIR:-/tmp}/quome-smoke.XXXXXX")
   trap 'rm -rf "$scratch"' EXIT
   export HOME="$scratch" CODEX_HOME="$scratch/.codex"
@@ -67,6 +74,8 @@ SKILL
 else
   skill=quome-build-app
   prompt="Use your quome-build-app skill to tell me its first step"
+  marker='list_sandboxes|create_sandbox'
+  marker_desc="output names the build-app first step"
 fi
 
 # Run "$@" with a wall-clock limit (macOS has no timeout(1)).
@@ -81,8 +90,8 @@ record() { # name status detail
 }
 
 check() { # name output
-  if printf '%s' "$2" | grep -qi 'playbook'; then
-    record "$1" PASS "output mentions playbook"
+  if printf '%s' "$2" | grep -Eqi "$marker"; then
+    record "$1" PASS "$marker_desc"
   else
     record "$1" FAIL "$(printf '%s' "$2" | tr '\n' ' ' | cut -c1-120)"
   fi
@@ -99,7 +108,7 @@ else
 fi
 
 if command -v opencode >/dev/null; then
-  o="$(with_limit opencode run "$prompt" 2>&1)"
+  o="$(with_limit opencode run --standalone "$prompt" 2>&1)"
   rc=$?
   if [ "$rc" = 0 ]; then check opencode "$o"; else record opencode FAIL "rc=$rc: $(printf '%s' "$o" | tr '\n' ' ' | tail -c 120)"; fi
 else
