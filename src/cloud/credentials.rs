@@ -98,10 +98,14 @@ impl CredError {
 pub fn cred_hint(e: CredError) -> String {
     let (code, text) = match e {
         CredError::Api(e) => {
-            let m = e.to_string();
-            let code = if m.contains("capability_missing") {
+            let m = match &e {
+                QuomeError::ApiError(m) => m.clone(),
+                other => other.to_string(),
+            };
+            let forbidden = matches!(e, QuomeError::ApiError(_)) && m.starts_with("403");
+            let code = if forbidden && m.contains("capability_missing") {
                 "capability_missing"
-            } else if m.contains("role_required") {
+            } else if forbidden && m.contains("role_required") {
                 "role_required"
             } else {
                 return super::mcp::fail(e);
@@ -121,8 +125,20 @@ pub fn cred_hint(e: CredError) -> String {
         "capability_missing" => "Run `quome connect` again and allow Credentials access.".into(),
         "role_required" => "An org Owner or Admin must have connected this agent with Credentials admin access; ask one to run `quome connect` again and allow it.".into(),
         "grant_missing" => "Ask for access with credentials_request.".into(),
+        "already_granted" => "This access is already granted; there is nothing to ask for.".into(),
+        "too_many_requests" => "Too many requests are open or were made recently. Wait before asking again.".into(),
+        "no_base_grant" => "There is no grant to attach this to yet. Ask for the route or repo access first with credentials_request.".into(),
+        "invalid_request" => format!("The request was not valid. {}", detail_of(&text)),
+        "agent_required" => "Only an agent acting for a person can ask for access.".into(),
+        "person_required" => "A person must do this in the console.".into(),
+        "exceptions_read_only" => "Git exceptions cannot be added or changed this way; they come only from approved requests.".into(),
         _ => text,
     }
+}
+
+/// The service's message from a "answered <code>: <message>" text, if any.
+fn detail_of(text: &str) -> &str {
+    text.split_once(": ").map(|(_, m)| m).unwrap_or("")
 }
 
 #[derive(Default)]
@@ -652,5 +668,21 @@ mod tests {
             url: "https://x.test/o".into(),
         };
         assert!(!format!("{t:?}").contains("SECRET"));
+    }
+
+    #[test]
+    fn hint_for_a_500_mentioning_capability_missing_is_not_reconnect() {
+        let e = CredError::Api(QuomeError::ApiError(
+            "500 upstream said capability_missing".into(),
+        ));
+        assert!(!e.needs_reconnect());
+        let t = cred_hint(CredError::Api(QuomeError::ApiError(
+            "500 upstream said capability_missing".into(),
+        )));
+        assert!(!t.contains("quome connect"), "{t}");
+        let t = cred_hint(CredError::Api(QuomeError::ApiError(
+            "403 forbidden: capability_missing".into(),
+        )));
+        assert_eq!(t, "Run `quome connect` again and allow Credentials access.");
     }
 }
