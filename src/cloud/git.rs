@@ -230,6 +230,12 @@ pub fn git_host(p: &Profile) -> String {
     format!("git.{}", p.apps_domain)
 }
 
+/// `egress.{apps_domain}`, the host plain git uses to reach outside repos
+/// through the org's credentials service.
+pub fn egress_host(p: &Profile) -> String {
+    format!("egress.{}", p.apps_domain)
+}
+
 /// A request to the git server.
 #[derive(Clone)]
 pub(crate) struct ServerReq {
