@@ -121,11 +121,14 @@ pub fn pick_profile<'a>(
 
 /// git's answer for `token`, valid until `now_unix + expires_in`.
 pub fn answer(token: &GitToken, now_unix: u64) -> String {
-    format!(
-        "username=quome\npassword={}\npassword_expiry_utc={}\n",
-        token.access_token,
-        now_unix + token.expires_in
-    )
+    let mut out = format!("username=quome\npassword={}\n", token.access_token);
+    if token.expires_in > 0 {
+        out.push_str(&format!(
+            "password_expiry_utc={}\n",
+            now_unix + token.expires_in
+        ));
+    }
+    out
 }
 
 /// The text for git's stdout, or `None` for nothing. `now_unix` reads the
@@ -297,6 +300,15 @@ mod tests {
         let st = two_profiles("other");
         let e = pick_profile(&st, &req("https", "git.apps.example", None), None).unwrap_err();
         assert!(e.to_string().contains("useHttpPath"), "{e}");
+    }
+
+    #[test]
+    fn answer_omits_expiry_without_a_lifetime() {
+        let t = GitToken {
+            access_token: "G1".into(),
+            expires_in: 0,
+        };
+        assert_eq!(answer(&t, 1_000), "username=quome\npassword=G1\n");
     }
 
     #[test]

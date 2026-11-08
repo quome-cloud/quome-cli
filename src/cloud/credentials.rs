@@ -115,6 +115,8 @@ pub fn cred_hint_for(e: CredError, access: CredAccess) -> String {
                 "role_required"
             } else if forbidden && m.contains("person_required") {
                 "person_required"
+            } else if m.contains("broker_refused") {
+                "broker_refused"
             } else {
                 return super::mcp::fail(e);
             };
@@ -141,6 +143,7 @@ pub fn cred_hint_for(e: CredError, access: CredAccess) -> String {
         "no_base_grant" => "There is no grant to attach this to yet. Ask for the route or repo access first with credentials_request.".into(),
         "invalid_request" => format!("The request was not valid. {}", detail_of(&text)),
         "agent_required" => "Only an agent acting for a person can ask for access.".into(),
+        "broker_refused" => "Quome Cloud could not issue a Credentials token; try again in a few seconds.".into(),
         "person_required" => "A person must do this in the console.".into(),
         "exceptions_read_only" => "Git exceptions cannot be added or changed this way; they come only from approved requests.".into(),
         _ => text,
@@ -276,7 +279,20 @@ impl CredentialsClient {
                 self.evict(access, &token.access_token).await;
                 continue;
             }
-            if parsed["error"].is_object() {
+            let enveloped = parsed["error"].is_object();
+            // The platform wakes the service before the edge route is back, and
+            // a restart can leave a cached token pointing at a missing route.
+            let miss = !enveloped
+                && (matches!(status.as_u16(), 404 | 502 | 503)
+                    || (status.as_u16() == 504 && method == Method::GET));
+            if miss {
+                self.evict(access, &token.access_token).await;
+                if patience.nap(None, "Credentials are starting").await {
+                    continue;
+                }
+                return Err(CredError::Api(QuomeError::Usage(STILL_STARTING.into())));
+            }
+            if enveloped {
                 let err = &parsed["error"];
                 return Err(CredError::Refused {
                     code: err["code"].as_str().unwrap_or("").to_string(),
@@ -326,7 +342,7 @@ impl CredentialsClient {
 
     async fn nap(&self, patience: &Patience<'_>, e: &CredError) -> Result<(), CredError> {
         if patience
-            .nap(e.retry_after(), "Your credentials service is starting")
+            .nap(e.retry_after(), "Credentials are starting")
             .await
         {
             Ok(())
@@ -747,5 +763,109 @@ mod tests {
             CredError::Refused { message, .. } => assert_eq!(message.chars().count(), SNIPPET),
             other => panic!("{other:?}"),
         }
+    }
+
+    async fn mount_route(s: &MockServer, m: &str, status: u16, body: Value, times: Option<u64>) {
+        let b = Mock::given(method(m))
+            .and(path("/acme/_v1/routes"))
+            .respond_with(ResponseTemplate::new(status).set_body_json(body));
+        match times {
+            Some(n) => b.up_to_n_times(n).mount(s).await,
+            None => b.mount(s).await,
+        }
+    }
+
+    #[tokio::test]
+    async fn edge_miss_502_remints_and_retries() {
+        let (s, c, _) = setup().await;
+        mount_broker(&s, "C1", 300, 2).await;
+        Mock::given(method("GET"))
+            .and(path("/acme/_v1/routes"))
+            .respond_with(ResponseTemplate::new(502).set_body_string("Bad Gateway"))
+            .up_to_n_times(1)
+            .mount(&s)
+            .await;
+        mount_route(&s, "GET", 200, json!({"routes": []}), None).await;
+        c.get(CredAccess::Use, "/_v1/routes", &NoProgress)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn edge_miss_404_without_envelope_retries() {
+        let (s, c, _) = setup().await;
+        mount_broker(&s, "C1", 300, 3).await;
+        Mock::given(method("GET"))
+            .and(path("/acme/_v1/routes"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+            .up_to_n_times(2)
+            .mount(&s)
+            .await;
+        mount_route(&s, "GET", 200, json!({"routes": []}), None).await;
+        c.get(CredAccess::Use, "/_v1/routes", &NoProgress)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn enveloped_404_is_not_a_miss() {
+        let (s, c, _) = setup().await;
+        mount_broker(&s, "C1", 300, 1).await;
+        Mock::given(method("GET"))
+            .and(path("/acme/_v1/routes"))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_json(json!({"error": {"code": "not_found", "message": "no"}})),
+            )
+            .expect(1)
+            .mount(&s)
+            .await;
+        match c.get(CredAccess::Use, "/_v1/routes", &NoProgress).await {
+            Err(CredError::Refused { code, .. }) => assert_eq!(code, "not_found"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unending_edge_miss_stops_within_the_budget() {
+        let (s, c, _) = setup().await;
+        let c = c.with_timing(Duration::from_millis(60), Duration::from_millis(5));
+        Mock::given(method("POST"))
+            .and(path(broker()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"access_token": "C1", "expires_in": 300, "url": format!("{}/acme", s.uri())}),
+            ))
+            .mount(&s)
+            .await;
+        mount_route(&s, "GET", 503, Value::Null, None).await;
+        let started = Instant::now();
+        match c.get(CredAccess::Use, "/_v1/routes", &NoProgress).await {
+            Err(CredError::Api(QuomeError::Usage(m))) => assert_eq!(m, STILL_STARTING),
+            other => panic!("{other:?}"),
+        }
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[tokio::test]
+    async fn post_504_is_not_retried() {
+        let (s, c, _) = setup().await;
+        mount_broker(&s, "C1", 300, 1).await;
+        Mock::given(method("POST"))
+            .and(path("/acme/_v1/requests"))
+            .respond_with(ResponseTemplate::new(504).set_body_string("timeout"))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let e = c
+            .send(
+                CredAccess::Use,
+                Method::POST,
+                "/_v1/requests",
+                &json!({"route": "x"}),
+                &NoProgress,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(e, CredError::Api(QuomeError::ApiError(m)) if m.starts_with("504")));
     }
 }

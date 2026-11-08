@@ -918,12 +918,14 @@ pub struct CredentialsGitException {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CredentialsGitUrlArgs {
     /// `github.com/<owner>/<name>` or `https://github.com/<owner>/<name>(.git)`.
     repo: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CredentialsProvidersArgs {
     /// Create or replace a provider. Not with request.
     set: Option<CredentialsProviderSet>,
@@ -3331,7 +3333,7 @@ impl QuomeMcp {
     }
 
     #[tool(
-        description = "Get the clone URL for a GitHub repo through the org's credentials service, and the git config lines that sign plain git in: credential_helper on your computer, in_sandbox inside a sandbox. repo is github.com/<owner>/<name> or a GitHub URL. Makes no network call; use credentials_routes to see whether the repo is allowed.",
+        description = "Get the clone URL for a GitHub repo through the org's credentials service, and the git config lines that sign plain git in: credential_helper on your computer, in_sandbox inside a sandbox. repo is github.com/<owner>/<name> or a GitHub URL. Makes no network call, and plain git cannot wake an idle credentials service: call credentials_routes first if the service may be idle, which wakes it, and to see whether the repo is allowed.",
         annotations(read_only_hint = true)
     )]
     async fn credentials_git_url(
@@ -3344,14 +3346,14 @@ impl QuomeMcp {
         json(&serde_json::json!({
             "clone_url": format!("https://{host}/{}/git/github.com/{owner}/{name}.git", p.org_slug),
             "credential_helper": format!(
-                "git config --global credential.https://{host}.helper '!quome git-credential'"
+                "git config --global credential.https://{host}.helper ''\ngit config --global --add credential.https://{host}.helper '!quome git-credential'\ngit config --global credential.https://{host}.useHttpPath true"
             ),
             "in_sandbox": "git config --global http.$QUOME_EGRESS_URL/.extraHeader \"Authorization: Bearer $QUOME_EGRESS_KEY\"",
         }))
     }
 
     #[tool(
-        description = "Work with the org's credential providers. Needs Credentials admin access, even to list. With no arguments, list them (id, kind, status, secret name; never a value). With `set` ({id, kind, secret_name}), create or replace one. With `request` ({provider_id, kind, secret_name, instructions, recipient_email}), ask a person to put the credential in Secrets; you never send or see a secret value. Changes by an agent may wait for a person's approval, and deleting stays in the console.",
+        description = "Work with the org's credential providers. Needs Credentials admin access, even to list. With no arguments, list them (id, kind, status, secret name; never a value). With `set` ({id, kind, secret_name}), create a new provider; changing or deleting an existing one is done by a person in the console. With `request` ({provider_id, kind, secret_name, instructions, recipient_email}), ask a person to put the credential in Secrets (an agent's request may wait for a person's approval before the email goes out); you never send or see a secret value.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     async fn credentials_providers(
@@ -3404,9 +3406,17 @@ impl QuomeMcp {
                 let v = self
                     .prov_call(|api| async move { api.create_credential_request(body).await })
                     .await?;
+                let r = v.get("request").unwrap_or(&v);
+                let message = if r["state"] == "awaiting_approval" {
+                    "A person must approve this before the email goes out. You will not be notified."
+                } else {
+                    "The email has gone out; a person must provide this. You will not be notified."
+                };
                 json(&serde_json::json!({
-                    "id": v.get("id").or_else(|| v["request"].get("id")),
-                    "message": "A person must provide this. You will not be notified.",
+                    "id": r["id"],
+                    "state": r["state"],
+                    "expires_at": r["expires_at"],
+                    "message": message,
                 }))
             }
         }
@@ -3473,15 +3483,31 @@ impl QuomeMcp {
         let body = serde_json::Value::Object(body);
         let path = format!("/_v1/admin/grants/{}", super::api::enc(&a.id));
         let progress = Progress::new(ctx);
-        let (status, v) = progress
-            .run(self.cred_call(
-                CredAccess::Admin,
-                reqwest::Method::PUT,
-                &path,
-                &body,
-                &progress,
-            ))
+        let r = progress
+            .run(async {
+                Ok(self
+                    .cred_raw(
+                        CredAccess::Admin,
+                        reqwest::Method::PUT,
+                        &path,
+                        &body,
+                        &progress,
+                    )
+                    .await)
+            })
             .await?;
+        let (status, v) = match r {
+            Ok(r) => r,
+            Err(CredError::Refused {
+                code, retry_after, ..
+            }) if code == "request_cooldown" => {
+                return json(&serde_json::json!({
+                    "state": "cooldown",
+                    "retry_in_minutes": cooldown_minutes(retry_after),
+                }));
+            }
+            Err(e) => return Err(cred_hint_for(e, CredAccess::Admin)),
+        };
         if status.as_u16() == 202 {
             return json(&serde_json::json!({
                 "state": "pending_approval",
@@ -9720,7 +9746,7 @@ mod tests {
             assert_eq!(v["clone_url"], want, "{repo}");
             assert_eq!(
                 v["credential_helper"],
-                "git config --global credential.https://egress.apps.example.helper '!quome git-credential'"
+                "git config --global credential.https://egress.apps.example.helper ''\ngit config --global --add credential.https://egress.apps.example.helper '!quome git-credential'\ngit config --global credential.https://egress.apps.example.useHttpPath true"
             );
             assert_eq!(
                 v["in_sandbox"],
@@ -10162,5 +10188,71 @@ mod tests {
                 || r.url.path() == "/oauth/token"),
             "{calls:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn misspelt_top_level_argument_is_refused() {
+        let (s, mut c) = start_creds().await;
+        let (err, _) = c
+            .call(
+                "credentials_providers",
+                json!({"sett":{"id":"p","kind":{"type":"bearer"}}}),
+            )
+            .await;
+        assert!(err);
+        let (err, _) = c
+            .call(
+                "credentials_git_url",
+                json!({"repo":"github.com/o/n","x":1}),
+            )
+            .await;
+        assert!(err);
+        let calls = s.received_requests().await.unwrap();
+        assert!(
+            calls.iter().all(|r| r.url.path().starts_with("/.well-known")
+                || r.url.path() == "/oauth/token"),
+            "{calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn grant_cooldown_and_request_state() {
+        let (s, mut c) = start_creds().await;
+        Mock::given(method("PUT"))
+            .and(path("/acme/_v1/admin/grants/g"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "120")
+                    .set_body_json(json!({"error":{"code":"request_cooldown","message":"w"}})),
+            )
+            .mount(&s)
+            .await;
+        let (err, text) = c
+            .call(
+                "credentials_grant",
+                json!({"id":"g","subject":{"app":"x"},"routes":[]}),
+            )
+            .await;
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v, json!({"state":"cooldown","retry_in_minutes":2}));
+        Mock::given(method("POST"))
+            .and(path(api_path("/credentials/requests")))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "id":"q","state":"awaiting_approval","expires_at":"2026-12-01T00:00:00Z","link":"https://x/LEAK"
+            })))
+            .mount(&s)
+            .await;
+        let (err, text) = c
+            .call(
+                "credentials_providers",
+                json!({"request":{"provider_id":"p","kind":{"type":"bearer"},"secret_name":"S","instructions":"i","recipient_email":"a@b.c"}}),
+            )
+            .await;
+        assert!(!err, "{text}");
+        assert!(!text.contains("LEAK"));
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["state"], "awaiting_approval");
+        assert!(v["message"].as_str().unwrap().contains("approve"));
     }
 }
