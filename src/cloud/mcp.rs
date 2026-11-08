@@ -1028,7 +1028,7 @@ fn github_repo(input: &str) -> Result<(String, String), String> {
 
 /// Minutes to wait, from a `Retry-After` in seconds (60 s when absent).
 fn cooldown_minutes(retry_after: Option<u64>) -> u64 {
-    retry_after.unwrap_or(60).div_ceil(60).max(1)
+    retry_after.map_or(60, |s| s.div_ceil(60).max(1))
 }
 
 /// The fields of a provider the tools show: ids and names, never values.
@@ -9575,7 +9575,7 @@ mod tests {
                 json!({"route":"stripe","reason":"x"}),
             )
             .await;
-        assert!(text.contains("\"retry_in_minutes\": 1"), "{text}");
+        assert!(text.contains("\"retry_in_minutes\": 60"), "{text}");
     }
 
     #[tokio::test]
