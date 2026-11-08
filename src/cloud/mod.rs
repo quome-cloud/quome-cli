@@ -12,4 +12,5 @@ pub mod local_scope;
 pub mod loopback;
 pub mod mcp;
 pub mod pack;
+pub mod playbooks;
 pub mod state;

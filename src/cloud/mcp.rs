@@ -3117,6 +3117,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_names_match_router() {
+        use super::super::playbooks::TOOL_NAMES;
+        let (_s, mut c) = start().await;
+        let v = c.rpc("tools/list", json!({})).await;
+        let mut have: Vec<String> = v["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        // The `playbook` tool does not exist in the router yet; remove this
+        // special case when it is added.
+        have.push("playbook".into());
+        have.sort();
+        let mut want: Vec<String> = TOOL_NAMES.iter().map(|s| s.to_string()).collect();
+        want.sort();
+        assert_eq!(have, want);
+    }
+
+    #[tokio::test]
     async fn exec_clamps_timeout_to_25() {
         let (s, mut c) = start().await;
         Mock::given(method("POST"))
