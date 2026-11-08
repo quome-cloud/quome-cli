@@ -107,6 +107,7 @@ All commands above these four rows, including `quome login`, are Quome Enterpris
 - [Authentication](docs/authentication.md) — API keys, service accounts, scopes, what a key can't do, CI tokens
 - [Configuration](docs/configuration.md) — config files, env vars, precedence
 - [Troubleshooting](docs/troubleshooting.md) — every error message, decoded
+- [Agent clients](docs/clients.md) — Claude Code, Codex, OpenCode and Antigravity: MCP setup, playbook skills, how to invoke them
 
 **Tutorials**
 
