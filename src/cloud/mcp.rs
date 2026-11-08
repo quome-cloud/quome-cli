@@ -151,6 +151,18 @@ pub(super) fn fail(e: QuomeError) -> String {
     }
 }
 
+/// True if the request itself was wrong (unknown playbook, bad arguments), as
+/// opposed to a session, permission, server or network problem.
+fn is_caller_error(e: &QuomeError) -> bool {
+    match e {
+        QuomeError::NotFound(_) => true,
+        QuomeError::ApiError(m) => {
+            matches!(m.split(' ').next(), Some("400" | "404" | "409" | "422"))
+        }
+        _ => false,
+    }
+}
+
 /// A long-running tool call's request context: progress notifications when the
 /// client gave a progress token, and cancellation when it sends
 /// `notifications/cancelled`.
@@ -1050,9 +1062,19 @@ impl QuomeMcp {
         Self::with_timing(api, profile, Timing::default())
     }
 
+    /// Like `new`, over a connection another task (the background skills
+    /// refresh) also uses, so both share one token source.
+    pub fn new_shared(api: Arc<CloudApi>, profile: Profile) -> QuomeMcp {
+        Self::with_timing_shared(api, profile, Timing::default())
+    }
+
     pub fn with_timing(api: CloudApi, profile: Profile, timing: Timing) -> QuomeMcp {
+        Self::with_timing_shared(Arc::new(api), profile, timing)
+    }
+
+    fn with_timing_shared(api: Arc<CloudApi>, profile: Profile, timing: Timing) -> QuomeMcp {
         let conn = Arc::new(std::sync::RwLock::new(Arc::new(Conn {
-            api: Arc::new(api),
+            api,
             profile: Arc::new(profile),
             playbooks: tokio::sync::OnceCell::new(),
         })));
@@ -2976,8 +2998,16 @@ impl rmcp::ServerHandler for QuomeMcp {
                 (k, v)
             })
             .collect();
-        let text = call!(self, |api| api.render_playbook(&request.name, &args))
-            .map_err(|e| ErrorData::invalid_params(e, None))?;
+        let text =
+            call_raw!(self, |api| api.render_playbook(&request.name, &args)).map_err(|e| {
+                let caller = is_caller_error(&e);
+                let m = fail(e);
+                if caller {
+                    ErrorData::invalid_params(m, None)
+                } else {
+                    ErrorData::internal_error(m, None)
+                }
+            })?;
         Ok(GetPromptResult::new(vec![PromptMessage::new_text(
             Role::User,
             text,
@@ -3294,6 +3324,43 @@ mod tests {
         let m = &v["result"]["messages"][0];
         assert_eq!(m["role"], "user");
         assert_eq!(m["content"]["text"], "Step 1. Do it.");
+    }
+
+    async fn prompt_error_code(status: u16, body: serde_json::Value) -> (i64, String) {
+        let (s, mut c) = start().await;
+        Mock::given(method("POST"))
+            .and(path(api_path("/agent-playbooks/sandbox-task/render")))
+            .respond_with(ResponseTemplate::new(status).set_body_json(body))
+            .mount(&s)
+            .await;
+        let v = c
+            .rpc("prompts/get", json!({"name":"sandbox-task","arguments":{}}))
+            .await;
+        (
+            v["error"]["code"].as_i64().unwrap_or_else(|| panic!("{v}")),
+            v["error"]["message"].as_str().unwrap_or_default().into(),
+        )
+    }
+
+    #[tokio::test]
+    async fn prompts_get_maps_caller_errors_to_invalid_params() {
+        let (code, m) = prompt_error_code(404, json!({"reason":"playbook_unknown"})).await;
+        assert_eq!(code, -32602, "{m}");
+        assert!(m.contains("playbook_unknown"), "{m}");
+        let (code, _) = prompt_error_code(422, json!({"reason":"argument_missing"})).await;
+        assert_eq!(code, -32602);
+    }
+
+    #[tokio::test]
+    async fn prompts_get_maps_other_failures_to_internal_error() {
+        let (code, m) = prompt_error_code(403, json!({"reason":"capability_missing"})).await;
+        assert_eq!(code, -32603, "{m}");
+        assert!(m.contains("capability_missing"), "{m}");
+        let (code, _) = prompt_error_code(500, json!({})).await;
+        assert_eq!(code, -32603);
+        let (code, m) = prompt_error_code(401, json!({"reason":"delegation_revoked"})).await;
+        assert_eq!(code, -32603);
+        assert!(m.contains("quome connect"), "{m}");
     }
 
     #[tokio::test]
