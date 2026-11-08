@@ -75,12 +75,6 @@ Sandbox and app arguments marked "name or id" accept either. Email `address` arg
 | `cache_set` | `cache`, `key`, `value`, `ttl?` | Sets a key to a value in your pod. `value`: at most 1 MiB of text. `ttl`: seconds until the key expires, 1 to 31536000; without it the key stays until deleted. Returns `{"key", "set": true, "ttl"}` (never the value). |
 | `cache_del` | `cache`, `key` | Deletes a key from your pod. Returns `{"key", "deleted"}`; `deleted` is `false` when it was not set. |
 | `cache_pod` | `cache` | Shows the size and usage of your pod: memory in bytes (`maxmemory`, `used_memory`), `keys`, `facts` (with `maxfacts`) and `connected_clients`. |
-| `database_enroll` | `database`, `intent` | Asks for access to your own branch of a database (name or id). Describe honestly what you mean to do; the grant is judged from it and returns its actions, tables and expiry. Each grant expires; enroll again then. |
-| `database_my_branch` | `database` | Shows your branch and current grant. |
-| `database_query` | `database`, `sql` | Runs one SQL statement on your branch, within your grant. Returns `columns`, `rows`, `row_count` and `truncated` (capped at 1,000 rows and 1 MiB; a `note` says so when cut off). |
-| `database_search` | `database`, `table`, `column`, `text?`, `vector?`, `metric?`, `k?` | Searches a column by `text` or by `vector` (exactly one). `metric`: `l2`, `cosine` (default) or `inner_product`. `k`: 1 to 100, default 10. |
-| `database_ask` | `database`, `question` | Asks a question about the data on your branch in plain words. |
-| `database_commit` | `database`, `message` | Commits your branch. A person merges it; you never merge. |
 
 ### Long-running commands
 
@@ -301,6 +295,57 @@ When a call fails, the tool says what to do:
 | Quome Cloud is busy; wait a second and try again. / The cache did not answer in time; try again shortly. / The cache could not complete the call; try again shortly. | A passing failure on the server or the cache. |
 
 If calls come too fast (more than 50 a second for one agent) the tool says to wait and try again. Any other error is `Could not <action>: ` followed by the server's message.
+
+### Database branches
+
+The `database_*` tools let an agent work on its own branch of an org database. A **branch** is the agent's private copy to change: it never touches the main data. A **grant** is the access the agent holds on its branch: a list of actions and tables, with an expiry. The grant is judged from the intent the agent states when it enrolls, so it covers only what the agent said it meant to do, and no more than the database's agent rules (set by an org admin) allow. Tools take the database by `database` (name or id) and never a branch, a principal or a grant id.
+
+The flow:
+
+1. `database_enroll` with an honest `intent`. The result lists the grant's actions, tables and expiry.
+2. Work: `database_query`, `database_search`, `database_ask`, and `database_commit` for your own branch.
+3. Each grant expires. A call after that fails and says to call `database_enroll` again, with a new intent if the work has changed. The tools never re-enroll on their own.
+4. A person merges the branch. Agents never merge, and no tool does.
+
+The agent must have been allowed to use databases when it was connected: connections made before databases existed need `quome connect` run again, with databases allowed. The next call picks up the new connection, with no restart.
+
+| Tool | Args | What it does |
+|------|------|--------------|
+| `database_enroll` | `database`, `intent` | Asks for access to your own branch of a database (name or id). Describe honestly what you mean to do; the grant is judged from it and returns its actions, tables and expiry. Each grant expires; enroll again then. |
+| `database_my_branch` | `database` | Shows your branch and current grant: actions, tables and expiry. Creates your branch if it doesn't exist yet. |
+| `database_query` | `database`, `sql` | Runs one SQL statement on your branch, within your grant. Returns `columns`, `rows`, `row_count` and `truncated` (capped at 1,000 rows and 1 MiB; a `note` says so when cut off). |
+| `database_search` | `database`, `table`, `column`, `text?`, `vector?`, `metric?`, `k?` | Searches a column by `text` or by `vector` (exactly one). `metric`: `l2`, `cosine` (default) or `inner_product`. `k`: 1 to 100, default 10. |
+| `database_ask` | `database`, `question` | Asks a question about the data on your branch in plain words. |
+| `database_commit` | `database`, `message` | Commits your branch. A person merges it; you never merge. |
+
+`database_query` and `database_search` results are shown as the server returns them: at most 1,000 rows and 1 MiB. When a result was cut off, `truncated` is `true` and a `note` says so.
+
+When a call fails, the tool says what to do:
+
+| Reason | Message to the agent |
+|--------|----------------------|
+| `reconnect_for_databases` | Run `quome connect` again and allow databases. (The call is retried once after a reconnect.) |
+| `no_charter` | This database has no agent rules yet. Ask an org admin to set them on the database's Agents tab. |
+| `models_not_connected` | No reasoning model key is connected. Ask an org admin to connect one in Secrets. |
+| `engine_predates_agents` | This database needs an update before agents can use it. |
+| `intent_refused` | Your stated intent is outside this database's agent rules. Restate it, or ask a person. |
+| `not_enrolled` | You have no grant here yet. Call `database_enroll` first. |
+| `grant_expired` | Your grant has expired. Call `database_enroll` again. |
+| `revoked`, `revoke_pending` | A person revoked this agent's access, or is revoking it. |
+| `branch_gone` | Your branch was removed. Call `database_enroll` to get a new one. |
+| `branch_conflict` | Your branch could not be updated because of a conflict. |
+| `one_statement`, `statement_too_large` | Send one SQL statement per call, and keep it small. |
+| `statement_refused` | Your grant does not cover that statement. |
+| `busy`, `rate_limited`, `engine_error`, `database_unreachable`, `session_failed` | The database could not take that call; try again shortly. |
+| `timed_out` | The database did not answer in time. |
+| `database_deleting`, `not_running` | The database is being deleted, or is not running. |
+| `database` (404) | No such database; check its name or id. |
+| other 404 `not_...` | This database type does not support agent branches. |
+| `invalid_intent`, `invalid_question`, `invalid_message` | The text must be plain text. |
+| `invalid_text` | Search text may not contain a backslash or a NUL character. |
+| `invalid_vector`, `invalid_identifier`, `invalid_metric`, `invalid_k`, `text_too_long`, `exactly_one_of_text_or_vector` | The search arguments are not valid: give exactly one of `text` or `vector`, `metric` is `l2`, `cosine` or `inner_product`, `k` is 1 to 100. |
+| `search_failed` | The search could not be completed. |
+| `agents_only` | Database branches are for agents connected with `quome connect`. |
 
 ### Progress and cancelling
 
