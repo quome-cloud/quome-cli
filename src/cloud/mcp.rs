@@ -733,6 +733,9 @@ fn database_hint(e: String, action: &str) -> String {
         "grant_expired" => {
             "Your grant has expired. Call database_enroll again, with a new intent if your work has changed."
         }
+        "charter_changed" => {
+            "The database's agent rules changed while you enrolled. Call database_enroll again."
+        }
         "revoked" => "A person revoked this agent's access to this database.",
         "revoke_pending" => "Your access to this database is being revoked.",
         "branch_gone" => "Your branch was removed. Call database_enroll to get a new one.",
@@ -8774,6 +8777,7 @@ mod tests {
             (403, "intent_refused", "Restate"),
             (409, "not_enrolled", "database_enroll"),
             (409, "grant_expired", "database_enroll"),
+            (409, "charter_changed", "database_enroll"),
             (409, "revoked", "revoked"),
             (409, "revoke_pending", "being revoked"),
             (409, "branch_gone", "database_enroll"),

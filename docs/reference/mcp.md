@@ -331,6 +331,7 @@ When a call fails, the tool says what to do:
 | `intent_refused` | Your stated intent is outside this database's agent rules. Restate it, or ask a person. |
 | `not_enrolled` | You have no grant here yet. Call `database_enroll` first. |
 | `grant_expired` | Your grant has expired. Call `database_enroll` again. |
+| `charter_changed` | The database's agent rules changed while you enrolled. Call `database_enroll` again. |
 | `revoked`, `revoke_pending` | A person revoked this agent's access, or is revoking it. |
 | `branch_gone` | Your branch was removed. Call `database_enroll` to get a new one. |
 | `branch_conflict` | Your branch could not be updated because of a conflict. |
