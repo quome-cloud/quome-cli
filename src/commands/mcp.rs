@@ -40,6 +40,15 @@ pub async fn execute(args: Args) -> Result<()> {
     let api = CloudApi::new(&profile, TokenSource::new(&profile, key, vrc));
     let home = dirs::home_dir()
         .ok_or_else(|| QuomeError::CloudState("cannot find home directory".into()))?;
+    // Refresh the agent skills in the background: it must not delay the MCP
+    // handshake and prints nothing (stdout is the protocol). Failures are dropped.
+    if let Ok((k2, v2)) = AgentKey::load_from(store.as_ref(), &name) {
+        let bg = CloudApi::new(&profile, TokenSource::new(&profile, k2, v2));
+        drop(crate::commands::skills::spawn_background_sync(
+            bg,
+            home.clone(),
+        ));
+    }
     let reload = stored_reloader(home, Arc::from(store), name);
     QuomeMcp::new(api, profile)
         .with_reloader(reload)

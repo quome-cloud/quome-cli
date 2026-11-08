@@ -27,6 +27,25 @@ impl ClientId {
         ClientId::OpenCode,
         ClientId::Antigravity,
     ];
+
+    /// The lowercase name used on the command line.
+    pub fn name(self) -> &'static str {
+        match self {
+            ClientId::Claude => "claude",
+            ClientId::Codex => "codex",
+            ClientId::OpenCode => "opencode",
+            ClientId::Antigravity => "antigravity",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<ClientId, String> {
+        ClientId::ALL
+            .into_iter()
+            .find(|c| c.name() == s.trim().to_ascii_lowercase())
+            .ok_or_else(|| {
+                format!("unknown client {s:?} (expected claude, codex, opencode or antigravity)")
+            })
+    }
 }
 
 pub struct SkillFile {

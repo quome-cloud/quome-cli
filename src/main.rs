@@ -97,6 +97,11 @@ enum Commands {
     Connect(commands::connect::Args),
     /// Run the Quome Cloud MCP server (stdio) for Claude Code
     Mcp(commands::mcp::Args),
+    /// Keep the Quome playbook skills in your agent clients up to date
+    Skills {
+        #[command(subcommand)]
+        command: commands::skills::SkillsCommands,
+    },
     /// Inspect or drop this computer's Quome Cloud connection
     Cloud {
         #[command(subcommand)]
@@ -133,6 +138,7 @@ async fn main() {
         Commands::Host { command } => commands::host::execute(command).await,
         Commands::Connect(args) => commands::connect::execute(args).await,
         Commands::Mcp(args) => commands::mcp::execute(args).await,
+        Commands::Skills { command } => commands::skills::execute(command).await,
         Commands::Cloud { command } => commands::cloud::execute(command).await,
         Commands::GitCredential(args) => commands::git_credential::execute(args).await,
         Commands::Upgrade => commands::upgrade::execute().await,

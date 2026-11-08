@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 
 use crate::cloud::api::CloudApi;
 use crate::cloud::auth::TokenSource;
+use crate::cloud::clients::runner::{CommandRunner, RealRunner};
+use crate::cloud::clients::{adapters, paths, ClientId, Ctx, RegisterOutcome};
 use crate::cloud::keys::{platform_store, AgentKey, KeyStore};
 use crate::cloud::loopback::{self, Callback, Listener};
 use crate::cloud::state::{CloudState, Profile};
@@ -37,9 +39,13 @@ pub struct Args {
     /// Issuer URL (default: the API URL with `api.` replaced by `auth.`)
     #[arg(long)]
     issuer: Option<String>,
-    /// Do not register the MCP server with Claude Code
+    /// Do not register the MCP server or install skills in any agent client
     #[arg(long)]
     no_mcp: bool,
+    /// Set up only these clients: claude, codex, opencode, antigravity
+    /// (default: every installed client)
+    #[arg(long, value_delimiter = ',', value_parser = ClientId::parse)]
+    client: Vec<ClientId>,
     /// Output as JSON
     #[arg(long)]
     json: bool,
@@ -78,6 +84,11 @@ pub struct Deps<'a> {
     pub store: &'a dyn KeyStore,
     pub open: &'a dyn Fn(&str) -> std::io::Result<()>,
     pub claude: &'a dyn ClaudeRunner,
+    /// Runs the other clients' own CLIs (`codex mcp add`, ...).
+    pub runner: &'a dyn CommandRunner,
+    /// True when a program is on PATH (client detection).
+    pub on_path: &'a (dyn Fn(&str) -> bool + Sync),
+    pub env: &'a dyn Fn(&str) -> Option<String>,
     /// Progress lines (stdout, or stderr under `--json`).
     pub say: &'a dyn Fn(&str),
     pub hostname: String,
@@ -94,6 +105,8 @@ pub struct Options {
     pub console: Option<String>,
     pub issuer: Option<String>,
     pub no_mcp: bool,
+    /// Clients to set up; empty means every installed client.
+    pub clients: Vec<ClientId>,
 }
 
 #[derive(Debug)]
@@ -390,11 +403,54 @@ pub async fn run(opts: Options, deps: &Deps<'_>) -> Result<Outcome> {
     }
     st.save_to(&deps.home)?;
 
-    let mcp = if opts.no_mcp {
+    let explicit = !opts.clients.is_empty();
+    let selected: Vec<ClientId> = if explicit {
+        opts.clients.clone()
+    } else {
+        ClientId::ALL.to_vec()
+    };
+    let mcp = if opts.no_mcp || !selected.contains(&ClientId::Claude) {
         "skipped"
     } else {
         register_mcp(deps, &profile_name)
     };
+    if !opts.no_mcp {
+        setup_other_clients(deps, &selected, explicit, &profile_name);
+        // `api` above was built before the org was known; make one that has it.
+        let synced = match AgentKey::load_from(deps.store, &profile_name) {
+            Ok((k, v)) => {
+                let api = CloudApi::new(&profile, TokenSource::new(&profile, k, v));
+                crate::commands::skills::sync_skills_with(&api, &deps.home, &selected, deps.on_path)
+                    .await
+            }
+            Err(e) => Err(e),
+        };
+        match synced {
+            Ok(r) => {
+                for c in &r.clients {
+                    (deps.say)(&format!(
+                        "Skills for {}: {} written, {} removed, {} unchanged.",
+                        c.client.name(),
+                        c.written,
+                        c.removed,
+                        c.unchanged
+                    ));
+                }
+                for w in &r.warnings {
+                    (deps.say)(&format!("Skills: {w}"));
+                }
+                for (c, e) in &r.failures {
+                    (deps.say)(&format!(
+                        "Could not write {} skills: {e}. Run `quome skills sync` to retry.",
+                        c.name()
+                    ));
+                }
+            }
+            Err(e) => (deps.say)(&format!(
+                "Could not install skills: {e}. Run `quome skills sync` to retry."
+            )),
+        }
+    }
 
     if previous {
         (deps.say)(&format!(
@@ -406,6 +462,64 @@ pub async fn run(opts: Options, deps: &Deps<'_>) -> Result<Outcome> {
         profile,
         mcp,
     })
+}
+
+/// A config snippet for adding the server by hand to a client.
+fn manual_snippet(client: ClientId, program: &str, profile: &str) -> String {
+    match client {
+        ClientId::Codex => format!(
+            "[mcp_servers.quome]\ncommand = {program:?}\nargs = [\"mcp\", \"--profile\", {profile:?}]"
+        ),
+        ClientId::OpenCode => format!(
+            "{{\"mcp\":{{\"quome\":{{\"type\":\"local\",\"command\":[{program:?},\"mcp\",\"--profile\",{profile:?}]}}}}}}"
+        ),
+        _ => mcp_config_json_for(program, profile),
+    }
+}
+
+/// Register the quome MCP server with every selected client except Claude Code
+/// (handled by `register_mcp`). One line per failure plus the manual snippet;
+/// never an error.
+fn setup_other_clients(deps: &Deps<'_>, selected: &[ClientId], explicit: bool, profile: &str) {
+    let program = mcp_program();
+    let ctx = Ctx {
+        home: &deps.home,
+        runner: deps.runner,
+        env: deps.env,
+    };
+    for a in adapters() {
+        let id = a.id();
+        if id == ClientId::Claude || !selected.contains(&id) {
+            continue;
+        }
+        if !paths::installed_with(id, &deps.home, deps.on_path) {
+            if explicit {
+                (deps.say)(&format!("{} is not installed; skipped.", id.name()));
+            }
+            continue;
+        }
+        match a.register_mcp(&ctx, &program, profile) {
+            Ok(RegisterOutcome::Added) => (deps.say)(&format!(
+                "Registered the quome MCP server with {} (profile {profile}).",
+                id.name()
+            )),
+            Ok(RegisterOutcome::Updated) => (deps.say)(&format!(
+                "Updated the quome MCP server in {} (profile {profile}).",
+                id.name()
+            )),
+            Ok(RegisterOutcome::Unchanged) => (deps.say)(&format!(
+                "The quome MCP server in {} is already set up.",
+                id.name()
+            )),
+            Err(why) => {
+                (deps.say)(&format!(
+                    "Could not register with {}: {why}. Add this to its MCP config:",
+                    id.name()
+                ));
+                (deps.say)(&manual_snippet(id, &program, profile));
+            }
+        }
+    }
 }
 
 /// How the Claude Code registration went.
@@ -500,6 +614,9 @@ pub async fn execute(args: Args) -> Result<()> {
         claude: &RealClaude {
             program: "claude".into(),
         },
+        runner: &RealRunner,
+        on_path: &paths::on_real_path,
+        env: &crate::cloud::clients::real_env,
         say: &say,
         hostname: gethostname::gethostname().to_string_lossy().into_owned(),
         listen_timeout: loopback::TIMEOUT,
@@ -514,6 +631,7 @@ pub async fn execute(args: Args) -> Result<()> {
         console: args.console,
         issuer: args.issuer,
         no_mcp: args.no_mcp,
+        clients: args.client,
     };
     let out = run(opts, &deps).await?;
     let p = &out.profile;
@@ -728,6 +846,7 @@ mod tests {
             console: Some("https://console.example".into()),
             issuer: Some(server.uri()),
             no_mcp: false,
+            clients: vec![],
         }
     }
 
@@ -772,6 +891,9 @@ mod tests {
         claude: FakeClaude,
         opened: RefCell<Vec<String>>,
         log: PageLog,
+        runner: crate::cloud::clients::runner::fake::Fake,
+        /// Programs reported as on PATH.
+        on_path: Vec<&'static str>,
     }
 
     impl Harness {
@@ -786,6 +908,15 @@ mod tests {
                 },
                 opened: RefCell::new(vec![]),
                 log: Arc::new(Mutex::new(vec![])),
+                runner: crate::cloud::clients::runner::fake::Fake::new(|p, a| {
+                    use crate::cloud::clients::runner::fake::{fail, ok};
+                    if p == "codex" && a.get(1).map(String::as_str) == Some("get") {
+                        fail("no MCP server named quome")
+                    } else {
+                        ok("")
+                    }
+                }),
+                on_path: vec![],
             }
         }
 
@@ -805,11 +936,15 @@ mod tests {
                 page(u, delegation, self.log.clone());
                 Ok(())
             };
+            let on_path = self.on_path.clone();
             let deps = Deps {
                 home: self.home.path().to_path_buf(),
                 store: &store,
                 open: &open,
                 claude: &self.claude,
+                runner: &self.runner,
+                on_path: &|b: &str| on_path.contains(&b),
+                env: &crate::cloud::clients::no_env,
                 say: &say,
                 hostname: hostname.into(),
                 listen_timeout: Duration::from_secs(20),
@@ -908,6 +1043,9 @@ mod tests {
             store: &store,
             open: &open,
             claude: &h.claude,
+            runner: &h.runner,
+            on_path: &|_: &str| false,
+            env: &crate::cloud::clients::no_env,
             say: &say,
             hostname: "mac".into(),
             listen_timeout: Duration::from_secs(20),
@@ -964,6 +1102,9 @@ mod tests {
             store: &store,
             open: &open,
             claude: &h.claude,
+            runner: &h.runner,
+            on_path: &|_: &str| false,
+            env: &crate::cloud::clients::no_env,
             say: &say,
             hostname: "mac".into(),
             listen_timeout: Duration::from_secs(20),
@@ -1029,6 +1170,115 @@ mod tests {
         assert_eq!(out.mcp, "skipped");
         assert!(h.claude.calls.lock().unwrap().is_empty());
         assert!(!h.said.borrow().join("\n").contains("mcpServers"));
+    }
+
+    async fn mount_playbooks(s: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/api/v1/orgs/org-1/agent-playbooks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"name":"ship","area":"apps","title":"Ship","description":"d",
+                 "arguments":[],"requires_tools":[],"allowed":true}
+            ])))
+            .mount(s)
+            .await;
+    }
+
+    fn mkdirs(h: &Harness, dirs: &[&str]) {
+        for d in dirs {
+            std::fs::create_dir_all(h.home.path().join(d)).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_sets_up_every_installed_client() {
+        let s = MockServer::start().await;
+        mount_auth(&s).await;
+        mount_me(&s, 0).await;
+        mount_playbooks(&s).await;
+        let h = Harness::new(ran(true));
+        mkdirs(&h, &[".codex", ".config/opencode", ".claude"]);
+        let out = h
+            .connect(opts(&s, "work"), "d", "mac", Duration::from_millis(10))
+            .await
+            .unwrap();
+        assert_eq!(out.mcp, "added");
+        let calls = h.runner.calls();
+        assert!(
+            calls.iter().any(|c| c.starts_with("codex mcp add quome")),
+            "{calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.starts_with("opencode mcp add quome")),
+            "{calls:?}"
+        );
+        assert!(!calls
+            .iter()
+            .any(|c| c.starts_with("agy") || c.contains("antigravity")));
+        let home = h.home.path();
+        assert!(home.join(".agents/skills/quome-ship/SKILL.md").is_file());
+        assert!(home
+            .join(".claude/skills/quome/skills/ship/SKILL.md")
+            .is_file());
+        assert!(!home.join(".gemini").exists());
+    }
+
+    #[tokio::test]
+    async fn connect_client_flag_limits() {
+        let s = MockServer::start().await;
+        mount_auth(&s).await;
+        mount_me(&s, 0).await;
+        mount_playbooks(&s).await;
+        let h = Harness::new(ran(true));
+        mkdirs(&h, &[".codex", ".claude", ".gemini/antigravity"]);
+        let mut o = opts(&s, "work");
+        o.clients = vec![ClientId::Codex];
+        let out = h
+            .connect(o, "d", "mac", Duration::from_millis(10))
+            .await
+            .unwrap();
+        assert_eq!(out.mcp, "skipped");
+        assert!(h.claude.calls.lock().unwrap().is_empty());
+        assert!(h.runner.calls().iter().all(|c| c.starts_with("codex ")));
+        let home = h.home.path();
+        assert!(home.join(".agents/skills/quome-ship/SKILL.md").is_file());
+        assert!(!home.join(".claude/skills").exists());
+        assert!(!home.join(".gemini/config").exists());
+        // naming a client that is not installed says so and does nothing
+        let h2 = Harness::new(ran(true));
+        let mut o = opts(&s, "work");
+        o.clients = vec![ClientId::OpenCode];
+        h2.connect(o, "d", "mac", Duration::from_millis(10))
+            .await
+            .unwrap();
+        assert!(h2
+            .said
+            .borrow()
+            .join("\n")
+            .contains("opencode is not installed"));
+        assert!(h2.runner.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn client_failure_prints_snippet_and_connect_succeeds() {
+        use crate::cloud::clients::runner::fake::{fail, Fake};
+        let s = MockServer::start().await;
+        mount_auth(&s).await;
+        mount_me(&s, 0).await;
+        // no playbooks route: the skills step fails too
+        let mut h = Harness::new(ran(true));
+        h.runner = Fake::new(|_, _| fail("no MCP server named quome"));
+        mkdirs(&h, &[".codex"]);
+        let out = h
+            .connect(opts(&s, "work"), "d", "mac", Duration::from_millis(10))
+            .await
+            .unwrap();
+        assert_eq!(out.profile_name, "work");
+        let said = h.said.borrow().join("\n");
+        assert!(said.contains("Could not register with codex"), "{said}");
+        assert!(said.contains("[mcp_servers.quome]"), "{said}");
+        assert!(said.contains("Could not install skills"), "{said}");
     }
 
     #[test]
