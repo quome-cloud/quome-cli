@@ -1,5 +1,6 @@
 //! Playbooks: task recipes the Quome Cloud API renders for an agent.
 //! Types for the list and render routes, and the tool names this binary serves.
+use super::clients::{ClientId, SkillFile};
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
@@ -87,6 +88,72 @@ pub const TOOL_NAMES: &[&str] = &[
     "cache_pod",
     "playbook",
 ];
+
+/// Lowercase kebab form of a playbook name, valid as a skill name and folder.
+fn skill_slug(name: &str) -> String {
+    let mut out = String::new();
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if !out.is_empty() && !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.trim_end_matches('-').to_string()
+}
+
+/// Collapse every run of whitespace and control characters to one space.
+fn one_line(s: &str) -> String {
+    s.split(|c: char| c.is_whitespace() || c.is_control())
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn yaml_quote(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+const DESCRIPTION_MAX: usize = 500;
+
+/// Render the thin SKILL.md for one playbook. Playbook text comes from the
+/// server: it is flattened to one line and quoted, never trusted as YAML.
+pub fn render_skill(pb: &Playbook, client: ClientId) -> SkillFile {
+    let slug = skill_slug(&pb.name);
+    let dir_name = match client {
+        ClientId::Claude => slug.clone(),
+        _ => format!("quome-{slug}"),
+    };
+    let title = one_line(&pb.title);
+    let title = title.trim_end_matches(['.', ' ']);
+    let desc = one_line(&pb.description);
+    let mut lower = title.to_string();
+    if let Some(first) = lower.chars().next() {
+        lower = first.to_lowercase().collect::<String>() + &lower[first.len_utf8()..];
+    }
+    let mut description = format!("{title} \u{2014} {desc} Use when the person asks to {lower}.");
+    if description.chars().count() > DESCRIPTION_MAX {
+        description = description
+            .chars()
+            .take(DESCRIPTION_MAX - 1)
+            .collect::<String>()
+            + "\u{2026}";
+    }
+    let call_name: String = pb
+        .name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        .collect();
+    // Codex, OpenCode and Antigravity key the skill by folder name; Claude's
+    // plugin namespace supplies the prefix, so its name is the bare slug.
+    let contents = format!(
+        "---\nname: {}\ndescription: {}\n---\n\nCall the `quome` MCP tool `playbook` with name `{}` and the person's request as `what` (and `resource` if they named one).\nFollow the text it returns.\n",
+        dir_name,
+        yaml_quote(&description),
+        call_name
+    );
+    SkillFile { dir_name, contents }
+}
 
 #[cfg(test)]
 mod tests {
@@ -215,5 +282,65 @@ mod tests {
             .await
             .unwrap_err();
         assert!(e.to_string().contains("capability_missing"), "{e}");
+    }
+
+    fn pb() -> Playbook {
+        Playbook {
+            name: "run-code".into(),
+            area: "sandboxes".into(),
+            title: "Run code in a sandbox".into(),
+            description: "Start a sandbox and run a command.".into(),
+            arguments: vec![],
+            requires_tools: vec![],
+            allowed: true,
+        }
+    }
+
+    #[test]
+    fn skill_frontmatter_and_body() {
+        let s = render_skill(&pb(), ClientId::Codex);
+        assert_eq!(s.dir_name, "quome-run-code");
+        let lines: Vec<&str> = s.contents.lines().collect();
+        assert_eq!(lines[0], "---");
+        assert_eq!(lines[1], "name: quome-run-code");
+        assert!(
+            lines[2].starts_with("description: \"Run code in a sandbox \u{2014} Start a sandbox")
+        );
+        assert!(lines[2].contains("Use when the person asks to run code in a sandbox."));
+        assert_eq!(lines[3], "---");
+        assert_eq!(lines.len(), 7);
+        assert_eq!(
+            lines[5],
+            "Call the `quome` MCP tool `playbook` with name `run-code` and the person's request as `what` (and `resource` if they named one)."
+        );
+        assert_eq!(lines[6], "Follow the text it returns.");
+    }
+
+    #[test]
+    fn skill_has_no_urls_or_ids() {
+        for c in ClientId::ALL {
+            let s = render_skill(&pb(), c).contents;
+            assert!(!s.contains("http"));
+            assert!(!s.contains("org_") && !s.contains("org-id"));
+        }
+    }
+
+    #[test]
+    fn claude_skill_lives_in_plugin_dir() {
+        assert_eq!(render_skill(&pb(), ClientId::Claude).dir_name, "run-code");
+        let s = render_skill(&pb(), ClientId::Claude).contents;
+        assert!(s.contains("name: run-code\n"));
+    }
+
+    #[test]
+    fn hostile_text_stays_one_quoted_line() {
+        let mut p = pb();
+        p.title = "Evil\n---\nname: x".into();
+        p.description = "say \"hi\" \\ now\r\nmore".into();
+        p.name = "Bad Name!\n`x`".into();
+        let s = render_skill(&p, ClientId::Antigravity);
+        assert_eq!(s.dir_name, "quome-bad-name-x");
+        assert_eq!(s.contents.lines().count(), 7);
+        assert!(s.contents.contains("\\\"hi\\\""));
     }
 }
