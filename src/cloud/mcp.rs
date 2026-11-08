@@ -704,6 +704,13 @@ fn cache_hint(e: String, action: &str) -> String {
     advice.into()
 }
 
+/// Add a note to a database result the server cut off.
+fn note_truncated(v: &mut serde_json::Value) {
+    if v["truncated"] == true {
+        v["note"] = "The result was cut off at the server's limit (1,000 rows or 1 MiB); narrow the request to see the rest.".into();
+    }
+}
+
 /// Turn a database-branch route error into a sentence for the agent. Errors
 /// without advice keep the server's message after "Could not {action}: ".
 fn database_hint(e: String, action: &str) -> String {
@@ -733,7 +740,10 @@ fn database_hint(e: String, action: &str) -> String {
         "one_statement" => "Send one SQL statement per call.",
         "statement_too_large" => "That statement is too large; send a smaller one.",
         "statement_refused" => "Your grant does not cover that statement.",
-        "busy" => "The database is busy; try again shortly.",
+        "busy" | "rate_limited" | "engine_error" | "database_unreachable" | "session_failed" => {
+            "The database could not take that call; try again shortly."
+        }
+        "database" => "No such database; check its name or id.",
         "timed_out" => "The database did not answer in time.",
         "database_deleting" => "This database is being deleted.",
         "not_running" => "The database is not running. Ask an org member to start it in the console.",
@@ -753,7 +763,7 @@ fn database_hint(e: String, action: &str) -> String {
             "The person revoked this agent's access. Run `quome connect` again."
         }
         // The one 404 `not_…` reason: a database of a kind that has no agent branches.
-        r if not_found && r.starts_with("not_") => {
+        r if not_found && r != "not_found" && r.starts_with("not_") => {
             "This database type does not support agent branches."
         }
         _ => return format!("Could not {action}: {e}"),
@@ -3081,8 +3091,7 @@ impl QuomeMcp {
     }
 
     #[tool(
-        description = "Show your own branch of a database (name or id) and your current grant: its actions, tables and expiry. Enroll first with database_enroll if you have none; when a grant has expired, enroll again.",
-        annotations(read_only_hint = true)
+        description = "Show your own branch of a database (name or id) and your current grant: its actions, tables and expiry. It creates your branch if it doesn't exist yet. Enroll first with database_enroll if you have no grant; when a grant has expired, enroll again."
     )]
     async fn database_my_branch(
         &self,
@@ -3110,9 +3119,7 @@ impl QuomeMcp {
                 api.database_query(&a.database, &a.sql).await
             })
             .await?;
-        if v["truncated"] == true {
-            v["note"] = "The result was cut off at the server's limit (1,000 rows or 1 MiB); narrow the query to see the rest.".into();
-        }
+        note_truncated(&mut v);
         json(&v)
     }
 
@@ -3136,11 +3143,12 @@ impl QuomeMcp {
             k: a.k,
         };
         let (database, req) = (&a.database, &req);
-        let v = self
+        let mut v = self
             .database_call("search the database", |api| async move {
                 api.database_search(database, req).await
             })
             .await?;
+        note_truncated(&mut v);
         json(&v)
     }
 
@@ -8757,38 +8765,44 @@ mod tests {
 
     #[tokio::test]
     async fn database_every_reason_has_advice() {
-        for (status, reason) in [
-            (403, "reconnect_for_databases"),
-            (409, "no_charter"),
-            (409, "models_not_connected"),
-            (409, "engine_predates_agents"),
-            (403, "intent_refused"),
-            (409, "not_enrolled"),
-            (409, "revoked"),
-            (409, "revoke_pending"),
-            (409, "branch_gone"),
-            (409, "branch_conflict"),
-            (422, "one_statement"),
-            (422, "statement_too_large"),
-            (403, "statement_refused"),
-            (503, "busy"),
-            (504, "timed_out"),
-            (409, "database_deleting"),
-            (409, "not_running"),
-            (422, "invalid_intent"),
-            (422, "invalid_question"),
-            (422, "invalid_message"),
-            (422, "invalid_text"),
-            (422, "invalid_vector"),
-            (422, "invalid_identifier"),
-            (422, "invalid_metric"),
-            (422, "invalid_k"),
-            (422, "text_too_long"),
-            (422, "search_failed"),
-            (502, "search_failed"),
-            (403, "agents_only"),
+        for (status, reason, expect) in [
+            (403, "reconnect_for_databases", "allow databases"),
+            (409, "no_charter", "Agents tab"),
+            (409, "models_not_connected", "Secrets"),
+            (409, "engine_predates_agents", "needs an update"),
+            (403, "intent_refused", "Restate"),
+            (409, "not_enrolled", "database_enroll"),
+            (409, "grant_expired", "database_enroll"),
+            (409, "revoked", "revoked"),
+            (409, "revoke_pending", "being revoked"),
+            (409, "branch_gone", "database_enroll"),
+            (409, "branch_conflict", "conflict"),
+            (422, "one_statement", "one SQL statement"),
+            (422, "statement_too_large", "too large"),
+            (403, "statement_refused", "does not cover"),
+            (503, "busy", "try again shortly"),
+            (504, "timed_out", "in time"),
+            (409, "database_deleting", "being deleted"),
+            (409, "not_running", "not running"),
+            (404, "database", "No such database; check its name or id."),
+            (404, "not_supported", "does not support agent branches"),
+            (422, "invalid_intent", "intent"),
+            (422, "invalid_question", "question"),
+            (422, "invalid_message", "message"),
+            (422, "invalid_text", "backslash"),
+            (422, "invalid_vector", "vector"),
+            (422, "invalid_identifier", "name"),
+            (422, "invalid_metric", "l2, cosine or inner_product"),
+            (422, "invalid_k", "1 to 100"),
+            (422, "text_too_long", "too long"),
+            (422, "search_failed", "search"),
+            (502, "search_failed", "search"),
+            (403, "agents_only", "quome connect"),
+            (503, "rate_limited", "try again shortly"),
+            (502, "engine_error", "try again shortly"),
+            (502, "database_unreachable", "try again shortly"),
+            (502, "session_failed", "try again shortly"),
         ] {
-            // Advice never falls through to the "Could not" form.
             let (s, mut c) = start().await;
             Mock::given(method("POST"))
                 .and(path(branch_path("/query")))
@@ -8806,7 +8820,68 @@ mod tests {
                 .await;
             assert!(err, "{reason}: {text}");
             assert!(!text.starts_with("Could not"), "{reason}: {text}");
+            assert!(text.contains(expect), "{status} {reason}: {text}");
         }
+    }
+
+    #[tokio::test]
+    async fn database_plain_not_found_is_not_advice_for_branches() {
+        let (s, mut c) = start().await;
+        Mock::given(method("POST"))
+            .and(path(branch_path("/query")))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_json(json!({"detail":"gone","reason":"not_found"})),
+            )
+            .mount(&s)
+            .await;
+        let (err, text) = c
+            .call(
+                "database_query",
+                json!({"database":"my db","sql":"select 1"}),
+            )
+            .await;
+        assert!(err);
+        assert!(text.starts_with("Could not run the query"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn database_search_notes_truncation() {
+        let (s, mut c) = start().await;
+        branch_route(
+            &s,
+            "/search",
+            json!({"table":"t","column":"c","text":"tea"}),
+            json!({"rows":[],"truncated":true}),
+        )
+        .await;
+        let (err, text) = c
+            .call(
+                "database_search",
+                json!({"database":"my db","table":"t","column":"c","text":"tea"}),
+            )
+            .await;
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert!(v["note"].as_str().unwrap().contains("cut off"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn database_my_branch_is_not_read_only_and_says_it_creates() {
+        let (_s, mut c) = start().await;
+        let v = c.rpc("tools/list", json!({})).await;
+        let t = v["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "database_my_branch")
+            .unwrap()
+            .clone();
+        assert!(t["description"]
+            .as_str()
+            .unwrap()
+            .contains("creates your branch if it doesn't exist yet"));
+        assert_ne!(t["annotations"]["readOnlyHint"], json!(true), "{t}");
     }
 
     #[tokio::test]
