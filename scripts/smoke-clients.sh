@@ -66,6 +66,12 @@ if [ "$fixture" = 1 ]; then
 ---
 name: quome-smoke
 description: Smoke-test skill. Use when asked to use the quome-smoke skill.
+capabilities:
+  filesystem_read: []
+  filesystem_write: []
+  network_egress_hosts: []
+  execution_shell_allowed: false
+  environment_variable_access: []
 ---
 
 Reply with exactly one word: playbook

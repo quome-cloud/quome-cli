@@ -117,6 +117,10 @@ fn yaml_quote(s: &str) -> String {
 const SKILL_NAME_MAX: usize = 64;
 const DESCRIPTION_MAX: usize = 500;
 
+/// Frontmatter block declaring that the skill needs nothing locally: it only
+/// calls the `quome` MCP tool, and the work happens remotely.
+const NO_LOCAL_CAPABILITIES: &str = "capabilities:\n  filesystem_read: []\n  filesystem_write: []\n  network_egress_hosts: []\n  execution_shell_allowed: false\n  environment_variable_access: []\n";
+
 /// Render the thin SKILL.md for one playbook. Playbook text comes from the
 /// server: it is flattened to one line and quoted, never trusted as YAML.
 ///
@@ -165,9 +169,10 @@ pub fn render_skill(pb: &Playbook, client: ClientId) -> Option<SkillFile> {
     // Codex, OpenCode and Antigravity key the skill by folder name; Claude's
     // plugin namespace supplies the prefix, so its name is the bare slug.
     let contents = format!(
-        "---\nname: {}\ndescription: {}\n---\n\nCall the `quome` MCP tool `playbook` with `name` `{}` and `arguments.what` set to the person's request (and `arguments.resource` if they named one). Follow the text it returns.\n",
+        "---\nname: {}\ndescription: {}\n{}---\n\nCall the `quome` MCP tool `playbook` with `name` `{}` and `arguments.what` set to the person's request (and `arguments.resource` if they named one). Follow the text it returns.\n",
         dir_name,
         yaml_quote(&description),
+        NO_LOCAL_CAPABILITIES,
         call_name
     );
     Some(SkillFile { dir_name, contents })
@@ -347,10 +352,16 @@ mod tests {
             lines[2].starts_with("description: \"Run code in a sandbox \u{2014} Start a sandbox")
         );
         assert!(lines[2].contains("Use when the person asks to run code in a sandbox."));
-        assert_eq!(lines[3], "---");
-        assert_eq!(lines.len(), 6);
+        assert_eq!(lines[3], "capabilities:");
+        assert_eq!(lines[4], "  filesystem_read: []");
+        assert_eq!(lines[5], "  filesystem_write: []");
+        assert_eq!(lines[6], "  network_egress_hosts: []");
+        assert_eq!(lines[7], "  execution_shell_allowed: false");
+        assert_eq!(lines[8], "  environment_variable_access: []");
+        assert_eq!(lines[9], "---");
+        assert_eq!(lines.len(), 12);
         assert_eq!(
-            lines[5],
+            lines[11],
             "Call the `quome` MCP tool `playbook` with `name` `run-code` and `arguments.what` set to the person's request (and `arguments.resource` if they named one). Follow the text it returns."
         );
     }
@@ -382,7 +393,7 @@ mod tests {
         p.name = "bad-name".into();
         let s = render_skill(&p, ClientId::Antigravity).unwrap();
         assert_eq!(s.dir_name, "quome-bad-name");
-        assert_eq!(s.contents.lines().count(), 6);
+        assert_eq!(s.contents.lines().count(), 12);
         assert!(s.contents.contains("\\\"hi\\\""));
     }
 
