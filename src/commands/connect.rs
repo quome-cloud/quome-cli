@@ -114,6 +114,27 @@ pub struct Outcome {
     pub profile_name: String,
     pub profile: Profile,
     pub mcp: &'static str,
+    /// Per selected client: how its MCP registration and skills went.
+    pub clients: Vec<ClientOutcome>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientOutcome {
+    pub client: ClientId,
+    /// added, updated, unchanged, manual or skipped.
+    pub mcp: &'static str,
+    pub skills_written: usize,
+    pub skills_removed: usize,
+}
+
+impl ClientOutcome {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "client": self.client.name(),
+            "mcp": self.mcp,
+            "skills": {"written": self.skills_written, "removed": self.skills_removed},
+        })
+    }
 }
 
 /// Replace a leading `api.` in the URL's host with `to.`; other hosts are kept.
@@ -414,8 +435,25 @@ pub async fn run(opts: Options, deps: &Deps<'_>) -> Result<Outcome> {
     } else {
         register_mcp(deps, &profile_name)
     };
+    let mut results: Vec<ClientOutcome> = selected
+        .iter()
+        .map(|c| ClientOutcome {
+            client: *c,
+            mcp: if *c == ClientId::Claude {
+                mcp
+            } else {
+                "skipped"
+            },
+            skills_written: 0,
+            skills_removed: 0,
+        })
+        .collect();
     if !opts.no_mcp {
-        setup_other_clients(deps, &selected, explicit, &profile_name);
+        for (id, m) in setup_other_clients(deps, &selected, explicit, &profile_name) {
+            if let Some(r) = results.iter_mut().find(|r| r.client == id) {
+                r.mcp = m;
+            }
+        }
         // `api` above was built before the org was known; make one that has it.
         let synced = match AgentKey::load_from(deps.store, &profile_name) {
             Ok((k, v)) => {
@@ -434,6 +472,10 @@ pub async fn run(opts: Options, deps: &Deps<'_>) -> Result<Outcome> {
         match synced {
             Ok(r) => {
                 for c in &r.clients {
+                    if let Some(o) = results.iter_mut().find(|o| o.client == c.client) {
+                        o.skills_written += c.written;
+                        o.skills_removed += c.removed;
+                    }
                     (deps.say)(&format!(
                         "Skills for {}: {} written, {} removed, {} unchanged.",
                         c.client.name(),
@@ -467,6 +509,7 @@ pub async fn run(opts: Options, deps: &Deps<'_>) -> Result<Outcome> {
         profile_name,
         profile,
         mcp,
+        clients: results,
     })
 }
 
@@ -486,7 +529,13 @@ fn manual_snippet(client: ClientId, program: &str, profile: &str) -> String {
 /// Register the quome MCP server with every selected client except Claude Code
 /// (handled by `register_mcp`). One line per failure plus the manual snippet;
 /// never an error.
-fn setup_other_clients(deps: &Deps<'_>, selected: &[ClientId], explicit: bool, profile: &str) {
+fn setup_other_clients(
+    deps: &Deps<'_>,
+    selected: &[ClientId],
+    explicit: bool,
+    profile: &str,
+) -> Vec<(ClientId, &'static str)> {
+    let mut done = Vec::new();
     let program = mcp_program();
     let ctx = Ctx {
         home: &deps.home,
@@ -505,19 +554,29 @@ fn setup_other_clients(deps: &Deps<'_>, selected: &[ClientId], explicit: bool, p
             continue;
         }
         match a.register_mcp(&ctx, &program, profile) {
-            Ok(RegisterOutcome::Added) => (deps.say)(&format!(
-                "Registered the quome MCP server with {} (profile {profile}).",
-                id.name()
-            )),
-            Ok(RegisterOutcome::Updated) => (deps.say)(&format!(
-                "Updated the quome MCP server in {} (profile {profile}).",
-                id.name()
-            )),
-            Ok(RegisterOutcome::Unchanged) => (deps.say)(&format!(
-                "The quome MCP server in {} is already set up.",
-                id.name()
-            )),
+            Ok(RegisterOutcome::Added) => {
+                done.push((id, "added"));
+                (deps.say)(&format!(
+                    "Registered the quome MCP server with {} (profile {profile}).",
+                    id.name()
+                ))
+            }
+            Ok(RegisterOutcome::Updated) => {
+                done.push((id, "updated"));
+                (deps.say)(&format!(
+                    "Updated the quome MCP server in {} (profile {profile}).",
+                    id.name()
+                ))
+            }
+            Ok(RegisterOutcome::Unchanged) => {
+                done.push((id, "unchanged"));
+                (deps.say)(&format!(
+                    "The quome MCP server in {} is already set up.",
+                    id.name()
+                ))
+            }
             Err(why) => {
+                done.push((id, "manual"));
                 (deps.say)(&format!(
                     "Could not register with {}: {why}. Add this to its MCP config:",
                     id.name()
@@ -526,6 +585,7 @@ fn setup_other_clients(deps: &Deps<'_>, selected: &[ClientId], explicit: bool, p
             }
         }
     }
+    done
 }
 
 /// How the Claude Code registration went.
@@ -652,6 +712,7 @@ pub async fn execute(args: Args) -> Result<()> {
                 "org_slug": p.org_slug,
                 "expires_at": p.expires_at,
                 "mcp": out.mcp,
+                "clients": out.clients.iter().map(ClientOutcome::to_json).collect::<Vec<_>>(),
             }))?
         );
     } else {
@@ -1208,6 +1269,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.mcp, "added");
+        let by = |c: ClientId| out.clients.iter().find(|o| o.client == c).unwrap();
+        assert_eq!(by(ClientId::Claude).mcp, "added");
+        assert_eq!(by(ClientId::Claude).skills_written, 1);
+        assert_eq!(by(ClientId::Codex).mcp, "added");
+        assert_eq!(by(ClientId::Codex).skills_written, 1);
+        assert_eq!(by(ClientId::Antigravity).mcp, "skipped");
+        assert_eq!(by(ClientId::Antigravity).skills_written, 0);
+        let j = by(ClientId::Codex).to_json();
+        assert_eq!(j["client"], "codex");
+        assert_eq!(j["skills"], serde_json::json!({"written": 1, "removed": 0}));
         let calls = h.runner.calls();
         assert!(
             calls.iter().any(|c| c.starts_with("codex mcp add quome")),
@@ -1260,6 +1331,8 @@ mod tests {
         let p = st.profile(Some("work")).unwrap().clone();
         let api = CloudApi::new(&p, TokenSource::new(&p, k, v));
         let none = |_: &str| false;
+        // An unchanged catalog is skipped; remove a skill so the refresh acts.
+        std::fs::remove_dir_all(home.join(".agents/skills/quome-ship")).unwrap();
         let r = crate::commands::skills::sync_skills_with(
             &api,
             home,
