@@ -217,14 +217,7 @@ pub async fn execute(command: HostCommands) -> Result<()> {
 /// it can be joined to `DOWNLOADS_PATH` and handed to `--control-plane-url`.
 fn control_plane_url() -> Result<String> {
     let settings = Settings::load().unwrap_or_default();
-    let url = settings.get_api_url();
-    let url = url.trim().trim_end_matches('/').to_string();
-    if !(url.starts_with("https://") || url.starts_with("http://")) {
-        return Err(QuomeError::ApiError(format!(
-            "API URL must be an http(s) URL, got {url:?} (check QUOME_API_URL or ~/.quome/settings.json)"
-        )));
-    }
-    Ok(url)
+    settings.checked_api_url()
 }
 
 /// `quome-host up` argv. `--control-plane-url` goes FIRST so `up` knows which
@@ -541,6 +534,7 @@ impl Downloader {
     fn new(api_url: &str, version: &str) -> Result<Self> {
         let http = reqwest::Client::builder()
             .user_agent(USER_AGENT)
+            .https_only(!crate::url_policy::is_loopback_http(api_url))
             .timeout(std::time::Duration::from_secs(300))
             .build()?;
         Ok(Self {

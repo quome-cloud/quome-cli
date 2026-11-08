@@ -87,4 +87,15 @@ impl Settings {
     pub fn get_api_url(&self) -> String {
         std::env::var("QUOME_API_URL").unwrap_or_else(|_| self.api_url.clone())
     }
+
+    /// The API URL to send requests to, checked by `url_policy`: https, or
+    /// http only to a loopback host. The error names where the value came from.
+    pub fn checked_api_url(&self) -> Result<String> {
+        match std::env::var("QUOME_API_URL") {
+            Ok(v) => crate::url_policy::validate_api_url(&v, "QUOME_API_URL"),
+            Err(_) => {
+                crate::url_policy::validate_api_url(&self.api_url, "api_url in settings.json")
+            }
+        }
+    }
 }

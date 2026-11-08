@@ -68,6 +68,20 @@ fn home() -> Result<PathBuf, QuomeError> {
     dirs::home_dir().ok_or_else(|| QuomeError::CloudState("cannot find home directory".into()))
 }
 
+impl Profile {
+    /// Refuse a profile whose URLs would send credentials over plain http.
+    fn check_urls(&self, name: &str) -> Result<(), QuomeError> {
+        for (field, v) in [
+            ("api_url", &self.api_url),
+            ("console_url", &self.console_url),
+            ("issuer", &self.issuer),
+        ] {
+            crate::url_policy::validate_api_url(v, &format!("{field} of profile \"{name}\""))?;
+        }
+        Ok(())
+    }
+}
+
 impl CloudState {
     pub fn load() -> Result<CloudState, QuomeError> {
         Self::load_from(&home()?)
@@ -102,9 +116,12 @@ impl CloudState {
             }
             None => &self.default,
         };
-        self.profiles
+        let p = self
+            .profiles
             .get(name)
-            .ok_or_else(|| QuomeError::CloudState(format!("no profile named \"{name}\"")))
+            .ok_or_else(|| QuomeError::CloudState(format!("no profile named \"{name}\"")))?;
+        p.check_urls(name)?;
+        Ok(p)
     }
 }
 
@@ -128,6 +145,21 @@ mod tests {
             org_slug: format!("slug-{n}"),
             apps_domain: "apps.quome.cloud".into(),
         }
+    }
+
+    #[test]
+    fn profile_with_plain_http_remote_url_is_refused() {
+        let mut s = state();
+        let name = s.default.clone();
+        s.profiles.get_mut(&name).unwrap().api_url = "http://api.example.com".into();
+        let e = s.profile(None).unwrap_err().to_string();
+        assert!(e.contains("api_url") && e.contains("https"), "{e}");
+        let mut s = state();
+        s.profiles.get_mut(&name).unwrap().issuer = "http://auth.example.com".into();
+        assert!(s.profile(None).is_err());
+        let mut s = state();
+        s.profiles.get_mut(&name).unwrap().api_url = "http://127.0.0.1:8080".into();
+        assert!(s.profile(None).is_ok());
     }
 
     fn state() -> CloudState {
