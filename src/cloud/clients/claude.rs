@@ -22,9 +22,6 @@ impl ClientAdapter for Claude {
     fn id(&self) -> ClientId {
         ClientId::Claude
     }
-    fn installed(&self, home: &Path) -> bool {
-        paths::installed_with(ClientId::Claude, home, &paths::on_real_path)
-    }
     fn register_mcp(
         &self,
         ctx: &Ctx,
@@ -37,9 +34,6 @@ impl ClientAdapter for Claude {
             ClaudeMcp::NotFound => Err("`claude` is not on PATH".into()),
             ClaudeMcp::Failed(e) => Err(format!("`claude mcp add` failed: {e}")),
         }
-    }
-    fn skills_dir(&self, home: &Path) -> PathBuf {
-        paths::skills_dir(ClientId::Claude, home)
     }
     fn plugin_root(&self, home: &Path) -> Option<PathBuf> {
         paths::plugin_root(ClientId::Claude, home)

@@ -275,6 +275,9 @@ pub fn stored_reloader(
 struct Conn {
     api: Arc<CloudApi>,
     profile: Arc<Profile>,
+    /// The playbook list for this connection, fetched once (errors are not
+    /// kept). It lives here so a reconnect starts with a fresh cache.
+    playbooks: tokio::sync::OnceCell<Vec<Playbook>>,
 }
 
 /// The connection as it is now, so a reconnect is seen by every later call.
@@ -309,8 +312,6 @@ pub struct QuomeMcp {
     email_cursors: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
     /// Which local folders `sync_folder` and `deploy_app` may read.
     local: Arc<LocalScope>,
-    /// The playbook list, fetched once per session (errors are not kept).
-    playbooks: Arc<tokio::sync::OnceCell<Vec<Playbook>>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -1053,6 +1054,7 @@ impl QuomeMcp {
         let conn = Arc::new(std::sync::RwLock::new(Arc::new(Conn {
             api: Arc::new(api),
             profile: Arc::new(profile),
+            playbooks: tokio::sync::OnceCell::new(),
         })));
         let current = conn.clone();
         let auth = AuthInstances::new(Arc::new(move || {
@@ -1072,7 +1074,6 @@ impl QuomeMcp {
             git,
             email_cursors: Arc::default(),
             local: Arc::new(default_scope()),
-            playbooks: Arc::default(),
             tool_router: Self::tool_router(),
         }
     }
@@ -1128,6 +1129,7 @@ impl QuomeMcp {
         *self.conn.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(Conn {
             api: Arc::new(api),
             profile: Arc::new(profile),
+            playbooks: tokio::sync::OnceCell::new(),
         });
         true
     }
@@ -2918,7 +2920,6 @@ impl rmcp::ServerHandler for QuomeMcp {
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_prompts()
-                .enable_prompts_list_changed()
                 .build(),
         )
         .with_server_info(Implementation::new("quome", env!("CARGO_PKG_VERSION")))
@@ -2930,7 +2931,8 @@ impl rmcp::ServerHandler for QuomeMcp {
         _request: Option<PaginatedRequestParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<ListPromptsResult, ErrorData> {
-        let list = self
+        let conn = self.conn();
+        let list = conn
             .playbooks
             .get_or_try_init(|| async { call!(self, |api| api.agent_playbooks(TOOL_NAMES)) })
             .await
@@ -3257,7 +3259,8 @@ mod tests {
             )
             .await;
         let caps = &v["result"]["capabilities"];
-        assert_eq!(caps["prompts"]["listChanged"], json!(true));
+        assert!(caps["prompts"].is_object());
+        assert!(caps["prompts"]["listChanged"].is_null());
         assert!(caps["tools"].is_object());
         assert!(v["result"]["instructions"]
             .as_str()
@@ -3696,6 +3699,25 @@ mod tests {
         let (err, text) = c.call("list_sandboxes", json!({})).await;
         assert!(!err, "{text}");
         assert_eq!(text.trim(), "[]");
+    }
+
+    #[tokio::test]
+    async fn reconnect_resets_the_playbook_cache() {
+        let s = revoking_server().await;
+        let old = AgentKey::generate();
+        let (home, reload) = cloud_home(&s.uri(), "j", "d", &old);
+        let p = profile(&s.uri());
+        let api = CloudApi::new(&p, TokenSource::new(&p, old, "vrc".into()));
+        let server = QuomeMcp::new(api, p).with_reloader(reload);
+        let first = server.conn();
+        first.playbooks.set(Vec::new()).unwrap();
+        // Same connection: nothing swapped, cache kept.
+        assert!(!server.refresh(&first.api).await);
+        assert!(server.conn().playbooks.initialized());
+        // `quome connect` again: new jkt and delegation swap the connection.
+        write_connection(home.path(), &s.uri(), "j2", "d2", &AgentKey::generate());
+        assert!(server.refresh(&first.api).await);
+        assert!(!server.conn().playbooks.initialized());
     }
 
     #[tokio::test]

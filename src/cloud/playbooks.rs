@@ -165,7 +165,7 @@ pub fn render_skill(pb: &Playbook, client: ClientId) -> Option<SkillFile> {
     // Codex, OpenCode and Antigravity key the skill by folder name; Claude's
     // plugin namespace supplies the prefix, so its name is the bare slug.
     let contents = format!(
-        "---\nname: {}\ndescription: {}\n---\n\nCall the `quome` MCP tool `playbook` with name `{}` and the person's request as `what` (and `resource` if they named one).\nFollow the text it returns.\n",
+        "---\nname: {}\ndescription: {}\n---\n\nCall the `quome` MCP tool `playbook` with `name` `{}` and `arguments.what` set to the person's request (and `arguments.resource` if they named one). Follow the text it returns.\n",
         dir_name,
         yaml_quote(&description),
         call_name
@@ -348,12 +348,11 @@ mod tests {
         );
         assert!(lines[2].contains("Use when the person asks to run code in a sandbox."));
         assert_eq!(lines[3], "---");
-        assert_eq!(lines.len(), 7);
+        assert_eq!(lines.len(), 6);
         assert_eq!(
             lines[5],
-            "Call the `quome` MCP tool `playbook` with name `run-code` and the person's request as `what` (and `resource` if they named one)."
+            "Call the `quome` MCP tool `playbook` with `name` `run-code` and `arguments.what` set to the person's request (and `arguments.resource` if they named one). Follow the text it returns."
         );
-        assert_eq!(lines[6], "Follow the text it returns.");
     }
 
     #[test]
@@ -383,7 +382,7 @@ mod tests {
         p.name = "bad-name".into();
         let s = render_skill(&p, ClientId::Antigravity).unwrap();
         assert_eq!(s.dir_name, "quome-bad-name");
-        assert_eq!(s.contents.lines().count(), 7);
+        assert_eq!(s.contents.lines().count(), 6);
         assert!(s.contents.contains("\\\"hi\\\""));
     }
 

@@ -47,6 +47,7 @@ pub async fn execute(args: Args) -> Result<()> {
         drop(crate::commands::skills::spawn_background_sync(
             bg,
             home.clone(),
+            name.clone(),
         ));
     }
     let reload = stored_reloader(home, Arc::from(store), name);

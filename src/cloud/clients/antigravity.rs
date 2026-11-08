@@ -24,12 +24,16 @@ pub fn config_path(home: &Path) -> PathBuf {
     home.join(".gemini/config/mcp_config.json")
 }
 
+/// True if `out` parses as a JSON object whose `mcpServers.quome` is `want`.
+fn spliced_ok(out: &str, want: &Value) -> bool {
+    serde_json::from_str::<Value>(out)
+        .ok()
+        .is_some_and(|v| v.is_object() && &v["mcpServers"]["quome"] == want)
+}
+
 impl ClientAdapter for Antigravity {
     fn id(&self) -> ClientId {
         ClientId::Antigravity
-    }
-    fn installed(&self, home: &Path) -> bool {
-        paths::installed_with(ClientId::Antigravity, home, &paths::on_real_path)
     }
     fn register_mcp(
         &self,
@@ -70,11 +74,12 @@ impl ClientAdapter for Antigravity {
         };
         let out = jsonedit::splice_set(&text, &["mcpServers", "quome"], &want)
             .ok_or_else(|| format!("cannot edit {}; left untouched", path.display()))?;
+        // Never write what we cannot read back as the config we meant.
+        if !spliced_ok(&out, &want) {
+            return Err(format!("cannot edit {}; left untouched", path.display()));
+        }
         write(&path, &out)?;
         Ok(outcome)
-    }
-    fn skills_dir(&self, home: &Path) -> PathBuf {
-        paths::skills_dir(ClientId::Antigravity, home)
     }
     fn plugin_root(&self, home: &Path) -> Option<PathBuf> {
         paths::plugin_root(ClientId::Antigravity, home)
@@ -209,6 +214,26 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, ["mcp_config.json"]);
+    }
+
+    #[test]
+    fn spliced_output_is_verified() {
+        let want = json!({"command":"quome"});
+        assert!(spliced_ok(
+            r#"{"mcpServers":{"quome":{"command":"quome"}}}"#,
+            &want
+        ));
+        // truncated, wrong value, missing entry, not an object
+        assert!(!spliced_ok(
+            r#"{"mcpServers":{"quome":{"command":"quome""#,
+            &want
+        ));
+        assert!(!spliced_ok(
+            r#"{"mcpServers":{"quome":{"command":"x"}}}"#,
+            &want
+        ));
+        assert!(!spliced_ok(r#"{"mcpServers":{}}"#, &want));
+        assert!(!spliced_ok("[1]", &want));
     }
 
     #[test]

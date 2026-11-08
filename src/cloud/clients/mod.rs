@@ -7,8 +7,7 @@ pub mod opencode;
 pub mod paths;
 pub mod runner;
 
-#[allow(unused_imports)]
-pub use super::playbooks::{render_skill, render_skills};
+pub use super::playbooks::render_skills;
 use runner::CommandRunner;
 use std::path::{Path, PathBuf};
 
@@ -81,7 +80,6 @@ pub fn no_env(_: &str) -> Option<String> {
 /// One agent client.
 pub trait ClientAdapter {
     fn id(&self) -> ClientId;
-    fn installed(&self, home: &Path) -> bool;
     /// Point the client's `quome` MCP server at `program mcp --profile <profile>`.
     /// `Err` means the caller should print the manual snippet.
     fn register_mcp(
@@ -90,8 +88,6 @@ pub trait ClientAdapter {
         program: &str,
         profile: &str,
     ) -> Result<RegisterOutcome, String>;
-    /// Directory that directly holds skill folders (for Claude, `<plugin root>/skills`).
-    fn skills_dir(&self, home: &Path) -> PathBuf;
     /// Plugin root that needs a `.claude-plugin/plugin.json`; Claude only.
     fn plugin_root(&self, home: &Path) -> Option<PathBuf>;
 }

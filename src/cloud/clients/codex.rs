@@ -30,9 +30,6 @@ impl ClientAdapter for Codex {
     fn id(&self) -> ClientId {
         ClientId::Codex
     }
-    fn installed(&self, home: &Path) -> bool {
-        paths::installed_with(ClientId::Codex, home, &paths::on_real_path)
-    }
     fn register_mcp(
         &self,
         ctx: &Ctx,
@@ -60,9 +57,6 @@ impl ClientAdapter for Codex {
         } else {
             RegisterOutcome::Added
         })
-    }
-    fn skills_dir(&self, home: &Path) -> PathBuf {
-        paths::skills_dir(ClientId::Codex, home)
     }
     fn plugin_root(&self, home: &Path) -> Option<PathBuf> {
         paths::plugin_root(ClientId::Codex, home)

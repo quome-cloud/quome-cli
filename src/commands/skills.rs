@@ -32,6 +32,36 @@ pub enum SkillsCommands {
 struct Manifest {
     catalog_hash: String,
     names: Vec<String>,
+    /// The profile that last wrote this root. Absent in older manifests, which
+    /// any profile may take over.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    profile: Option<String>,
+}
+
+/// Who is syncing and what it may create.
+#[derive(Debug, Clone, Copy)]
+pub struct SyncOpts<'a> {
+    /// The profile writing the skills; recorded in each root's manifest.
+    pub profile: &'a str,
+    /// Background mode: only update roots that already hold a manifest from this
+    /// profile (or from before manifests named one). Never creates a root.
+    pub refresh_only: bool,
+}
+
+impl<'a> SyncOpts<'a> {
+    /// Explicit sync or connect: creates roots and takes over another profile's.
+    pub fn explicit(profile: &'a str) -> Self {
+        SyncOpts {
+            profile,
+            refresh_only: false,
+        }
+    }
+    pub fn refresh(profile: &'a str) -> Self {
+        SyncOpts {
+            profile,
+            refresh_only: true,
+        }
+    }
 }
 
 /// What happened to one skills root.
@@ -112,6 +142,7 @@ fn sync_root(
     root: &Path,
     plugin_root: Option<&Path>,
     hash: &str,
+    profile: &str,
     files: &[crate::cloud::clients::SkillFile],
 ) -> std::io::Result<ClientSync> {
     let mut out = ClientSync {
@@ -150,14 +181,19 @@ fn sync_root(
             }
             let dir = root.join(n);
             if dir.is_dir() {
-                std::fs::remove_dir_all(&dir)?;
-                out.removed += 1;
+                match std::fs::remove_dir_all(&dir) {
+                    Ok(()) => out.removed += 1,
+                    // Gone since we looked: already removed.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
             }
         }
     }
     let manifest = Manifest {
         catalog_hash: hash.to_string(),
         names,
+        profile: Some(profile.to_string()),
     };
     write_if_changed(
         &root.join(MANIFEST),
@@ -182,8 +218,13 @@ pub fn installed_of(
 }
 
 /// Sync skills into the installed ones of `clients`.
-pub async fn sync_skills(api: &CloudApi, home: &Path, clients: &[ClientId]) -> Result<SyncReport> {
-    sync_skills_with(api, home, clients, &paths::on_real_path).await
+pub async fn sync_skills(
+    api: &CloudApi,
+    home: &Path,
+    clients: &[ClientId],
+    opts: SyncOpts<'_>,
+) -> Result<SyncReport> {
+    sync_skills_with(api, home, clients, &paths::on_real_path, opts).await
 }
 
 pub async fn sync_skills_with(
@@ -191,16 +232,24 @@ pub async fn sync_skills_with(
     home: &Path,
     clients: &[ClientId],
     on_path: &(dyn Fn(&str) -> bool + Sync),
+    opts: SyncOpts<'_>,
 ) -> Result<SyncReport> {
     let installed = installed_of(clients, home, on_path);
     let mut report = SyncReport::default();
-    if installed.is_empty() {
+    let mut targets = skill_targets(&installed, home);
+    if opts.refresh_only {
+        targets.retain(|(root, _)| {
+            read_manifest(root)
+                .is_some_and(|m| m.profile.as_deref().is_none_or(|p| p == opts.profile))
+        });
+    }
+    if targets.is_empty() {
         return Ok(report);
     }
     let pbs = api.agent_playbooks(TOOL_NAMES).await?;
     let hash = catalog_hash(&pbs);
     let all = adapters();
-    for (root, client) in skill_targets(&installed, home) {
+    for (root, client) in targets {
         let (files, warnings) = render_skills(&pbs, client);
         for w in warnings {
             if !report.warnings.contains(&w) {
@@ -211,7 +260,14 @@ pub async fn sync_skills_with(
             .iter()
             .find(|a| a.id() == client)
             .and_then(|a| a.plugin_root(home));
-        match sync_root(client, &root, plugin.as_deref(), &hash, &files) {
+        match sync_root(
+            client,
+            &root,
+            plugin.as_deref(),
+            &hash,
+            opts.profile,
+            &files,
+        ) {
             Ok(s) => report.clients.push(s),
             Err(e) => report
                 .failures
@@ -221,11 +277,17 @@ pub async fn sync_skills_with(
     Ok(report)
 }
 
-/// Fire-and-forget sync for `quome mcp`: never delays the handshake, never prints
-/// (stdout is the MCP transport), and drops every failure.
-pub fn spawn_background_sync(api: CloudApi, home: PathBuf) -> tokio::task::JoinHandle<()> {
+/// Fire-and-forget refresh for `quome mcp`: never delays the handshake, never
+/// prints (stdout is the MCP transport), and drops every failure. It only
+/// updates roots that `quome connect` or `quome skills sync` already set up for
+/// this profile; it never creates one.
+pub fn spawn_background_sync(
+    api: CloudApi,
+    home: PathBuf,
+    profile: String,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let _ = sync_skills(&api, &home, &ClientId::ALL).await;
+        let _ = sync_skills(&api, &home, &ClientId::ALL, SyncOpts::refresh(&profile)).await;
     })
 }
 
@@ -271,7 +333,7 @@ pub async fn execute(cmd: SkillsCommands) -> Result<()> {
     } else {
         client
     };
-    let report = sync_skills(&api, &home, &clients).await?;
+    let report = sync_skills(&api, &home, &clients, SyncOpts::explicit(&name)).await?;
     if report.clients.is_empty() && report.failures.is_empty() {
         println!("No installed agent clients found; nothing to do.");
     }
@@ -360,9 +422,15 @@ mod tests {
         let (s, api) = setup().await;
         serve(&s, &["ship", "mail"]).await;
         let h = home_with(&[".claude", ".codex"]);
-        let r = sync_skills_with(&api, h.path(), &ClientId::ALL, &none)
-            .await
-            .unwrap();
+        let r = sync_skills_with(
+            &api,
+            h.path(),
+            &ClientId::ALL,
+            &none,
+            SyncOpts::explicit("p"),
+        )
+        .await
+        .unwrap();
         assert_eq!(r.clients.len(), 2);
         assert!(claude_skills(h.path()).join("ship/SKILL.md").is_file());
         assert!(claude_skills(h.path()).join("mail/SKILL.md").is_file());
@@ -388,18 +456,30 @@ mod tests {
         let (s, api) = setup().await;
         serve(&s, &["ship"]).await;
         let h = home_with(&[".codex"]);
-        sync_skills_with(&api, h.path(), &ClientId::ALL, &none)
-            .await
-            .unwrap();
+        sync_skills_with(
+            &api,
+            h.path(),
+            &ClientId::ALL,
+            &none,
+            SyncOpts::explicit("p"),
+        )
+        .await
+        .unwrap();
         assert!(!h.path().join(".claude").exists());
         assert!(!h.path().join(".gemini").exists());
         assert!(h.path().join(".agents/skills/quome-ship").is_dir());
         // nothing installed: no request at all
         let h2 = home_with(&[]);
         s.reset().await;
-        let r = sync_skills_with(&api, h2.path(), &ClientId::ALL, &none)
-            .await
-            .unwrap();
+        let r = sync_skills_with(
+            &api,
+            h2.path(),
+            &ClientId::ALL,
+            &none,
+            SyncOpts::explicit("p"),
+        )
+        .await
+        .unwrap();
         assert!(r.clients.is_empty());
         assert!(s.received_requests().await.unwrap().is_empty());
         assert_eq!(std::fs::read_dir(h2.path()).unwrap().count(), 0);
@@ -410,13 +490,25 @@ mod tests {
         let (s, api) = setup().await;
         serve(&s, &["ship", "mail"]).await;
         let h = home_with(&[".claude", ".codex"]);
-        sync_skills_with(&api, h.path(), &ClientId::ALL, &none)
-            .await
-            .unwrap();
+        sync_skills_with(
+            &api,
+            h.path(),
+            &ClientId::ALL,
+            &none,
+            SyncOpts::explicit("p"),
+        )
+        .await
+        .unwrap();
         serve(&s, &["ship"]).await;
-        let r = sync_skills_with(&api, h.path(), &ClientId::ALL, &none)
-            .await
-            .unwrap();
+        let r = sync_skills_with(
+            &api,
+            h.path(),
+            &ClientId::ALL,
+            &none,
+            SyncOpts::explicit("p"),
+        )
+        .await
+        .unwrap();
         assert!(r.clients.iter().all(|c| c.removed == 1));
         assert!(!claude_skills(h.path()).join("mail").exists());
         assert!(!h.path().join(".agents/skills/quome-mail").exists());
@@ -428,20 +520,38 @@ mod tests {
         let (s, api) = setup().await;
         serve(&s, &[]).await;
         let h = home_with(&[".claude"]);
-        let r = sync_skills_with(&api, h.path(), &[ClientId::Claude], &none)
-            .await
-            .unwrap();
+        let r = sync_skills_with(
+            &api,
+            h.path(),
+            &[ClientId::Claude],
+            &none,
+            SyncOpts::explicit("p"),
+        )
+        .await
+        .unwrap();
         assert_eq!(r.clients[0].written, 0);
         assert!(!h.path().join(".claude/skills").exists());
 
         serve(&s, &["ship"]).await;
-        sync_skills_with(&api, h.path(), &[ClientId::Claude], &none)
-            .await
-            .unwrap();
+        sync_skills_with(
+            &api,
+            h.path(),
+            &[ClientId::Claude],
+            &none,
+            SyncOpts::explicit("p"),
+        )
+        .await
+        .unwrap();
         serve(&s, &[]).await;
-        let r = sync_skills_with(&api, h.path(), &[ClientId::Claude], &none)
-            .await
-            .unwrap();
+        let r = sync_skills_with(
+            &api,
+            h.path(),
+            &[ClientId::Claude],
+            &none,
+            SyncOpts::explicit("p"),
+        )
+        .await
+        .unwrap();
         assert_eq!(r.clients[0].removed, 1);
         assert!(!claude_skills(h.path()).join("ship").exists());
         assert!(h
@@ -458,13 +568,25 @@ mod tests {
         let a = h.path().join(".agents/skills");
         std::fs::create_dir_all(a.join("quome-notes")).unwrap();
         std::fs::write(a.join("quome-notes/SKILL.md"), "mine").unwrap();
-        sync_skills_with(&api, h.path(), &ClientId::ALL, &none)
-            .await
-            .unwrap();
+        sync_skills_with(
+            &api,
+            h.path(),
+            &ClientId::ALL,
+            &none,
+            SyncOpts::explicit("p"),
+        )
+        .await
+        .unwrap();
         serve(&s, &[]).await;
-        sync_skills_with(&api, h.path(), &ClientId::ALL, &none)
-            .await
-            .unwrap();
+        sync_skills_with(
+            &api,
+            h.path(),
+            &ClientId::ALL,
+            &none,
+            SyncOpts::explicit("p"),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             std::fs::read_to_string(a.join("quome-notes/SKILL.md")).unwrap(),
             "mine"
@@ -484,9 +606,15 @@ mod tests {
             ["../../victim","other-skill","a/b","..","","quome-gone"]});
         std::fs::write(a.join(MANIFEST), m.to_string()).unwrap();
         std::fs::create_dir_all(a.join("quome-gone")).unwrap();
-        sync_skills_with(&api, h.path(), &ClientId::ALL, &none)
-            .await
-            .unwrap();
+        sync_skills_with(
+            &api,
+            h.path(),
+            &ClientId::ALL,
+            &none,
+            SyncOpts::explicit("p"),
+        )
+        .await
+        .unwrap();
         assert!(h.path().join("victim").is_dir());
         assert!(a.join("other-skill").is_dir());
         assert!(!a.join("quome-gone").exists());
@@ -507,13 +635,25 @@ mod tests {
         let (s, api) = setup().await;
         serve(&s, &["ship"]).await;
         let h = home_with(&[".claude", ".codex"]);
-        sync_skills_with(&api, h.path(), &ClientId::ALL, &none)
-            .await
-            .unwrap();
+        sync_skills_with(
+            &api,
+            h.path(),
+            &ClientId::ALL,
+            &none,
+            SyncOpts::explicit("p"),
+        )
+        .await
+        .unwrap();
         let before = read_manifest(&h.path().join(".agents/skills")).unwrap();
-        let r = sync_skills_with(&api, h.path(), &ClientId::ALL, &none)
-            .await
-            .unwrap();
+        let r = sync_skills_with(
+            &api,
+            h.path(),
+            &ClientId::ALL,
+            &none,
+            SyncOpts::explicit("p"),
+        )
+        .await
+        .unwrap();
         assert!(r
             .clients
             .iter()
@@ -529,14 +669,18 @@ mod tests {
         let (s, api) = setup().await;
         s.reset().await; // every request now 404s
         let h = home_with(&[".claude", ".codex"]);
-        let before = std::fs::read_dir(h.path()).unwrap().count();
+        // A root that would be refreshed, so the failing fetch is reached.
+        let a = h.path().join(".agents/skills");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::write(a.join(MANIFEST), r#"{"catalog_hash":"x","names":[]}"#).unwrap();
+        let before = std::fs::read(a.join(MANIFEST)).unwrap();
         // Resolves to () with no panic and no error surface; the function body
         // has no print of any kind (stdout is the MCP transport).
-        spawn_background_sync(api, h.path().to_path_buf())
+        spawn_background_sync(api, h.path().to_path_buf(), "p".into())
             .await
             .unwrap();
-        assert_eq!(std::fs::read_dir(h.path()).unwrap().count(), before);
-        assert!(!h.path().join(".agents").exists());
+        assert_eq!(std::fs::read(a.join(MANIFEST)).unwrap(), before);
+        assert!(!h.path().join(".claude/skills").exists());
         let src = include_str!("skills.rs");
         let body = src
             .split("pub fn spawn_background_sync")
@@ -547,5 +691,154 @@ mod tests {
             .unwrap();
         assert!(!body.contains("println!") && !body.contains("print!"));
         assert!(!body.contains("eprint"));
+    }
+
+    #[tokio::test]
+    async fn background_sync_never_creates_a_root() {
+        let (s, api) = setup().await;
+        serve(&s, &["ship"]).await;
+        let h = home_with(&[".claude", ".codex", ".gemini/antigravity"]);
+        // Nothing set up yet: no roots written, no request made.
+        let r = sync_skills_with(
+            &api,
+            h.path(),
+            &ClientId::ALL,
+            &none,
+            SyncOpts::refresh("p"),
+        )
+        .await
+        .unwrap();
+        assert!(r.clients.is_empty());
+        assert!(!h.path().join(".agents").exists());
+        assert!(!h.path().join(".claude/skills").exists());
+        assert!(!h.path().join(".gemini/config").exists());
+        assert!(s.received_requests().await.unwrap().is_empty());
+        // `connect --client codex` set up only the shared root.
+        sync_skills_with(
+            &api,
+            h.path(),
+            &[ClientId::Codex],
+            &none,
+            SyncOpts::explicit("p"),
+        )
+        .await
+        .unwrap();
+        serve(&s, &["ship", "mail"]).await;
+        let r = sync_skills_with(
+            &api,
+            h.path(),
+            &ClientId::ALL,
+            &none,
+            SyncOpts::refresh("p"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.clients.len(), 1);
+        assert_eq!(r.clients[0].client, ClientId::Codex);
+        assert!(h
+            .path()
+            .join(".agents/skills/quome-mail/SKILL.md")
+            .is_file());
+        assert!(!h.path().join(".claude/skills").exists());
+        assert!(!h.path().join(".gemini/config").exists());
+    }
+
+    #[tokio::test]
+    async fn background_sync_skips_another_profiles_root_and_explicit_takes_over() {
+        let (s, api) = setup().await;
+        serve(&s, &["ship"]).await;
+        let h = home_with(&[".codex"]);
+        let a = h.path().join(".agents/skills");
+        sync_skills_with(
+            &api,
+            h.path(),
+            &ClientId::ALL,
+            &none,
+            SyncOpts::explicit("work"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_manifest(&a).unwrap().profile.as_deref(), Some("work"));
+        serve(&s, &["ship", "mail"]).await;
+        let r = sync_skills_with(
+            &api,
+            h.path(),
+            &ClientId::ALL,
+            &none,
+            SyncOpts::refresh("dev"),
+        )
+        .await
+        .unwrap();
+        assert!(r.clients.is_empty());
+        assert!(!a.join("quome-mail").exists());
+        assert_eq!(read_manifest(&a).unwrap().profile.as_deref(), Some("work"));
+        // Same profile refreshes.
+        let r = sync_skills_with(
+            &api,
+            h.path(),
+            &ClientId::ALL,
+            &none,
+            SyncOpts::refresh("work"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.clients.len(), 1);
+        assert!(a.join("quome-mail").is_dir());
+        // An explicit sync under another profile takes the root over.
+        sync_skills_with(
+            &api,
+            h.path(),
+            &ClientId::ALL,
+            &none,
+            SyncOpts::explicit("dev"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_manifest(&a).unwrap().profile.as_deref(), Some("dev"));
+    }
+
+    #[tokio::test]
+    async fn manifest_without_profile_matches_any_and_is_stamped() {
+        let (s, api) = setup().await;
+        serve(&s, &["ship"]).await;
+        let h = home_with(&[".codex"]);
+        let a = h.path().join(".agents/skills");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::write(a.join(MANIFEST), r#"{"catalog_hash":"x","names":[]}"#).unwrap();
+        let r = sync_skills_with(
+            &api,
+            h.path(),
+            &ClientId::ALL,
+            &none,
+            SyncOpts::refresh("dev"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.clients.len(), 1);
+        assert!(a.join("quome-ship/SKILL.md").is_file());
+        assert_eq!(read_manifest(&a).unwrap().profile.as_deref(), Some("dev"));
+    }
+
+    #[tokio::test]
+    async fn already_deleted_skill_dir_is_not_a_failure() {
+        let (s, api) = setup().await;
+        serve(&s, &["ship"]).await;
+        let h = home_with(&[".codex"]);
+        let a = h.path().join(".agents/skills");
+        std::fs::create_dir_all(&a).unwrap();
+        let m = serde_json::json!({"catalog_hash":"x","names":["quome-gone"]});
+        std::fs::write(a.join(MANIFEST), m.to_string()).unwrap();
+        let r = sync_skills_with(
+            &api,
+            h.path(),
+            &ClientId::ALL,
+            &none,
+            SyncOpts::explicit("p"),
+        )
+        .await
+        .unwrap();
+        assert!(r.failures.is_empty());
+        assert_eq!(r.clients[0].removed, 0);
+        assert_eq!(read_manifest(&a).unwrap().names, ["quome-ship"]);
     }
 }

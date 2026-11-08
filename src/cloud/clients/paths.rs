@@ -73,7 +73,7 @@ pub fn plugin_root(client: ClientId, home: &Path) -> Option<PathBuf> {
     row(client).plugin_root.map(|r| home.join(r))
 }
 
-/// True if `name` is a regular file in a PATH directory (and executable, on unix).
+/// True if `p` is a regular file (and executable, on unix).
 fn is_exec(p: &Path) -> bool {
     #[cfg(unix)]
     {
@@ -88,6 +88,7 @@ fn is_exec(p: &Path) -> bool {
     }
 }
 
+/// True if an executable called `name` is in a PATH directory.
 pub fn on_real_path(name: &str) -> bool {
     std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).any(|d| is_exec(&d.join(name))))

@@ -420,8 +420,14 @@ pub async fn run(opts: Options, deps: &Deps<'_>) -> Result<Outcome> {
         let synced = match AgentKey::load_from(deps.store, &profile_name) {
             Ok((k, v)) => {
                 let api = CloudApi::new(&profile, TokenSource::new(&profile, k, v));
-                crate::commands::skills::sync_skills_with(&api, &deps.home, &selected, deps.on_path)
-                    .await
+                crate::commands::skills::sync_skills_with(
+                    &api,
+                    &deps.home,
+                    &selected,
+                    deps.on_path,
+                    crate::commands::skills::SyncOpts::explicit(&profile_name),
+                )
+                .await
             }
             Err(e) => Err(e),
         };
@@ -471,7 +477,7 @@ fn manual_snippet(client: ClientId, program: &str, profile: &str) -> String {
             "[mcp_servers.quome]\ncommand = {program:?}\nargs = [\"mcp\", \"--profile\", {profile:?}]"
         ),
         ClientId::OpenCode => format!(
-            "{{\"mcp\":{{\"quome\":{{\"type\":\"local\",\"command\":[{program:?},\"mcp\",\"--profile\",{profile:?}]}}}}}}"
+            "opencode mcp add quome --global -- {program} mcp --profile {profile}\nor, in opencode.json:\n{{\"mcp\":{{\"servers\":{{\"quome\":{{\"type\":\"local\",\"command\":[{program:?},\"mcp\",\"--profile\",{profile:?}]}}}}}}}}"
         ),
         _ => mcp_config_json_for(program, profile),
     }
@@ -1245,6 +1251,28 @@ mod tests {
         assert!(home.join(".agents/skills/quome-ship/SKILL.md").is_file());
         assert!(!home.join(".claude/skills").exists());
         assert!(!home.join(".gemini/config").exists());
+        // `quome mcp`'s background refresh only touches the root connect made.
+        let st = CloudState::load_from(home).unwrap();
+        let store = FileStore {
+            dir: home.join(".quome"),
+        };
+        let (k, v) = AgentKey::load_from(&store, "work").unwrap();
+        let p = st.profile(Some("work")).unwrap().clone();
+        let api = CloudApi::new(&p, TokenSource::new(&p, k, v));
+        let none = |_: &str| false;
+        let r = crate::commands::skills::sync_skills_with(
+            &api,
+            home,
+            &ClientId::ALL,
+            &none,
+            crate::commands::skills::SyncOpts::refresh("work"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.clients.len(), 1);
+        assert_eq!(r.clients[0].client, ClientId::Codex);
+        assert!(!home.join(".claude/skills").exists());
+        assert!(!home.join(".gemini/config").exists());
         // naming a client that is not installed says so and does nothing
         let h2 = Harness::new(ran(true));
         let mut o = opts(&s, "work");
@@ -1279,6 +1307,22 @@ mod tests {
         assert!(said.contains("Could not register with codex"), "{said}");
         assert!(said.contains("[mcp_servers.quome]"), "{said}");
         assert!(said.contains("Could not install skills"), "{said}");
+    }
+
+    #[test]
+    fn opencode_manual_snippet_is_current() {
+        let t = manual_snippet(ClientId::OpenCode, "quome", "work");
+        assert!(
+            t.contains("opencode mcp add quome --global -- quome mcp --profile work"),
+            "{t}"
+        );
+        let json = t.lines().last().unwrap();
+        let v: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            v["mcp"]["servers"]["quome"],
+            serde_json::json!({"type":"local","command":["quome","mcp","--profile","work"]})
+        );
+        assert!(t.contains("\"servers\""));
     }
 
     #[test]

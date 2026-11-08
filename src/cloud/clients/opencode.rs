@@ -61,9 +61,6 @@ impl ClientAdapter for OpenCode {
     fn id(&self) -> ClientId {
         ClientId::OpenCode
     }
-    fn installed(&self, home: &Path) -> bool {
-        paths::installed_with(ClientId::OpenCode, home, &paths::on_real_path)
-    }
     fn register_mcp(
         &self,
         ctx: &Ctx,
@@ -98,9 +95,6 @@ impl ClientAdapter for OpenCode {
                 _ => RegisterOutcome::Added,
             }),
         }
-    }
-    fn skills_dir(&self, home: &Path) -> PathBuf {
-        paths::skills_dir(ClientId::OpenCode, home)
     }
     fn plugin_root(&self, home: &Path) -> Option<PathBuf> {
         paths::plugin_root(ClientId::OpenCode, home)
