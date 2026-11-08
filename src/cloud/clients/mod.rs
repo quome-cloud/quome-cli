@@ -1,8 +1,15 @@
 //! Agent clients the CLI can wire up: skill rendering, paths, MCP registration.
+pub mod antigravity;
+pub mod claude;
+pub mod codex;
+pub mod jsonedit;
+pub mod opencode;
 pub mod paths;
+pub mod runner;
 
 #[allow(unused_imports)]
 pub use super::playbooks::{render_skill, render_skills};
+use runner::CommandRunner;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -34,14 +41,22 @@ pub enum RegisterOutcome {
     Unchanged,
 }
 
-/// One agent client. `register_mcp` is only declared here: the adapters below
-/// return an error until the registration task replaces them per client.
+/// What an adapter may touch: the home directory and the process runner, both
+/// injected so tests never reach the real machine.
+pub struct Ctx<'a> {
+    pub home: &'a Path,
+    pub runner: &'a dyn CommandRunner,
+}
+
+/// One agent client.
 pub trait ClientAdapter {
     fn id(&self) -> ClientId;
     fn installed(&self, home: &Path) -> bool;
+    /// Point the client's `quome` MCP server at `program mcp --profile <profile>`.
+    /// `Err` means the caller should print the manual snippet.
     fn register_mcp(
         &self,
-        home: &Path,
+        ctx: &Ctx,
         program: &str,
         profile: &str,
     ) -> Result<RegisterOutcome, String>;
@@ -51,31 +66,13 @@ pub trait ClientAdapter {
     fn plugin_root(&self, home: &Path) -> Option<PathBuf>;
 }
 
-struct Adapter(ClientId);
-
-impl ClientAdapter for Adapter {
-    fn id(&self) -> ClientId {
-        self.0
-    }
-    fn installed(&self, home: &Path) -> bool {
-        paths::installed_with(self.0, home, &paths::on_real_path)
-    }
-    fn register_mcp(&self, _: &Path, _: &str, _: &str) -> Result<RegisterOutcome, String> {
-        Err("not implemented".into())
-    }
-    fn skills_dir(&self, home: &Path) -> PathBuf {
-        paths::skills_dir(self.0, home)
-    }
-    fn plugin_root(&self, home: &Path) -> Option<PathBuf> {
-        paths::plugin_root(self.0, home)
-    }
-}
-
 pub fn adapters() -> Vec<Box<dyn ClientAdapter>> {
-    ClientId::ALL
-        .iter()
-        .map(|c| Box::new(Adapter(*c)) as Box<dyn ClientAdapter>)
-        .collect()
+    vec![
+        Box::new(claude::Claude),
+        Box::new(codex::Codex),
+        Box::new(opencode::OpenCode),
+        Box::new(antigravity::Antigravity),
+    ]
 }
 
 /// Skill directories to write for the installed clients, each root once. Codex and
@@ -110,5 +107,68 @@ mod tests {
     fn adapters_cover_every_client() {
         let ids: Vec<_> = adapters().iter().map(|a| a.id()).collect();
         assert_eq!(ids, ClientId::ALL.to_vec());
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    /// Files OpenCode would load as skills from its global roots (each root is
+    /// scanned recursively for `SKILL.md`).
+    fn opencode_skill_files(home: &Path) -> Vec<PathBuf> {
+        fn walk(d: &Path, out: &mut Vec<PathBuf>) {
+            let Ok(rd) = std::fs::read_dir(d) else { return };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.file_name().is_some_and(|n| n == "SKILL.md") {
+                    out.push(p);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for root in [
+            ".config/opencode/skills",
+            ".claude/skills",
+            ".agents/skills",
+        ] {
+            walk(&home.join(root), &mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn no_double_load_claude_and_opencode() {
+        let home = tempfile::tempdir().unwrap();
+        let installed = [ClientId::Claude, ClientId::OpenCode];
+        let targets = skill_targets(&installed, home.path());
+        assert_eq!(targets.len(), 2);
+        // Claude's skills sit one level below the plugin root, never at
+        // ~/.claude/skills/<x>/SKILL.md, so they are not a root-level skill.
+        let claude = paths::skills_dir(ClientId::Claude, home.path());
+        assert_eq!(
+            claude,
+            home.path().join(".claude/skills/quome/skills"),
+            "claude skills live inside the plugin"
+        );
+        for (root, _) in &targets {
+            let dir = root.join("check");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("SKILL.md"), "x").unwrap();
+        }
+        for f in opencode_skill_files(home.path()) {
+            let rel = f.strip_prefix(home.path().join(".claude/skills")).ok();
+            if let Some(rel) = rel {
+                // ~/.claude/skills/<plugin>/skills/<name>/SKILL.md: depth 4, not 2.
+                assert_eq!(rel.components().count(), 4, "{rel:?}");
+            }
+        }
+        assert_eq!(opencode_skill_files(home.path()).len(), 2);
+        // Codex and OpenCode share one root, written once.
+        let t = skill_targets(&[ClientId::Codex, ClientId::OpenCode], home.path());
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].0, home.path().join(".agents/skills"));
     }
 }

@@ -64,16 +64,10 @@ struct RealClaude {
 
 impl ClaudeRunner for RealClaude {
     fn run(&self, args: &[String]) -> ClaudeResult {
-        let out = std::process::Command::new(&self.program)
-            .args(args)
-            .stdin(std::process::Stdio::null())
-            .output();
-        match out {
-            Ok(o) => ClaudeResult::Ran {
-                ok: o.status.success(),
-                stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
-            },
-            Err(_) => ClaudeResult::NotFound,
+        use crate::cloud::clients::runner::{CommandRunner, RealRunner, RunResult};
+        match RealRunner.run(&self.program, args) {
+            RunResult::NotFound => ClaudeResult::NotFound,
+            RunResult::Ran { ok, stderr, .. } => ClaudeResult::Ran { ok, stderr },
         }
     }
 }
@@ -200,6 +194,7 @@ pub fn connect_url(console: &str, name: &str, key: &AgentKey, port: u16, state: 
     )
 }
 
+#[cfg(test)]
 pub fn mcp_add_args(profile: &str) -> Vec<String> {
     mcp_add_args_for(&mcp_program(), profile)
 }
@@ -413,6 +408,34 @@ pub async fn run(opts: Options, deps: &Deps<'_>) -> Result<Outcome> {
     })
 }
 
+/// How the Claude Code registration went.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaudeMcp {
+    Added,
+    Updated,
+    /// `claude` is not on PATH.
+    NotFound,
+    Failed(String),
+}
+
+/// Point Claude Code's user-scope `quome` MCP server at `profile` through
+/// `claude mcp`, replacing an existing one. Shared with the client adapters.
+pub fn claude_register(runner: &dyn ClaudeRunner, program: &str, profile: &str) -> ClaudeMcp {
+    let exists = match runner.run(&mcp_get_args()) {
+        ClaudeResult::NotFound => return ClaudeMcp::NotFound,
+        ClaudeResult::Ran { ok, .. } => ok,
+    };
+    if exists {
+        let _ = runner.run(&mcp_remove_args());
+    }
+    match runner.run(&mcp_add_args_for(program, profile)) {
+        ClaudeResult::Ran { ok: true, .. } if exists => ClaudeMcp::Updated,
+        ClaudeResult::Ran { ok: true, .. } => ClaudeMcp::Added,
+        ClaudeResult::Ran { stderr, .. } => ClaudeMcp::Failed(stderr.trim().to_string()),
+        ClaudeResult::NotFound => ClaudeMcp::NotFound,
+    }
+}
+
 /// Point Claude Code's user-scope `quome` MCP server at `profile`, replacing an
 /// existing one. Returns "added", "updated" or "manual".
 fn register_mcp(deps: &Deps<'_>, profile: &str) -> &'static str {
@@ -424,31 +447,24 @@ fn register_mcp(deps: &Deps<'_>, profile: &str) -> &'static str {
         (deps.say)(&mcp_config_json(profile));
         "manual"
     };
-    let exists = match deps.claude.run(&mcp_get_args()) {
-        ClaudeResult::NotFound => return manual(None),
-        ClaudeResult::Ran { ok, .. } => ok,
-    };
-    if exists {
-        let _ = deps.claude.run(&mcp_remove_args());
-    }
-    match deps.claude.run(&mcp_add_args(profile)) {
-        ClaudeResult::Ran { ok: true, .. } if exists => {
+    match claude_register(deps.claude, &mcp_program(), profile) {
+        ClaudeMcp::Updated => {
             (deps.say)(&format!(
                 "Updated the quome MCP server in Claude Code (profile {profile})."
             ));
             "updated"
         }
-        ClaudeResult::Ran { ok: true, .. } => {
+        ClaudeMcp::Added => {
             (deps.say)(&format!(
                 "Registered the quome MCP server with Claude Code (profile {profile})."
             ));
             "added"
         }
-        ClaudeResult::Ran { stderr, .. } => {
-            let why = format!("`claude mcp add` failed: {}", stderr.trim());
+        ClaudeMcp::Failed(stderr) => {
+            let why = format!("`claude mcp add` failed: {stderr}");
             manual(Some(&why))
         }
-        ClaudeResult::NotFound => manual(None),
+        ClaudeMcp::NotFound => manual(None),
     }
 }
 
