@@ -1,6 +1,6 @@
 ---
 type: tool_used
-tool: mcp__quome__playbook
+tool: mcp__plugin_quome_quome__playbook
 input_match: '\bname\W+caches\W'
 min: 1
 ---

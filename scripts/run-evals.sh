@@ -82,7 +82,9 @@ fi
 # starts it; the flags below opt in to that.
 args='["mcp"]'
 [ -n "$profile" ] && args="[\"mcp\",\"--profile\",\"$profile\"]"
-printf '{ "mcpServers": { "quome": { "command": "quome", "args": %s } } }\n' "$args" > "$plugin/.mcp.json"
+# The eval harness gives the agent a sandboxed HOME; the quome server must still find this
+# machine's connection (~/.quome and the keychain), so pass the real HOME through.
+printf '{ "mcpServers": { "quome": { "command": "quome", "args": %s, "env": { "HOME": "%s" } } } }\n' "$args" "$HOME" > "$plugin/.mcp.json"
 
 rm -rf "$plugin/evals"
 cp -R "$repo/evals" "$plugin/evals"
@@ -99,7 +101,7 @@ claude plugin validate "$plugin"
 #                          not start. This lets the plugin's real `quome mcp`
 #                          run, as you, against your test org.
 #  --allow-tools           operator grant, least privilege: only
-#                          mcp__quome__playbook (plus Skill for the skill-*
+#                          mcp__plugin_quome_quome__playbook (plus Skill for the skill-*
 #                          cases). Every other quome tool stays gated, so a run
 #                          that wanders cannot act on the org. Widen only by
 #                          passing your own --allow-tools after "--".
@@ -110,7 +112,7 @@ claude plugin validate "$plugin"
 #  --max-cost-usd 5        hard ceiling for a by-hand run; raise it deliberately.
 #  --trust-plugin          NOT passed: the first run asks you to confirm, which is
 #                          what a by-hand run should do. Add it after "--" for CI.
-grants=(mcp__quome__playbook)
+grants=(mcp__plugin_quome_quome__playbook)
 [ "$case_glob" = 'skill-*' ] && grants+=(Skill)
 cmd=(claude plugin eval "$plugin"
   --case "$case_glob"

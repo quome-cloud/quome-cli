@@ -24,7 +24,7 @@ copy of this directory), validates it, shows the profile and org you are about t
 choice is explained in the script. `--from-installed` starts from a read-only
 copy of your synced plugin instead of the bare manifest.
 
-A real run requires `--profile`; only `mcp__quome__playbook` (and `Skill` for the skill cases) is granted, so the agent cannot act on the org.
+A real run requires `--profile`; only `mcp__plugin_quome_quome__playbook` (and `Skill` for the skill cases) is granted, so the agent cannot act on the org.
 
 Reports go to `target/evals-report.html` and `target/evals-results/`.
 
