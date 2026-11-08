@@ -109,8 +109,24 @@ fn removable(name: &str, client: ClientId) -> bool {
     safe_component(name) && (client == ClientId::Claude || name.starts_with("quome-"))
 }
 
+/// True if the root's manifest records this catalog hash and every skill it
+/// names is still on disk, so a refresh has nothing to write.
+fn up_to_date(root: &Path, hash: &str) -> bool {
+    read_manifest(root).is_some_and(|m| {
+        m.catalog_hash == hash
+            && m.names
+                .iter()
+                .all(|n| safe_component(n) && root.join(n).join("SKILL.md").is_file())
+    })
+}
+
 fn read_manifest(root: &Path) -> Option<Manifest> {
     serde_json::from_slice(&std::fs::read(root.join(MANIFEST)).ok()?).ok()
+}
+
+/// True if `p` is a symlink (not followed). Skills are never written through one.
+fn is_link(p: &Path) -> bool {
+    std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink())
 }
 
 /// Write `contents` to `path` unless it already holds them. True if written.
@@ -144,6 +160,7 @@ fn sync_root(
     hash: &str,
     profile: &str,
     files: &[crate::cloud::clients::SkillFile],
+    warnings: &mut Vec<String>,
 ) -> std::io::Result<ClientSync> {
     let mut out = ClientSync {
         client,
@@ -161,7 +178,16 @@ fn sync_root(
         if !safe_component(&f.dir_name) {
             continue;
         }
-        if write_if_changed(&root.join(&f.dir_name).join("SKILL.md"), &f.contents)? {
+        let dir = root.join(&f.dir_name);
+        let file = dir.join("SKILL.md");
+        if is_link(&dir) || is_link(&file) {
+            warnings.push(format!(
+                "skipped {}: it is a symbolic link; skills are never written through one",
+                dir.display()
+            ));
+            continue;
+        }
+        if write_if_changed(&file, &f.contents)? {
             out.written += 1;
         } else {
             out.unchanged += 1;
@@ -169,10 +195,16 @@ fn sync_root(
         names.push(f.dir_name.clone());
     }
     if let (Some(pr), false) = (plugin_root, names.is_empty()) {
-        write_if_changed(
-            &pr.join(".claude-plugin").join("plugin.json"),
-            &plugin_json(),
-        )?;
+        let pdir = pr.join(".claude-plugin");
+        let pfile = pdir.join("plugin.json");
+        if is_link(&pdir) || is_link(&pfile) {
+            warnings.push(format!(
+                "skipped {}: it is a symbolic link; skills are never written through one",
+                pfile.display()
+            ));
+        } else {
+            write_if_changed(&pfile, &plugin_json())?;
+        }
     }
     if let Some(m) = &old {
         for n in &m.names {
@@ -180,6 +212,9 @@ fn sync_root(
                 continue;
             }
             let dir = root.join(n);
+            if is_link(&dir) {
+                continue;
+            }
             if dir.is_dir() {
                 match std::fs::remove_dir_all(&dir) {
                     Ok(()) => out.removed += 1,
@@ -195,10 +230,18 @@ fn sync_root(
         names,
         profile: Some(profile.to_string()),
     };
-    write_if_changed(
-        &root.join(MANIFEST),
-        &(serde_json::to_string_pretty(&manifest).unwrap_or_default() + "\n"),
-    )?;
+    let mpath = root.join(MANIFEST);
+    if is_link(&mpath) {
+        warnings.push(format!(
+            "skipped {}: it is a symbolic link; skills are never written through one",
+            mpath.display()
+        ));
+    } else {
+        write_if_changed(
+            &mpath,
+            &(serde_json::to_string_pretty(&manifest).unwrap_or_default() + "\n"),
+        )?;
+    }
     Ok(out)
 }
 
@@ -248,6 +291,10 @@ pub async fn sync_skills_with(
     }
     let pbs = api.agent_playbooks(TOOL_NAMES).await?;
     let hash = catalog_hash(&pbs);
+    if opts.refresh_only {
+        // Same catalog as last time and every skill still in place: nothing to do.
+        targets.retain(|(root, _)| !up_to_date(root, &hash));
+    }
     let all = adapters();
     for (root, client) in targets {
         let (files, warnings) = render_skills(&pbs, client);
@@ -260,14 +307,22 @@ pub async fn sync_skills_with(
             .iter()
             .find(|a| a.id() == client)
             .and_then(|a| a.plugin_root(home));
-        match sync_root(
+        let mut skipped = Vec::new();
+        let res = sync_root(
             client,
             &root,
             plugin.as_deref(),
             &hash,
             opts.profile,
             &files,
-        ) {
+            &mut skipped,
+        );
+        for w in skipped {
+            if !report.warnings.contains(&w) {
+                report.warnings.push(w);
+            }
+        }
+        match res {
             Ok(s) => report.clients.push(s),
             Err(e) => report
                 .failures
@@ -277,18 +332,22 @@ pub async fn sync_skills_with(
     Ok(report)
 }
 
-/// Fire-and-forget refresh for `quome mcp`: never delays the handshake, never
-/// prints (stdout is the MCP transport), and drops every failure. It only
-/// updates roots that `quome connect` or `quome skills sync` already set up for
-/// this profile; it never creates one.
+/// The background refresh for `quome mcp`: never prints (stdout is the MCP
+/// transport) and drops every failure. It only updates roots that `quome
+/// connect` or `quome skills sync` already set up for this profile; it never
+/// creates one.
+pub async fn background_sync(api: &CloudApi, home: &Path, profile: &str) {
+    let _ = sync_skills(api, home, &ClientId::ALL, SyncOpts::refresh(profile)).await;
+}
+
+/// Fire-and-forget `background_sync` over a connection the caller shares, so it
+/// never delays the handshake or opens a second token source.
 pub fn spawn_background_sync(
-    api: CloudApi,
+    api: std::sync::Arc<CloudApi>,
     home: PathBuf,
     profile: String,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let _ = sync_skills(&api, &home, &ClientId::ALL, SyncOpts::refresh(&profile)).await;
-    })
+    tokio::spawn(async move { background_sync(&api, &home, &profile).await })
 }
 
 pub fn print_report(r: &SyncReport) {
@@ -676,14 +735,14 @@ mod tests {
         let before = std::fs::read(a.join(MANIFEST)).unwrap();
         // Resolves to () with no panic and no error surface; the function body
         // has no print of any kind (stdout is the MCP transport).
-        spawn_background_sync(api, h.path().to_path_buf(), "p".into())
+        spawn_background_sync(std::sync::Arc::new(api), h.path().to_path_buf(), "p".into())
             .await
             .unwrap();
         assert_eq!(std::fs::read(a.join(MANIFEST)).unwrap(), before);
         assert!(!h.path().join(".claude/skills").exists());
         let src = include_str!("skills.rs");
         let body = src
-            .split("pub fn spawn_background_sync")
+            .split("pub async fn background_sync")
             .nth(1)
             .unwrap()
             .split("pub fn print_report")
@@ -691,6 +750,169 @@ mod tests {
             .unwrap();
         assert!(!body.contains("println!") && !body.contains("print!"));
         assert!(!body.contains("eprint"));
+    }
+
+    fn mtime(p: &Path) -> std::time::SystemTime {
+        std::fs::metadata(p).unwrap().modified().unwrap()
+    }
+
+    #[tokio::test]
+    async fn refresh_skips_roots_whose_catalog_is_unchanged() {
+        let (s, api) = setup().await;
+        serve(&s, &["ship"]).await;
+        let h = home_with(&[".codex"]);
+        sync_skills_with(
+            &api,
+            h.path(),
+            &ClientId::ALL,
+            &none,
+            SyncOpts::explicit("p"),
+        )
+        .await
+        .unwrap();
+        let a = h.path().join(".agents/skills");
+        let skill = a.join("quome-ship/SKILL.md");
+        let (m0, k0) = (mtime(&a.join(MANIFEST)), mtime(&skill));
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        // A hand edit is left alone: the root is not even compared.
+        let r = sync_skills_with(
+            &api,
+            h.path(),
+            &ClientId::ALL,
+            &none,
+            SyncOpts::refresh("p"),
+        )
+        .await
+        .unwrap();
+        assert!(r.clients.is_empty());
+        assert_eq!((m0, k0), (mtime(&a.join(MANIFEST)), mtime(&skill)));
+        // A missing skill defeats the shortcut, so it is restored.
+        std::fs::remove_dir_all(a.join("quome-ship")).unwrap();
+        let r = sync_skills_with(
+            &api,
+            h.path(),
+            &ClientId::ALL,
+            &none,
+            SyncOpts::refresh("p"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.clients[0].written, 1);
+        assert!(skill.is_file());
+    }
+
+    #[tokio::test]
+    async fn refresh_rewrites_when_the_catalog_changed() {
+        let (s, api) = setup().await;
+        serve(&s, &["ship"]).await;
+        let h = home_with(&[".codex"]);
+        sync_skills_with(
+            &api,
+            h.path(),
+            &ClientId::ALL,
+            &none,
+            SyncOpts::explicit("p"),
+        )
+        .await
+        .unwrap();
+        serve(&s, &["ship", "mail"]).await;
+        let r = sync_skills_with(
+            &api,
+            h.path(),
+            &ClientId::ALL,
+            &none,
+            SyncOpts::refresh("p"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.clients[0].written, 1);
+        assert!(h
+            .path()
+            .join(".agents/skills/quome-mail/SKILL.md")
+            .is_file());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_skill_dirs_are_skipped_with_a_warning() {
+        let (s, api) = setup().await;
+        serve(&s, &["x", "ship"]).await;
+        let h = home_with(&[".codex"]);
+        let outside = tempfile::tempdir().unwrap();
+        let a = h.path().join(".agents/skills");
+        std::fs::create_dir_all(&a).unwrap();
+        std::os::unix::fs::symlink(outside.path(), a.join("quome-x")).unwrap();
+        let r = sync_skills_with(
+            &api,
+            h.path(),
+            &ClientId::ALL,
+            &none,
+            SyncOpts::explicit("p"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+        assert!(
+            r.warnings.iter().any(|w| w.contains("quome-x")),
+            "{:?}",
+            r.warnings
+        );
+        assert!(a.join("quome-ship/SKILL.md").is_file());
+        assert!(!read_manifest(&a)
+            .unwrap()
+            .names
+            .contains(&"quome-x".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_skill_file_and_plugin_json_are_not_followed() {
+        let (s, api) = setup().await;
+        serve(&s, &["ship", "mail"]).await;
+        let h = home_with(&[".claude"]);
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("t");
+        std::fs::write(&target, "keep").unwrap();
+        let root = claude_skills(h.path());
+        std::fs::create_dir_all(root.join("ship")).unwrap();
+        std::os::unix::fs::symlink(&target, root.join("ship/SKILL.md")).unwrap();
+        let pdir = h.path().join(".claude/skills/quome/.claude-plugin");
+        std::fs::create_dir_all(&pdir).unwrap();
+        std::os::unix::fs::symlink(&target, pdir.join("plugin.json")).unwrap();
+        let r = sync_skills_with(
+            &api,
+            h.path(),
+            &ClientId::ALL,
+            &none,
+            SyncOpts::explicit("p"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
+        assert!(r.warnings.len() >= 2, "{:?}", r.warnings);
+    }
+
+    #[tokio::test]
+    async fn background_sync_survives_server_errors_and_unreachable_hosts() {
+        let (s, api) = setup().await;
+        let h = home_with(&[".codex"]);
+        let a = h.path().join(".agents/skills");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::write(a.join(MANIFEST), r#"{"catalog_hash":"x","names":[]}"#).unwrap();
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v1/orgs/{ORG}/agent-playbooks")))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&s)
+            .await;
+        // Returns () without panicking; nothing is written.
+        background_sync(&api, h.path(), "p").await;
+        assert_eq!(
+            std::fs::read_to_string(a.join(MANIFEST)).unwrap(),
+            r#"{"catalog_hash":"x","names":[]}"#
+        );
+        drop(s);
+        background_sync(&api, h.path(), "p").await;
+        assert_eq!(std::fs::read_dir(&a).unwrap().count(), 1);
     }
 
     #[tokio::test]
