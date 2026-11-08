@@ -1,10 +1,12 @@
 //! Quome Cloud API client: bearer-authenticated calls under `<api_url>/api/v1`.
 use super::auth::{TokenSource, CONNECT_TIMEOUT, REQUEST_TIMEOUT};
+use super::playbooks::Playbook;
 use super::state::Profile;
 use crate::errors::QuomeError;
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use reqwest::{Method, RequestBuilder, Response};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
@@ -615,6 +617,17 @@ fn map_error(status: u16, text: &str) -> QuomeError {
     }
 }
 
+/// `map_error`, with a user-facing message for an unknown playbook.
+fn map_playbook_error(status: u16, text: &str) -> QuomeError {
+    match map_error(status, text) {
+        QuomeError::NotFound(r) if r == "playbook_unknown" => QuomeError::NotFound(
+            "playbook_unknown: no playbook has that name; list the available playbooks first"
+                .into(),
+        ),
+        e => e,
+    }
+}
+
 async fn check(resp: Response, map: fn(u16, &str) -> QuomeError) -> Result<Response, QuomeError> {
     let status = resp.status();
     if status.is_success() {
@@ -786,6 +799,32 @@ impl CloudApi {
     pub async fn agent_guide(&self) -> Result<String, QuomeError> {
         let p = self.org_path("/agent-guide");
         Ok(self.send(Method::GET, &p, |b| b).await?.text().await?)
+    }
+
+    /// Playbooks usable with the given MCP tool names, sorted by area and name.
+    pub async fn agent_playbooks(&self, tools: &[&str]) -> Result<Vec<Playbook>, QuomeError> {
+        let p = self.org_path("/agent-playbooks");
+        let tools = tools.join(",");
+        self.json(Method::GET, &p, |b| b.query(&[("tools", tools.as_str())]))
+            .await
+    }
+
+    /// The rendered text of one playbook for the given arguments.
+    pub async fn render_playbook(
+        &self,
+        name: &str,
+        args: &BTreeMap<String, String>,
+    ) -> Result<String, QuomeError> {
+        #[derive(Deserialize)]
+        struct Rendered {
+            text: String,
+        }
+        let p = self.org_path(&format!("/agent-playbooks/{}/render", enc(name)));
+        let body = serde_json::json!({ "arguments": args });
+        let r = self
+            .send_mapping(Method::POST, &p, |b| b.json(&body), map_playbook_error)
+            .await?;
+        Ok(r.json::<Rendered>().await?.text)
     }
 
     pub async fn list_sandboxes(&self) -> Result<Vec<Sandbox>, QuomeError> {
