@@ -82,7 +82,19 @@ impl LocalScope {
 
         let roots: Vec<PathBuf> = match client_roots {
             Some(r) => r.iter().filter_map(|p| canonical(p)).collect(),
-            None => self.start_dir.iter().filter_map(|p| canonical(p)).collect(),
+            None => {
+                let start: Vec<PathBuf> =
+                    self.start_dir.iter().filter_map(|p| canonical(p)).collect();
+                if start.iter().any(|d| self.is_too_broad(d)) {
+                    return Err(format!(
+                        "Refusing to read {folder:?}: the MCP server was started in the home \
+                         folder (or above it), so there is no project folder to read from. \
+                         Start your agent from the project folder, or let your client share \
+                         its workspace roots, and try again."
+                    ));
+                }
+                start
+            }
         };
         if roots.iter().any(|r| canon.starts_with(r)) {
             return Ok(canon);
@@ -106,6 +118,19 @@ impl LocalScope {
              Use a folder inside it, or ask the user to open that folder as the project \
              (or add it as a workspace root) and try again."
         ))
+    }
+}
+
+impl LocalScope {
+    /// A start directory that is the filesystem root, the home folder or one
+    /// of its parents gives no project boundary.
+    fn is_too_broad(&self, dir: &Path) -> bool {
+        dir.parent().is_none()
+            || self
+                .home
+                .as_deref()
+                .and_then(canonical)
+                .is_some_and(|home| home.starts_with(dir))
     }
 }
 
@@ -224,11 +249,52 @@ mod tests {
     fn home_and_its_parents_are_refused_even_inside_a_root() {
         let f = fixture();
         let root = f.home.parent().unwrap().to_path_buf();
-        let scope = LocalScope::new(Some(root.clone()), Some(f.home.clone()));
+        let scope = LocalScope::new(Some(f.project.clone()), Some(f.home.clone()));
+        let roots = vec![root.clone()];
         for p in [&f.home, &root] {
-            let e = scope.check(s(p), None).unwrap_err();
-            assert!(e.contains("home folder"), "{e}");
+            let e = scope.check(s(p), Some(&roots)).unwrap_err();
+            assert!(e.contains("is the home folder or contains it"), "{e}");
         }
+    }
+
+    #[test]
+    fn a_start_dir_of_home_gives_no_project_root() {
+        let f = fixture();
+        let scope = LocalScope::new(Some(f.home.clone()), Some(f.home.clone()));
+        let e = scope.check(s(&f.project), None).unwrap_err();
+        assert!(
+            e.contains("Start your agent from the project folder"),
+            "{e}"
+        );
+        // Workspace roots from the client still work.
+        let roots = vec![f.project.clone()];
+        assert!(scope.check(s(&f.project), Some(&roots)).is_ok());
+    }
+
+    #[test]
+    fn a_start_dir_above_home_or_at_the_filesystem_root_gives_no_project_root() {
+        let f = fixture();
+        let above = f.home.parent().unwrap().to_path_buf();
+        for start in [above, PathBuf::from("/")] {
+            let scope = LocalScope::new(Some(start.clone()), Some(f.home.clone()));
+            let e = scope.check(s(&f.project), None).unwrap_err();
+            assert!(
+                e.contains("let your client share its workspace roots"),
+                "{start:?}: {e}"
+            );
+        }
+        // Without a known home, `/` alone is still refused.
+        let scope = LocalScope::new(Some(PathBuf::from("/")), None);
+        let e = scope.check(s(&f.project), None).unwrap_err();
+        assert!(e.contains("Start your agent"), "{e}");
+    }
+
+    #[test]
+    fn a_start_dir_inside_home_keeps_its_subtree() {
+        let f = fixture();
+        let code = f.home.join("code");
+        let scope = LocalScope::new(Some(code), Some(f.home.clone()));
+        assert!(scope.check(s(&f.project), None).is_ok());
     }
 
     #[test]
@@ -240,7 +306,8 @@ mod tests {
             assert!(e.contains("credential location"), "{rel}: {e}");
         }
         // The project under the same root is still fine.
-        assert!(scope.check(s(&f.project), None).is_ok());
+        let roots = vec![f.home.clone()];
+        assert!(scope.check(s(&f.project), Some(&roots)).is_ok());
     }
 
     #[cfg(unix)]

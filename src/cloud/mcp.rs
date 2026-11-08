@@ -4828,6 +4828,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_folder_refuses_when_started_in_home_or_the_filesystem_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().canonicalize().unwrap().join("home");
+        let project = home.join("app");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("a.txt"), "a").unwrap();
+        for start in [home.clone(), std::path::PathBuf::from("/")] {
+            let (s, mut c) = scoped_client(&start, &home, None).await;
+            let (err, text) = c
+                .call("sync_folder", json!({"sandbox": SB, "folder": project}))
+                .await;
+            assert!(err, "{start:?}: {text}");
+            assert!(
+                text.contains("Start your agent from the project folder"),
+                "{start:?}: {text}"
+            );
+            assert!(s.received_requests().await.unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn sync_folder_uses_the_client_roots_when_given() {
         use wiremock::matchers::query_param;
         let tmp = tempfile::tempdir().unwrap();
