@@ -8,6 +8,7 @@ pub mod auth_instance;
 pub mod email;
 pub mod git;
 pub mod keys;
+pub mod local_scope;
 pub mod loopback;
 pub mod mcp;
 pub mod pack;
