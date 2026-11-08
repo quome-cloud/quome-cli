@@ -341,7 +341,7 @@ When a call fails, the tool says what to do:
 | `database_deleting`, `not_running` | The database is being deleted, or is not running. |
 | `database` (404) | No such database; check its name or id. |
 | other 404 `not_...` | This database type does not support agent branches. |
-| `invalid_intent`, `invalid_question`, `invalid_message` | The text must be plain text. |
+| `invalid_intent`, `invalid_question`, `invalid_message`, `invalid_sql` | The text must be plain text (for `database_query`, one SQL statement). |
 | `invalid_text` | Search text may not contain a backslash or a NUL character. |
 | `invalid_vector`, `invalid_identifier`, `invalid_metric`, `invalid_k`, `text_too_long`, `exactly_one_of_text_or_vector` | The search arguments are not valid: give exactly one of `text` or `vector`, `metric` is `l2`, `cosine` or `inner_product`, `k` is 1 to 100. |
 | `search_failed` | The search could not be completed. |
