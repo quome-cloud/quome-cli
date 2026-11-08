@@ -270,10 +270,35 @@ pub struct GitClient {
 }
 
 /// One call's budget for waiting out a start-up.
-struct Patience<'a> {
+pub(super) struct Patience<'a> {
     deadline: tokio::time::Instant,
     cap: Duration,
     w: &'a dyn Waiting,
+}
+
+impl<'a> Patience<'a> {
+    pub(super) fn new(wait: Duration, cap: Duration, w: &'a dyn Waiting) -> Self {
+        Patience {
+            deadline: tokio::time::Instant::now() + wait,
+            cap,
+            w,
+        }
+    }
+
+    /// Tell the waiter `message` and sleep for `hint` (or the default pause),
+    /// bounded by the cap and the time left. False when no time was left.
+    pub(super) async fn nap(&self, hint: Option<Duration>, message: &str) -> bool {
+        let left = self
+            .deadline
+            .saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        let pause = hint.unwrap_or(DEFAULT_PAUSE).min(self.cap).min(left);
+        self.w.note(message).await;
+        tokio::time::sleep(pause).await;
+        true
+    }
 }
 
 impl Patience<'_> {
@@ -283,20 +308,14 @@ impl Patience<'_> {
         if !e.is_starting() {
             return Err(e);
         }
-        let left = self
-            .deadline
-            .saturating_duration_since(tokio::time::Instant::now());
-        if left.is_zero() {
-            return Err(GitError::Usage(STILL_STARTING.into()));
+        if self
+            .nap(e.retry_after(), "Your Git server is starting")
+            .await
+        {
+            Ok(())
+        } else {
+            Err(GitError::Usage(STILL_STARTING.into()))
         }
-        let pause = e
-            .retry_after()
-            .unwrap_or(DEFAULT_PAUSE)
-            .min(self.cap)
-            .min(left);
-        self.w.note("Your Git server is starting").await;
-        tokio::time::sleep(pause).await;
-        Ok(())
     }
 }
 
@@ -342,11 +361,7 @@ impl GitClient {
     }
 
     fn patience<'a>(&self, w: &'a dyn Waiting) -> Patience<'a> {
-        Patience {
-            deadline: tokio::time::Instant::now() + self.timing.wait,
-            cap: self.timing.retry_cap,
-            w,
-        }
+        Patience::new(self.timing.wait, self.timing.retry_cap, w)
     }
 
     /// Run a platform call, waiting while the git server starts.

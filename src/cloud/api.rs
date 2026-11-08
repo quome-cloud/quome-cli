@@ -122,6 +122,32 @@ impl std::fmt::Debug for GitToken {
     }
 }
 
+/// A short-lived token for the org's credentials service, brokered by the
+/// platform, with the service's base URL (service paths are appended to it).
+#[derive(Clone, Deserialize, PartialEq)]
+pub struct CredentialsToken {
+    pub access_token: String,
+    /// Seconds; a missing or null value means "do not cache".
+    #[serde(default, deserialize_with = "seconds_or_zero")]
+    pub expires_in: u64,
+    pub url: String,
+}
+
+fn seconds_or_zero<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+    Ok(Option::<u64>::deserialize(d)?.unwrap_or(0))
+}
+
+/// Never prints the token itself.
+impl std::fmt::Debug for CredentialsToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CredentialsToken")
+            .field("access_token", &"<redacted>")
+            .field("expires_in", &self.expires_in)
+            .field("url", &self.url)
+            .finish()
+    }
+}
+
 /// A repository on the org's git server.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct GitRepo {
@@ -1244,6 +1270,46 @@ impl CloudApi {
         let body = serde_json::json!({ "scope": scope });
         self.send_git(Method::POST, &self.org_path("/git/token"), |b| {
             b.json(&body)
+        })
+        .await
+    }
+
+    /// A token for the org's credentials service with `scope`.
+    pub async fn credentials_token(&self, scope: &[&str]) -> Result<CredentialsToken, QuomeError> {
+        let body = serde_json::json!({ "scope": scope });
+        self.send_git(Method::POST, &self.org_path("/credentials/token"), |b| {
+            b.json(&body)
+        })
+        .await
+    }
+
+    /// The org's credential providers, as the platform sends them.
+    pub async fn credential_providers(&self) -> Result<serde_json::Value, QuomeError> {
+        self.send_git(Method::GET, &self.org_path("/credentials/providers"), |b| b)
+            .await
+    }
+
+    /// Create or replace provider `id`; `kind` is the provider's kind object
+    /// and `secret_name` names the Secrets entry holding its credential.
+    pub async fn put_credential_provider(
+        &self,
+        id: &str,
+        kind: &serde_json::Value,
+        secret_name: Option<&str>,
+    ) -> Result<serde_json::Value, QuomeError> {
+        let body = serde_json::json!({ "kind": kind, "secret_name": secret_name });
+        let p = self.org_path(&format!("/credentials/providers/{}", enc(id)));
+        self.send_git(Method::PUT, &p, |b| b.json(&body)).await
+    }
+
+    /// Ask a person to provide a credential; `body` holds `provider_id`, `kind`,
+    /// `secret_name`, `instructions` and `recipient_email`.
+    pub async fn create_credential_request(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, QuomeError> {
+        self.send_git(Method::POST, &self.org_path("/credentials/requests"), |b| {
+            b.json(body)
         })
         .await
     }
@@ -2774,6 +2840,59 @@ mod tests {
         let t = api.git_token(&["repos_read", "repos_write"]).await.unwrap();
         assert_eq!((t.access_token.as_str(), t.expires_in), ("G1", 300));
         assert!(!format!("{t:?}").contains("G1"));
+    }
+
+    #[tokio::test]
+    async fn credentials_token_tolerates_null_expiry_and_redacts() {
+        let (s, api) = setup().await;
+        Mock::given(method("POST"))
+            .and(path(format!("/api/v1/orgs/{ORG}/credentials/token")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "SECRET1", "expires_in": null, "url": "https://x.test/acme"
+            })))
+            .mount(&s)
+            .await;
+        let t = api.credentials_token(&["credentials_use"]).await.unwrap();
+        assert_eq!((t.expires_in, t.url.as_str()), (0, "https://x.test/acme"));
+        assert!(!format!("{t:?}").contains("SECRET1"));
+    }
+
+    #[tokio::test]
+    async fn provider_routes_and_bodies() {
+        let (s, api) = setup().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v1/orgs/{ORG}/credentials/providers")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(1)
+            .mount(&s)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(format!(
+                "/api/v1/orgs/{ORG}/credentials/providers/my%20id"
+            )))
+            .and(wiremock::matchers::body_json(
+                serde_json::json!({"kind": {"type": "bearer"}, "secret_name": null}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&s)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/api/v1/orgs/{ORG}/credentials/requests")))
+            .and(wiremock::matchers::body_json(
+                serde_json::json!({"provider_id": "p"}),
+            ))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&s)
+            .await;
+        api.credential_providers().await.unwrap();
+        api.put_credential_provider("my id", &serde_json::json!({"type": "bearer"}), None)
+            .await
+            .unwrap();
+        api.create_credential_request(&serde_json::json!({"provider_id": "p"}))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

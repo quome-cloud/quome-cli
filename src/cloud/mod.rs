@@ -6,6 +6,7 @@ pub mod api;
 pub mod auth;
 pub mod auth_instance;
 pub mod clients;
+pub mod credentials;
 pub mod email;
 pub mod git;
 pub mod keys;
