@@ -30,7 +30,7 @@ Reports go to `target/evals-report.html` and `target/evals-results/`.
 
 ## Cases
 
-- `playbook-<name>`: one for each of the 24 playbooks. The prompt asks Claude to
+- `playbook-<name>`: one for each of the 28 playbooks. The prompt asks Claude to
   fetch the playbook by name with the `playbook` tool and report its first
   step. Graders check the tool was called with that name and that the answer
   reflects the rendered steps. These work while the playbooks are unlisted.
@@ -42,5 +42,5 @@ Reports go to `target/evals-report.html` and `target/evals-results/`.
   `with-only`, so it is shown as a plugin-fired indicator rather than scored in
   the baseline comparison.
 
-General playbooks (`sandboxes`, `apps`, `auth`, `email`, `caches`, `git`) take a
+General playbooks (`sandboxes`, `apps`, `auth`, `email`, `caches`, `git`, `credentials`) take a
 required `what`; the cases pass one.
