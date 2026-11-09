@@ -608,6 +608,20 @@ fn use_backend(e: &QuomeError) -> Option<String> {
     ok.then(|| b.to_string())
 }
 
+/// The JSON object a gateway result carries: its structured content, else the
+/// first text content that parses as JSON.
+fn gateway_body(r: &rmcp::model::CallToolResult) -> Option<serde_json::Value> {
+    r.structured_content
+        .clone()
+        .or_else(|| {
+            r.content.iter().find_map(|c| {
+                c.as_text()
+                    .and_then(|t| serde_json::from_str::<serde_json::Value>(&t.text).ok())
+            })
+        })
+        .filter(|v| v.is_object())
+}
+
 /// An app slug that may be sent to the gateway as `app:<slug>`.
 fn valid_app_slug(slug: &str) -> bool {
     let mut cs = slug.chars();
@@ -1515,10 +1529,15 @@ impl QuomeMcp {
             .remove(app);
     }
 
-    /// If the gateway says it does not know the app's server, forget the
-    /// remembered backend so the next call tries the relay again.
-    fn forget_if_unknown_server(&self, app: &str, text: &str) {
-        if text.contains("unknown_server") {
+    /// If the gateway's refusal is the error code `server_unknown`, forget
+    /// the remembered backend so the next call tries the relay again. Only
+    /// the parsed code counts, never message text.
+    fn forget_if_unknown_server(&self, app: &str, r: &rmcp::model::CallToolResult) {
+        let body = gateway_body(r);
+        if body
+            .as_ref()
+            .is_some_and(|v| v["error"]["code"] == "server_unknown")
+        {
             self.forget_backend(app);
         }
     }
@@ -1560,7 +1579,7 @@ impl QuomeMcp {
             .map_err(|e| e.to_string())?;
         let text = json(&r)?;
         if r.is_error == Some(true) {
-            self.forget_if_unknown_server(app, &text);
+            self.forget_if_unknown_server(app, &r);
             Err(text)
         } else {
             Ok(text)
@@ -1584,22 +1603,12 @@ impl QuomeMcp {
             .map_err(|e| e.to_string())?;
         if r.is_error == Some(true) {
             let text = json(&r)?;
-            self.forget_if_unknown_server(app, &text);
+            self.forget_if_unknown_server(app, &r);
             return Err(text);
         }
-        let v = r
-            .structured_content
-            .clone()
-            .or_else(|| {
-                r.content.iter().find_map(|c| {
-                    c.as_text()
-                        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t.text).ok())
-                })
-            })
-            .filter(|v| v.is_object())
-            .ok_or_else(|| {
-                "The org's MCP gateway sent no description for that tool.".to_string()
-            })?;
+        let v = gateway_body(&r).ok_or_else(|| {
+            "The org's MCP gateway sent no description for that tool.".to_string()
+        })?;
         if let Some(h) = v["schema_hash"].as_str().filter(|h| !h.is_empty()) {
             self.app_hashes
                 .lock()
@@ -10962,7 +10971,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_server_answer_clears_remembered_backend() {
+    async fn server_unknown_answer_clears_remembered_backend() {
         let (s, mut c) = start().await;
         mount_find(
             &s,
@@ -10970,7 +10979,7 @@ mod tests {
         )
         .await;
         mount_gateway(&s, |_, _| {
-            json!({"content":[{"type":"text","text":"{\"error\":{\"code\":\"unknown_server\",\"message\":\"x\"}}"}],"isError":true})
+            json!({"content":[{"type":"text","text":"{\"error\":{\"code\":\"server_unknown\",\"message\":\"x\"}}"}],"isError":true})
         })
         .await;
         Mock::given(method("POST"))
@@ -10995,6 +11004,33 @@ mod tests {
             .await;
         assert!(!err);
         assert_eq!(relay_calls(&s).await, 1);
+    }
+
+    #[tokio::test]
+    async fn refusal_text_with_the_words_does_not_clear_backend() {
+        let (s, mut c) = start().await;
+        mount_find(
+            &s,
+            json!([{"app":"sales","tool":"t","summary":"s","destructive":false,"backend":"gateway"}]),
+        )
+        .await;
+        mount_gateway(&s, |_, _| {
+            json!({"content":[{"type":"text","text":"server_unknown is mentioned here"}],"isError":true,
+                   "structuredContent":{"error":{"code":"denied","message":"server_unknown unknown_server"}}})
+        })
+        .await;
+        c.call("find_app_tools", json!({})).await;
+        for _ in 0..2 {
+            let (err, _) = c
+                .call(
+                    "call_app_tool",
+                    json!({"app":"sales","tool":"t","arguments":{}}),
+                )
+                .await;
+            assert!(err);
+        }
+        assert_eq!(relay_calls(&s).await, 0);
+        assert_eq!(gateway_calls(&s).await.len(), 2);
     }
 
     #[tokio::test]
