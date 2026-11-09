@@ -40,9 +40,9 @@ Sandbox and app arguments marked "name or id" accept either. Email `address` arg
 | `install_app` | `app`, `confirm?` | Without `confirm: true`, previews the billing and changes nothing. With it, installs the app and waits (up to 10 minutes) until it runs; returns `status`, `url` and `next`. |
 | `list_installed_apps` | | Lists this org's installed apps and their status. |
 | `open_app` | `app` | Returns `{url}`, for an installed app, a link that opens it already signed in (no second login). |
-| `find_app_tools` | `query?`, `app?` | Searches the tools of installed apps and returns short hits. Apps' tools are never separate MCP servers, so this tool list stays fixed. |
-| `describe_app_tool` | `app`, `tool` | Shows one app tool's description and input schema. |
-| `call_app_tool` | `app`, `tool`, `arguments` | Calls an app tool; `arguments` go through unchanged. Destructive tools need an org owner or admin. |
+| `find_app_tools` | `query?`, `app?` | Searches the tools of installed apps and returns short hits; each hit has a `backend` (`relay`, or another value when the app is served through the org's MCP gateway). Apps' tools are never separate MCP servers, so this tool list stays fixed. |
+| `describe_app_tool` | `app`, `tool` | Shows one app tool's description and input schema (through the org's MCP gateway for apps it serves). |
+| `call_app_tool` | `app`, `tool`, `arguments` | Calls an app tool, through whichever backend serves its app; `arguments` go through unchanged. Destructive tools need an org owner or admin. |
 | `list_app_keys` | `app` | Lists the keys an app can use and whether each is set (never the values). |
 | `set_app_key` | `app`, `key`, `value` | Sets an app key. Write-only: the value is never returned or echoed. Needs an org owner or admin, and the "Store secrets" permission (`quome connect`). The result says whether the app is picking the key up (`delivering`). |
 | `uninstall_app` | `app`, `confirm?` | Without `confirm: true`, previews. With it, removes the app's service; its data is kept. |

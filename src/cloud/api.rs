@@ -379,6 +379,10 @@ pub struct ToolHit {
     pub tool: String,
     pub summary: String,
     pub destructive: bool,
+    /// Which backend serves the app: `relay`, or another value for the org's
+    /// MCP gateway. Absent from older servers, which means the relay.
+    #[serde(default)]
+    pub backend: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -2504,6 +2508,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.results[0].tool, "send_email");
+        assert_eq!(r.results[0].backend, None);
+    }
+
+    #[test]
+    fn tool_hit_reads_backend() {
+        let h: ToolHit = serde_json::from_value(serde_json::json!(
+            {"app":"a","tool":"t","summary":"s","destructive":false,"backend":"gateway"}
+        ))
+        .unwrap();
+        assert_eq!(h.backend.as_deref(), Some("gateway"));
     }
 
     #[tokio::test]
