@@ -3148,7 +3148,7 @@ impl QuomeMcp {
     }
 
     #[tool(
-        description = "Change a deployed app's settings by name: its size (memory_gb, cpus), whether it sleeps when idle (sleep_after_minutes) or stays always on (always_on: true), and automatic deploys on each push to a branch of a repo in the org's Git (auto_deploy: true with repo and ref; false turns them off). Give at least one setting; the others stay as they are. Apps bill by memory size and the hours they run, so have the person's agreement before making an app larger. A new size is only saved: it applies on the app's next start (a restart, a deploy or a wake from sleep), not to the running app. Returns the settings as they now are and which ones this call changed."
+        description = "Change a deployed app's settings by name: its size (memory_gb, cpus), whether it sleeps when idle (sleep_after_minutes) or stays always on (always_on: true), and automatic deploys on each push to a branch of a repo in the org's Git (auto_deploy: true with repo and ref; false turns them off). Give at least one setting; the others stay as they are. Apps bill by memory size and the hours they run, so have the person's agreement before making an app larger or always on. A new size is only saved: it applies on the app's next start (a restart, a deploy or a wake from sleep), not to the running app. Returns the settings as they now are and which ones this call changed."
     )]
     async fn update_app(&self, Parameters(a): Parameters<UpdateAppArgs>) -> Result<String, String> {
         let (settings, auto) = a.changes()?;

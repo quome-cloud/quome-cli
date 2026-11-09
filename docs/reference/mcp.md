@@ -134,7 +134,7 @@ To remove a deployed app, call `delete_app` with its name; it previews first and
 
 Leaving `sleep_after_minutes` out (or sending `null`) leaves sleeping as it is; it never means always on, which is `always_on: true`.
 
-**Size and billing.** Apps bill by memory size and the hours they run, so the agent is told to have the person's agreement before making an app larger. A new size is only saved: it takes effect the next time the app starts (a restart, a deploy or a wake from sleep), and the running app keeps its old size until then. The result's `note` says so whenever `memory_gb` or `cpus` changed.
+**Size and billing.** Apps bill by memory size and the hours they run, so the agent is told to have the person's agreement before making an app larger or always on. A new size is only saved: it takes effect the next time the app starts (a restart, a deploy or a wake from sleep), and the running app keeps its old size until then. The result's `note` says so whenever `memory_gb` or `cpus` changed.
 
 The result gives the settings as they now are, `name`, `id`, `memory_gb`, `cpus`, `sleep_after_minutes` (`null` when the app is always on), `always_on` and `auto_deploy` (`{repo, ref}`, or `null` when off), and `changed`, the settings this call set.
 
