@@ -927,7 +927,7 @@ pub struct CredentialsGitUrlArgs {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CredentialsProvidersArgs {
-    /// Create or replace a provider. Not with request.
+    /// Create a new provider; a person changes an existing one in the console. Not with request.
     set: Option<CredentialsProviderSet>,
     /// Ask a person to put a credential in Secrets. Not with set.
     request: Option<CredentialsProviderRequest>,
@@ -3423,7 +3423,7 @@ impl QuomeMcp {
     }
 
     #[tool(
-        description = "Create or replace a grant: who (subject: {agent, user} where user is a user id or `*` for any user, or {app}) may use which routes, with optional git rules (repos, push_branches, pr_only, force_push, delete_branch, tags) and ttl_days (1 to 365), and optional caps (a JSON object). A write replaces the whole grant, so anything you do not send, including caps, is cleared. Needs Credentials admin access. Changes by an agent may wait for a person's approval, and deleting stays in the console.",
+        description = "Create or replace a grant: who (subject: {agent, user} where user is a user id or `*` for any user, or {app}) may use which routes, with optional git rules (repos, push_branches, pr_only, force_push, delete_branch, tags) and ttl_days (1 to 365), and optional caps (a JSON object). A write replaces the whole grant, so anything you do not send, including caps, is cleared. A change refused within the last hour answers with state cooldown and retry_in_minutes. Needs Credentials admin access. Changes by an agent may wait for a person's approval, and deleting stays in the console.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     async fn credentials_grant(
