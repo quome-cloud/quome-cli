@@ -8,6 +8,7 @@ pub mod auth_instance;
 pub mod clients;
 pub mod credentials;
 pub mod email;
+pub mod gateway;
 pub mod git;
 pub mod keys;
 pub mod local_scope;
