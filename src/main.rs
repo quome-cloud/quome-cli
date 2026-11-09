@@ -1,4 +1,5 @@
 mod api;
+mod auto_update;
 mod client;
 mod cloud;
 mod commands;
@@ -112,11 +113,36 @@ enum Commands {
     GitCredential(commands::git_credential::Args),
     /// Upgrade quome to the latest version
     Upgrade,
+    /// The daily background update check (internal)
+    #[command(name = "__auto-update", hide = true)]
+    AutoUpdate,
+}
+
+impl Commands {
+    /// `git-credential` runs inside git and `upgrade` already updates.
+    fn starts_update_check(&self) -> bool {
+        !matches!(
+            self,
+            Commands::GitCredential(_) | Commands::Upgrade | Commands::AutoUpdate
+        )
+    }
+
+    /// `mcp` and `git-credential` are read by programs, so they never print the update line.
+    fn shows_update_notice(&self) -> bool {
+        !matches!(
+            self,
+            Commands::Mcp(_) | Commands::GitCredential(_) | Commands::AutoUpdate
+        )
+    }
 }
 
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    let shows_update_notice = cli.command.shows_update_notice();
+    if cli.command.starts_update_check() {
+        auto_update::start_background_check();
+    }
 
     let result = match cli.command {
         Commands::Login(args) => commands::login::execute(args).await,
@@ -142,10 +168,57 @@ async fn main() {
         Commands::Cloud { command } => commands::cloud::execute(command).await,
         Commands::GitCredential(args) => commands::git_credential::execute(args).await,
         Commands::Upgrade => commands::upgrade::execute().await,
+        Commands::AutoUpdate => {
+            auto_update::run().await;
+            Ok(())
+        }
     };
+
+    if shows_update_notice {
+        auto_update::print_notice();
+    }
 
     if let Err(e) = result {
         eprintln!("{} {}", "error:".red().bold(), e);
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn command(args: &[&str]) -> Commands {
+        let mut argv = vec!["quome"];
+        argv.extend_from_slice(args);
+        Cli::try_parse_from(argv).unwrap().command
+    }
+
+    #[test]
+    fn mcp_checks_for_updates_but_never_prints_the_notice() {
+        let mcp = command(&["mcp"]);
+        assert!(mcp.starts_update_check());
+        assert!(!mcp.shows_update_notice());
+    }
+
+    #[test]
+    fn git_credential_stays_out_of_updates() {
+        let git = command(&["git-credential", "get"]);
+        assert!(!git.starts_update_check());
+        assert!(!git.shows_update_notice());
+    }
+
+    #[test]
+    fn the_background_check_cannot_start_itself() {
+        let check = command(&[auto_update::SUBCOMMAND]);
+        assert!(!check.starts_update_check());
+        assert!(!check.shows_update_notice());
+    }
+
+    #[test]
+    fn an_ordinary_command_checks_and_can_show_the_notice() {
+        let whoami = command(&["whoami"]);
+        assert!(whoami.starts_update_check());
+        assert!(whoami.shows_update_notice());
     }
 }
