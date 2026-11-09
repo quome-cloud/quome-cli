@@ -91,7 +91,7 @@ Full walkthrough with expected output: **[Getting started](docs/getting-started.
 | `quome events` | Organization audit trail (dashboard-only for API keys) | [Events](docs/reference/events.md) |
 | `quome fn …` | Functions-as-a-service: Python compiled to WebAssembly, run from a warm sandbox pool | [Functions](docs/reference/functions.md) |
 | `quome host …` | Run a sandbox host on your own computer | [Host](docs/reference/host.md) |
-| `quome upgrade` | Self-update via Homebrew | [Upgrade](docs/reference/upgrade.md) |
+| `quome upgrade` | Upgrade now via Homebrew (updates also install automatically) | [Upgrade](docs/reference/upgrade.md) |
 | `quome connect` | **Quome Cloud:** connect this computer and register it with Claude Code | [Connect](docs/reference/connect.md) |
 | `quome mcp` | **Quome Cloud:** MCP server (sandboxes, previews, app deploys, one-click apps, email inboxes, auth, Git, cache pods, database branches) for Claude Code | [MCP](docs/reference/mcp.md) |
 | `quome cloud status` / `disconnect` | **Quome Cloud:** check or drop the connection | [Cloud](docs/reference/cloud.md) |
