@@ -15,6 +15,14 @@ pub const UPLOAD_CHUNK: usize = 8 * 1024 * 1024;
 /// Largest exec timeout the CLI sends (the edge cuts requests at 30 s).
 pub const MAX_EXEC_TIMEOUT: u32 = 25;
 pub const MEMORY_SIZES: [f64; 8] = [0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0];
+/// The CPU counts an app can have; each CPU needs `MIN_GB_PER_CPU` of memory.
+pub const CPU_SIZES: [u32; 5] = [1, 2, 4, 8, 16];
+pub const MIN_GB_PER_CPU: f64 = 0.5;
+/// How many idle minutes an app can be set to sleep after.
+pub const SLEEP_MINUTES: std::ops::RangeInclusive<u32> = 5..=1440;
+pub const MEMORY_RULE: &str = "Memory must be one of 0.5, 1, 2, 4, 8, 16, 32, 64 (GB).";
+pub const SLEEP_RULE: &str = "sleep_after_minutes must be 5 to 1440; to keep the app always on, \
+                              give always_on: true instead.";
 pub const RUNTIMES: [&str; 4] = ["claude", "codex", "opencode", "antigravity"];
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -271,6 +279,94 @@ pub struct Service {
     pub status: String,
     #[serde(default)]
     pub created_at: Option<String>,
+    #[serde(default)]
+    pub cpus: Option<f64>,
+    /// Idle minutes before an app sleeps; `None` for an app that is always on.
+    #[serde(default)]
+    pub sleep_after_minutes: Option<u32>,
+    /// Set while pushes to a branch deploy the app.
+    #[serde(default)]
+    pub auto_deploy: Option<AutoDeploy>,
+}
+
+/// The repo (`<org>/<name>`) and branch whose pushes deploy an app.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct AutoDeploy {
+    pub repo: String,
+    #[serde(rename = "ref")]
+    pub git_ref: String,
+}
+
+/// Changes to an app's settings; what is `None` stays as it is.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AppSettings {
+    pub memory_gb: Option<f64>,
+    /// Without it, a new `memory_gb` also sets the CPU count that goes with it.
+    pub cpus: Option<u32>,
+    /// `Some(Some(n))`: sleep after `n` idle minutes. `Some(None)`: always on.
+    pub sleep_after_minutes: Option<Option<u32>>,
+}
+
+impl AppSettings {
+    pub fn is_empty(&self) -> bool {
+        *self == AppSettings::default()
+    }
+
+    /// True when the app's size would change (it applies on the app's next start).
+    pub fn resizes(&self) -> bool {
+        self.memory_gb.is_some() || self.cpus.is_some()
+    }
+
+    /// What can be refused without asking the API.
+    pub fn check(&self) -> Result<(), QuomeError> {
+        if self.is_empty() {
+            return Err(QuomeError::Usage(
+                "Nothing to change: no setting was given.".into(),
+            ));
+        }
+        if self.memory_gb.is_some_and(|m| !MEMORY_SIZES.contains(&m)) {
+            return Err(QuomeError::Usage(MEMORY_RULE.into()));
+        }
+        if self.cpus.is_some_and(|c| !CPU_SIZES.contains(&c)) {
+            return Err(QuomeError::Usage(
+                "cpus must be one of 1, 2, 4, 8, 16.".into(),
+            ));
+        }
+        if let (Some(cpus), Some(memory_gb)) = (self.cpus, self.memory_gb) {
+            check_cpus_fit(cpus, memory_gb)?;
+        }
+        if matches!(self.sleep_after_minutes, Some(Some(n)) if !SLEEP_MINUTES.contains(&n)) {
+            return Err(QuomeError::Usage(SLEEP_RULE.into()));
+        }
+        Ok(())
+    }
+
+    fn body(&self) -> serde_json::Value {
+        let mut body = serde_json::json!({});
+        if let Some(m) = self.memory_gb {
+            body["memory_gb"] = m.into();
+        }
+        if let Some(c) = self.cpus {
+            body["cpus"] = c.into();
+        }
+        // The API tells an explicit null (always on) from a field left out.
+        if let Some(sleep) = self.sleep_after_minutes {
+            body["sleep_after_minutes"] = sleep.into();
+        }
+        body
+    }
+}
+
+/// Refuse `cpus` that `memory_gb` cannot carry.
+pub fn check_cpus_fit(cpus: u32, memory_gb: f64) -> Result<(), QuomeError> {
+    let need = f64::from(cpus) * MIN_GB_PER_CPU;
+    if memory_gb < need {
+        return Err(QuomeError::Usage(format!(
+            "{cpus} CPUs need at least {need} GB of memory (0.5 GB per CPU); give a larger \
+             memory_gb or fewer cpus."
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -622,9 +718,7 @@ fn check_name_size(name: &str, memory_gb: f64) -> Result<(), QuomeError> {
         ));
     }
     if !MEMORY_SIZES.contains(&memory_gb) {
-        return Err(QuomeError::Usage(
-            "Memory must be one of 0.5, 1, 2, 4, 8, 16, 32, 64 (GB).".into(),
-        ));
+        return Err(QuomeError::Usage(MEMORY_RULE.into()));
     }
     Ok(())
 }
@@ -1075,6 +1169,39 @@ impl CloudApi {
     pub async fn delete_service(&self, id: &str) -> Result<Service, QuomeError> {
         let p = self.org_path(&format!("/services/{}", enc(id)));
         self.json(Method::DELETE, &p, |b| b).await
+    }
+
+    /// Change an app's settings; answers the service as it now is. A new
+    /// size is only recorded: it applies on the app's next start.
+    pub async fn update_service(
+        &self,
+        id: &str,
+        settings: &AppSettings,
+    ) -> Result<Service, QuomeError> {
+        settings.check()?;
+        let p = self.org_path(&format!("/services/{}", enc(id)));
+        let body = settings.body();
+        self.json(Method::PATCH, &p, |b| b.json(&body)).await
+    }
+
+    /// Deploy the app on each push to branch `git_ref` of `repo` (`<name>` or
+    /// `<org>/<name>` in the org's Git).
+    pub async fn set_auto_deploy(
+        &self,
+        app_id: &str,
+        repo: &str,
+        git_ref: &str,
+    ) -> Result<AutoDeploy, QuomeError> {
+        let p = self.org_path(&format!("/apps/{}/auto-deploy", enc(app_id)));
+        let body = serde_json::json!({"repo": repo, "ref": git_ref});
+        self.json(Method::PUT, &p, |b| b.json(&body)).await
+    }
+
+    /// Stop deploying the app on pushes (idempotent).
+    pub async fn clear_auto_deploy(&self, app_id: &str) -> Result<(), QuomeError> {
+        let p = self.org_path(&format!("/apps/{}/auto-deploy", enc(app_id)));
+        self.send(Method::DELETE, &p, |b| b).await?;
+        Ok(())
     }
 
     pub async fn app_catalog(&self) -> Result<Vec<CatalogApp>, QuomeError> {
@@ -2203,6 +2330,120 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&dep.body).unwrap(),
             serde_json::json!({"source_key":"k.tar"})
         );
+    }
+
+    fn service_json() -> serde_json::Value {
+        serde_json::json!({"id":"a1","kind":"app","name":"web","memory_gb":2.0,"cpus":1,
+            "status":"running","sleep_after_minutes":null,
+            "auto_deploy":{"repo":"acme/site","ref":"main","pending_sha":null}})
+    }
+
+    #[tokio::test]
+    async fn update_service_sends_only_what_is_set_and_null_for_always_on() {
+        let (s, api) = setup().await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("/api/v1/orgs/{ORG}/services/a1")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(service_json()))
+            .mount(&s)
+            .await;
+        let size = AppSettings {
+            memory_gb: Some(2.0),
+            ..Default::default()
+        };
+        let always_on = AppSettings {
+            sleep_after_minutes: Some(None),
+            ..Default::default()
+        };
+        let all = AppSettings {
+            memory_gb: Some(4.0),
+            cpus: Some(2),
+            sleep_after_minutes: Some(Some(30)),
+        };
+        let svc = api.update_service("a1", &size).await.unwrap();
+        assert_eq!(svc.cpus, Some(1.0));
+        assert_eq!(svc.sleep_after_minutes, None);
+        let auto = svc.auto_deploy.unwrap();
+        assert_eq!(
+            (auto.repo.as_str(), auto.git_ref.as_str()),
+            ("acme/site", "main")
+        );
+        api.update_service("a1", &always_on).await.unwrap();
+        api.update_service("a1", &all).await.unwrap();
+        let bodies: Vec<String> = s
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.method.as_str() == "PATCH")
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        assert_eq!(
+            bodies,
+            [
+                r#"{"memory_gb":2.0}"#,
+                r#"{"sleep_after_minutes":null}"#,
+                r#"{"memory_gb":4.0,"cpus":2,"sleep_after_minutes":30}"#,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn update_service_validates_locally() {
+        let (s, api) = setup().await;
+        let set = |memory_gb, cpus, sleep| AppSettings {
+            memory_gb,
+            cpus,
+            sleep_after_minutes: sleep,
+        };
+        for (settings, want) in [
+            (set(None, None, None), "Nothing to change"),
+            (set(Some(3.0), None, None), "0.5, 1, 2, 4, 8, 16, 32, 64"),
+            (set(None, Some(3), None), "1, 2, 4, 8, 16"),
+            (set(Some(1.0), Some(4), None), "at least 2 GB"),
+            (set(None, None, Some(Some(4))), "5 to 1440"),
+            (set(None, None, Some(Some(1441))), "5 to 1440"),
+        ] {
+            let e = api.update_service("a1", &settings).await.unwrap_err();
+            assert!(matches!(e, QuomeError::Usage(_)), "{e:?}");
+            assert!(e.to_string().contains(want), "{e}");
+        }
+        assert!(s.received_requests().await.unwrap().is_empty());
+        // The size steps at their edges pass.
+        for ok in [
+            set(Some(0.5), Some(1), None),
+            set(Some(8.0), Some(16), None),
+            set(None, None, Some(Some(5))),
+            set(None, None, Some(Some(1440))),
+        ] {
+            assert!(ok.check().is_ok(), "{ok:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_deploy_is_put_and_deleted() {
+        let (s, api) = setup().await;
+        let p = format!("/api/v1/orgs/{ORG}/apps/a1/auto-deploy");
+        Mock::given(method("PUT"))
+            .and(path(p.clone()))
+            .and(body_json(serde_json::json!({"repo":"site","ref":"main"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"repo":"acme/site","ref":"main","pending_sha":null}),
+            ))
+            .expect(1)
+            .mount(&s)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(p))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let set = api.set_auto_deploy("a1", "site", "main").await.unwrap();
+        assert_eq!(
+            (set.repo.as_str(), set.git_ref.as_str()),
+            ("acme/site", "main")
+        );
+        api.clear_auto_deploy("a1").await.unwrap();
     }
 
     #[tokio::test]

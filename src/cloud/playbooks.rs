@@ -45,6 +45,7 @@ pub const TOOL_NAMES: &[&str] = &[
     "deploy_app",
     "app_status",
     "app_logs",
+    "update_app",
     "delete_app",
     "sync_folder",
     "list_app_catalog",
