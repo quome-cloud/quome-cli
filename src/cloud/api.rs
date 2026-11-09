@@ -852,6 +852,11 @@ impl CloudApi {
         Ok(check(resp, map_error).await?.json().await?)
     }
 
+    /// The platform's API base URL.
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base
+    }
+
     fn org_path(&self, rest: &str) -> String {
         format!("/orgs/{}{}", enc(&self.org), rest)
     }
@@ -1314,7 +1319,8 @@ impl CloudApi {
         .await
     }
 
-    /// A token for the org's MCP gateway with `scope`. A 503 keeps its `Retry-After`.
+    /// A token for the org's MCP gateway with `scope`. Goes through `send_git`
+    /// for its long timeout and because a 503 keeps its `Retry-After`.
     pub async fn mcp_token(&self, scope: &[&str]) -> Result<McpToken, QuomeError> {
         let body = serde_json::json!({ "scope": scope });
         self.send_git(Method::POST, &self.org_path("/mcp/token"), |b| {

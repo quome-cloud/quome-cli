@@ -3,7 +3,8 @@
 //! gateway speaks MCP over Streamable HTTP at the URL that comes with it.
 //!
 //! The token lives only in memory and is scrubbed from every error. Whatever
-//! the gateway sends back is untrusted data and is passed through unchanged.
+//! the gateway sends back is untrusted data: it is passed through unchanged,
+//! but everything read from it is size-bounded.
 use super::api::{CloudApi, McpToken};
 use super::auth::CONNECT_TIMEOUT;
 use super::auth_instance::PROTOCOL_VERSION;
@@ -13,22 +14,38 @@ use rmcp::model::{CallToolResult, GetPromptResult, Prompt, Tool};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::{broadcast, Mutex};
+use tokio::time::Instant;
 
-/// Refresh the token this long before it expires.
-const SKEW: Duration = Duration::from_secs(30);
 /// Longest total wait while the gateway starts.
 const START_BUDGET: Duration = Duration::from_secs(60);
 /// The wait when the platform sends no usable `Retry-After`.
 const DEFAULT_RETRY: Duration = Duration::from_secs(5);
+/// The shortest wait between two token requests while the gateway starts.
+const MIN_RETRY: Duration = Duration::from_secs(1);
 /// Longest wait for an ordinary request; tool calls may run to the gateway's own limit.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const CALL_TIMEOUT: Duration = Duration::from_secs(600);
 /// Longest piece of an unexpected answer quoted in an error.
 const SNIPPET: usize = 300;
+/// Most of an error body that is read at all.
+const ERROR_BODY_MAX: usize = 4 * 1024;
+/// Largest plain JSON answer.
+const BODY_MAX: usize = 16 * 1024 * 1024;
+/// Longest line of an event stream, and most data in one event.
+const SSE_LINE_MAX: usize = 64 * 1024;
+const SSE_EVENT_MAX: usize = 4 * 1024 * 1024;
+/// How long the notification stream may stay silent before it is reopened.
+const LISTEN_IDLE: Duration = Duration::from_secs(300);
+/// Backoff bounds for reopening the notification stream.
+const LISTEN_BACKOFF_MIN: Duration = Duration::from_secs(1);
+const LISTEN_BACKOFF_MAX: Duration = Duration::from_secs(60);
+/// A token is refreshed this long before it expires (less for short-lived ones).
+const SKEW: Duration = Duration::from_secs(30);
 /// Most pages followed when listing tools or prompts.
 const MAX_PAGES: usize = 50;
 const START_MESSAGE: &str = "starting the org's MCP gateway";
@@ -45,7 +62,7 @@ pub struct ProgressUpdate {
 
 /// Receives progress while a call runs.
 pub type ProgressSink = Arc<dyn Fn(ProgressUpdate) + Send + Sync>;
-type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
+type Clock = Arc<dyn Fn() -> std::time::Instant + Send + Sync>;
 
 /// Why a gateway call failed. No variant ever carries the token.
 #[derive(Debug)]
@@ -60,13 +77,15 @@ pub enum GatewayError {
     InsecureUrl(String),
     /// The gateway refused the token, even after a refresh.
     Unauthorized,
+    /// The gateway no longer knows this session; connect again.
+    SessionLost,
     /// The gateway answered with an HTTP error.
     Http { status: u16, body: String },
     /// The gateway answered with a JSON-RPC error.
     Rpc { code: i64, message: String },
     /// The gateway could not be reached or the answer broke off.
     Transport(String),
-    /// The gateway sent something that is not MCP.
+    /// The gateway sent something that is not MCP, or too much of it.
     Protocol(String),
 }
 
@@ -89,6 +108,9 @@ impl std::fmt::Display for GatewayError {
                 f,
                 "The org's MCP gateway rejected this agent's token; run `quome connect` again."
             ),
+            GatewayError::SessionLost => {
+                write!(f, "the MCP gateway session ended; reconnect")
+            }
             GatewayError::Http { status, body } => {
                 write!(f, "The org's MCP gateway answered {status}: {body}")
             }
@@ -112,31 +134,28 @@ impl std::error::Error for GatewayError {}
 
 /// Knobs for tests.
 #[derive(Default)]
-pub struct Options {
+pub(crate) struct Options {
     clock: Option<Clock>,
-    budget: Option<Duration>,
 }
 
 impl Options {
-    pub fn clock(mut self, clock: Clock) -> Self {
+    pub(crate) fn clock(mut self, clock: Clock) -> Self {
         self.clock = Some(clock);
-        self
-    }
-    pub fn budget(mut self, budget: Duration) -> Self {
-        self.budget = Some(budget);
         self
     }
 }
 
 /// The current token, when it was fetched, and a counter that changes with it.
 struct Held {
-    token: Option<(McpToken, Instant)>,
+    token: Option<(McpToken, std::time::Instant)>,
     generation: u64,
 }
 
 struct Inner {
     api: Arc<CloudApi>,
     http: reqwest::Client,
+    /// For the notification stream: no total timeout.
+    stream_http: reqwest::Client,
     url: String,
     /// Held across a refresh so concurrent callers share one fetch.
     held: Mutex<Held>,
@@ -144,7 +163,6 @@ struct Inner {
     next_id: AtomicU64,
     notes: broadcast::Sender<Value>,
     clock: Clock,
-    budget: Duration,
 }
 
 pub struct GatewayClient {
@@ -160,37 +178,68 @@ impl Drop for GatewayClient {
     }
 }
 
-/// Replace every occurrence of `secret` in `text`.
+/// Replace every occurrence of `secret`, and the value of any `Bearer`
+/// header-style credential, in `text`.
 fn scrub(text: &str, secret: &str) -> String {
-    if secret.is_empty() {
-        return text.to_string();
+    let mut out = if secret.is_empty() {
+        text.to_string()
+    } else {
+        text.replace(secret, "<redacted>")
+    };
+    let mut from = 0;
+    while let Some(i) = out[from..].to_ascii_lowercase().find("bearer ") {
+        let start = from + i + "bearer ".len();
+        let end = out[start..]
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ',' | ';'))
+            .map_or(out.len(), |n| start + n);
+        out.replace_range(start..end, "<redacted>");
+        from = start + "<redacted>".len();
     }
-    text.replace(secret, "<redacted>")
+    out
 }
 
+/// `text` with the credential scrubbed first, then cut to a quotable length.
 fn snippet(text: &str, secret: &str) -> String {
-    scrub(
-        &text.trim().chars().take(SNIPPET).collect::<String>(),
-        secret,
-    )
+    scrub(text.trim(), secret).chars().take(SNIPPET).collect()
 }
 
 /// Ask the platform for a gateway token, waiting through `mcp_starting`.
 async fn fetch_token(
     api: &CloudApi,
-    budget: Duration,
     progress: Option<&ProgressSink>,
 ) -> Result<McpToken, GatewayError> {
+    wait_for_token(|| api.mcp_token(&["mcp_call"]), START_BUDGET, progress).await
+}
+
+/// Make token requests with `attempt` until one succeeds, waiting through
+/// `mcp_starting`. Each wait is at least 1 s, and the time attempts take
+/// counts against `budget`.
+async fn wait_for_token<F, Fut>(
+    mut attempt: F,
+    budget: Duration,
+    progress: Option<&ProgressSink>,
+) -> Result<McpToken, GatewayError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<McpToken, QuomeError>>,
+{
     let start = Instant::now();
     let mut announced = false;
     loop {
-        match api.mcp_token(&["mcp_call"]).await {
+        let remaining = budget.saturating_sub(start.elapsed());
+        let result = match tokio::time::timeout(remaining.max(MIN_RETRY), attempt()).await {
+            Ok(r) => r,
+            Err(_) => return Err(GatewayError::StillStarting),
+        };
+        match result {
             Ok(t) => return Ok(t),
             Err(QuomeError::RetryLater {
                 message,
                 retry_after,
             }) if message.contains("mcp_starting") => {
-                let wait = retry_after.map_or(DEFAULT_RETRY, Duration::from_secs);
+                let wait = retry_after
+                    .map_or(DEFAULT_RETRY, Duration::from_secs)
+                    .max(MIN_RETRY);
                 if wait > budget.saturating_sub(start.elapsed()) {
                     return Err(GatewayError::StillStarting);
                 }
@@ -216,6 +265,62 @@ async fn fetch_token(
     }
 }
 
+/// How long a token is used: until less than half its life, or 30 s, remains
+/// (and for at least a second, so a very short one is not refetched per call).
+fn usable_for(expires_in: u64) -> Duration {
+    let life = Duration::from_secs(expires_in);
+    life.saturating_sub(SKEW.min(life / 2))
+        .max(Duration::from_secs(1))
+}
+
+/// A gateway address is acceptable when it passes the URL policy, and a plain
+/// http one only when the platform itself is on a loopback address.
+fn check_gateway_url(raw: &str, api: &CloudApi, secret: &str) -> Result<String, GatewayError> {
+    let url = crate::url_policy::validate_api_url(raw, "the MCP gateway address")
+        .map_err(|e| GatewayError::InsecureUrl(snippet(&e.to_string(), secret)))?;
+    if crate::url_policy::is_loopback_http(&url)
+        && !crate::url_policy::is_loopback_http(api.base_url())
+    {
+        return Err(GatewayError::InsecureUrl(
+            "plain http is only allowed when the platform is on this computer".into(),
+        ));
+    }
+    Ok(url)
+}
+
+/// Read at most `max` bytes of a body. `None` when the body is longer.
+async fn read_capped(
+    resp: reqwest::Response,
+    max: usize,
+    token: &str,
+) -> Result<Option<Vec<u8>>, GatewayError> {
+    let mut out = Vec::new();
+    let mut chunks = resp.bytes_stream();
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk
+            .map_err(|e| GatewayError::Transport(scrub(&e.without_url().to_string(), token)))?;
+        if out.len() + chunk.len() > max {
+            return Ok(None);
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(Some(out))
+}
+
+/// The start of an error body: at most `ERROR_BODY_MAX` bytes are read.
+async fn read_error_body(resp: reqwest::Response, token: &str) -> String {
+    let mut out = Vec::new();
+    let mut chunks = resp.bytes_stream();
+    while let Some(Ok(chunk)) = chunks.next().await {
+        let room = ERROR_BODY_MAX - out.len();
+        out.extend_from_slice(&chunk[..chunk.len().min(room)]);
+        if out.len() >= ERROR_BODY_MAX {
+            break;
+        }
+    }
+    snippet(&String::from_utf8_lossy(&out), token)
+}
+
 impl GatewayClient {
     /// Get a token, open a session with the org's MCP gateway and start
     /// listening for its notifications. `local_tools` names the tools the CLI
@@ -233,29 +338,35 @@ impl GatewayClient {
         Self::connect_with(api, local_tools, progress, Options::default()).await
     }
 
-    pub async fn connect_with(
+    pub(crate) async fn connect_with(
         api: Arc<CloudApi>,
         local_tools: &[&str],
         progress: Option<ProgressSink>,
         opts: Options,
     ) -> Result<Self, GatewayError> {
-        let budget = opts.budget.unwrap_or(START_BUDGET);
-        let clock: Clock = opts.clock.unwrap_or_else(|| Arc::new(Instant::now));
+        let clock: Clock = opts
+            .clock
+            .unwrap_or_else(|| Arc::new(std::time::Instant::now));
         let fetched = clock();
-        let token = fetch_token(&api, budget, progress.as_ref()).await?;
-        let url = crate::url_policy::validate_api_url(&token.url, "the MCP gateway address")
-            .map_err(|e| GatewayError::InsecureUrl(snippet(&e.to_string(), &token.access_token)))?;
+        let token = fetch_token(&api, progress.as_ref()).await?;
+        let url = check_gateway_url(&token.url, &api, &token.access_token)?;
         // Never follow a redirect: the token must only go to the address it came with.
-        let http = reqwest::Client::builder()
-            .https_only(!crate::url_policy::is_loopback_http(&url))
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(CONNECT_TIMEOUT)
-            .build()
-            .map_err(|e| GatewayError::Transport(e.without_url().to_string()))?;
+        let build = |idle: bool| {
+            let mut b = reqwest::Client::builder()
+                .https_only(!crate::url_policy::is_loopback_http(&url))
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(CONNECT_TIMEOUT);
+            if idle {
+                b = b.read_timeout(LISTEN_IDLE);
+            }
+            b.build()
+                .map_err(|e| GatewayError::Transport(e.without_url().to_string()))
+        };
         let (notes, _) = broadcast::channel(64);
         let inner = Arc::new(Inner {
             api,
-            http,
+            http: build(false)?,
+            stream_http: build(true)?,
             url,
             held: Mutex::new(Held {
                 token: Some((token, fetched)),
@@ -265,7 +376,6 @@ impl GatewayClient {
             next_id: AtomicU64::new(0),
             notes,
             clock,
-            budget,
         });
         inner
             .request(
@@ -301,14 +411,22 @@ impl GatewayClient {
         progress: Option<ProgressSink>,
     ) -> Result<CallToolResult, GatewayError> {
         let mut params = json!({"name": name, "arguments": args});
+        let mut progress_token = None;
         if progress.is_some() {
-            params["_meta"] = json!({"progressToken": uuid::Uuid::new_v4().to_string()});
+            let t = uuid::Uuid::new_v4().to_string();
+            params["_meta"] = json!({"progressToken": t});
+            progress_token = Some(t);
         }
         let v = self
             .inner
-            .request("tools/call", params, progress.as_ref(), CALL_TIMEOUT)
+            .request(
+                "tools/call",
+                params,
+                progress.as_ref().zip(progress_token.as_deref()),
+                CALL_TIMEOUT,
+            )
             .await?;
-        decode(v)
+        self.inner.decode(v)
     }
 
     /// The gateway's prompts.
@@ -330,10 +448,12 @@ impl GatewayClient {
                 REQUEST_TIMEOUT,
             )
             .await?;
-        decode(v)
+        self.inner.decode(v)
     }
 
-    /// Notifications the gateway sends outside any call.
+    /// Notifications the gateway sends outside any call. A receiver gets the
+    /// events that arrive after it was made; earlier ones are not buffered,
+    /// and a slow receiver may miss some.
     pub fn notifications(&self) -> broadcast::Receiver<Value> {
         self.inner.notes.subscribe()
     }
@@ -344,22 +464,39 @@ impl GatewayClient {
     }
 }
 
-fn decode<T: DeserializeOwned>(v: Value) -> Result<T, GatewayError> {
-    serde_json::from_value(v).map_err(|e| GatewayError::Protocol(format!("bad result ({e})")))
+/// The delay before reopening the notification stream for the `failures`-th
+/// time in a row, with `jitter` in `0..=255` taking up to half of it off.
+fn backoff(failures: u32, jitter: u8) -> Duration {
+    let base = LISTEN_BACKOFF_MIN
+        .saturating_mul(1u32 << failures.min(6))
+        .min(LISTEN_BACKOFF_MAX);
+    base - base.mul_f64(f64::from(jitter) / 512.0)
 }
 
 impl Inner {
-    /// A valid token and the generation it belongs to, refreshed within 30 s of expiry.
+    /// Decode a result; the error never quotes the gateway's data.
+    fn decode<T: DeserializeOwned>(&self, v: Value) -> Result<T, GatewayError> {
+        serde_json::from_value(v)
+            .map_err(|_| GatewayError::Protocol("a result of the wrong shape".into()))
+    }
+
+    /// A valid token and the generation it belongs to, refreshed before it expires.
     async fn token(&self) -> Result<(String, u64), GatewayError> {
         let mut held = self.held.lock().await;
         if let Some((t, fetched)) = &held.token {
-            let ttl = Duration::from_secs(t.expires_in).saturating_sub(SKEW);
-            if (self.clock)() < *fetched + ttl {
+            if (self.clock)() < *fetched + usable_for(t.expires_in) {
                 return Ok((t.access_token.clone(), held.generation));
             }
         }
         let fetched = (self.clock)();
-        let t = fetch_token(&self.api, self.budget, None).await?;
+        let t = fetch_token(&self.api, None).await?;
+        // A refresh must not move the token to another address.
+        let url = check_gateway_url(&t.url, &self.api, &t.access_token)?;
+        if url != self.url {
+            return Err(GatewayError::InsecureUrl(
+                "the gateway address changed; connect again".into(),
+            ));
+        }
         let secret = t.access_token.clone();
         held.token = Some((t, fetched));
         held.generation += 1;
@@ -378,7 +515,12 @@ impl Inner {
         self.session.lock().ok().and_then(|s| s.clone())
     }
 
-    fn headers(&self, b: reqwest::RequestBuilder, token: &str) -> reqwest::RequestBuilder {
+    fn headers(
+        &self,
+        b: reqwest::RequestBuilder,
+        token: &str,
+        session: Option<&str>,
+    ) -> reqwest::RequestBuilder {
         let b = b
             .bearer_auth(token)
             .header("MCP-Protocol-Version", PROTOCOL_VERSION)
@@ -386,7 +528,7 @@ impl Inner {
                 reqwest::header::ACCEPT,
                 "application/json, text/event-stream",
             );
-        match self.session() {
+        match session {
             Some(sid) => b.header("Mcp-Session-Id", sid),
             None => b,
         }
@@ -400,18 +542,18 @@ impl Inner {
             .map(|_| ())
     }
 
-    /// One JSON-RPC request; returns the `result`.
+    /// One JSON-RPC request; returns the `result`. `progress` is a sink and
+    /// the progress token its reports carry.
     async fn request(
         &self,
         method: &str,
         params: Value,
-        progress: Option<&ProgressSink>,
+        progress: Option<(&ProgressSink, &str)>,
         timeout: Duration,
     ) -> Result<Value, GatewayError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let body = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        let v = self.post(&body, Some(id), progress, timeout).await?;
-        match v {
+        match self.post(&body, Some(id), progress, timeout).await? {
             Some(v) => Ok(v),
             None => Err(GatewayError::Protocol("no answer".into())),
         }
@@ -431,7 +573,7 @@ impl Inner {
             };
             let v = self.request(method, params, None, REQUEST_TIMEOUT).await?;
             let items = v.get(key).cloned().unwrap_or(Value::Null);
-            out.extend(decode::<Vec<T>>(items)?);
+            out.extend(self.decode::<Vec<T>>(items)?);
             cursor = v["nextCursor"].as_str().map(str::to_string);
             if cursor.is_none() {
                 break;
@@ -447,14 +589,15 @@ impl Inner {
         &self,
         body: &Value,
         want: Option<u64>,
-        progress: Option<&ProgressSink>,
+        progress: Option<(&ProgressSink, &str)>,
         timeout: Duration,
     ) -> Result<Option<Value>, GatewayError> {
         let mut refreshed = false;
         loop {
             let (token, generation) = self.token().await?;
+            let session = self.session();
             let resp = self
-                .headers(self.http.post(&self.url), &token)
+                .headers(self.http.post(&self.url), &token, session.as_deref())
                 .timeout(timeout)
                 .json(body)
                 .send()
@@ -471,11 +614,13 @@ impl Inner {
                 self.invalidate(generation).await;
                 continue;
             }
+            if status == 404 && session.is_some() {
+                return Err(GatewayError::SessionLost);
+            }
             if !resp.status().is_success() {
-                let text = resp.text().await.unwrap_or_default();
                 return Err(GatewayError::Http {
                     status,
-                    body: snippet(&text, &token),
+                    body: read_error_body(resp, &token).await,
                 });
             }
             if let Some(sid) = resp
@@ -498,11 +643,12 @@ impl Inner {
             let answer = if is_stream {
                 self.read_stream(resp, id, progress, &token).await?
             } else {
-                let text = resp.text().await.map_err(|e| {
-                    GatewayError::Transport(scrub(&e.without_url().to_string(), &token))
+                let bytes = read_capped(resp, BODY_MAX, &token)
+                    .await?
+                    .ok_or_else(|| GatewayError::Protocol("the answer is too large".into()))?;
+                let v: Value = serde_json::from_slice(&bytes).map_err(|_| {
+                    GatewayError::Protocol(snippet(&String::from_utf8_lossy(&bytes), &token))
                 })?;
-                let v: Value = serde_json::from_str(&text)
-                    .map_err(|_| GatewayError::Protocol(snippet(&text, &token)))?;
                 if v["id"] == json!(id) {
                     v
                 } else {
@@ -513,12 +659,39 @@ impl Inner {
         }
     }
 
+    /// Handle one event of a call's stream: `Some` when it is the answer to `id`.
+    fn on_event(
+        &self,
+        data: &str,
+        id: u64,
+        progress: Option<(&ProgressSink, &str)>,
+    ) -> Option<Value> {
+        let v = serde_json::from_str::<Value>(data).ok()?;
+        if v["id"] == json!(id) && (v.get("result").is_some() || v.get("error").is_some()) {
+            return Some(v);
+        }
+        if v["method"] == "notifications/progress" {
+            if let Some((sink, token)) = progress {
+                if v["params"]["progressToken"].as_str() == Some(token) {
+                    sink(ProgressUpdate {
+                        progress: v["params"]["progress"].as_f64().unwrap_or(0.0),
+                        total: v["params"]["total"].as_f64(),
+                        message: v["params"]["message"].as_str().map(str::to_string),
+                    });
+                }
+            }
+        } else if v.get("method").is_some() {
+            let _ = self.notes.send(v);
+        }
+        None
+    }
+
     /// Read events until the answer to `id`.
     async fn read_stream(
         &self,
         resp: reqwest::Response,
         id: u64,
-        progress: Option<&ProgressSink>,
+        progress: Option<(&ProgressSink, &str)>,
         token: &str,
     ) -> Result<Value, GatewayError> {
         let mut events = SseEvents::default();
@@ -526,24 +699,15 @@ impl Inner {
         while let Some(chunk) = chunks.next().await {
             let chunk = chunk
                 .map_err(|e| GatewayError::Transport(scrub(&e.without_url().to_string(), token)))?;
-            for data in events.push(&chunk) {
-                let Ok(v) = serde_json::from_str::<Value>(&data) else {
-                    continue;
-                };
-                if v["id"] == json!(id) && (v.get("result").is_some() || v.get("error").is_some()) {
+            for data in events.push(&chunk)? {
+                if let Some(v) = self.on_event(&data, id, progress) {
                     return Ok(v);
                 }
-                if v["method"] == "notifications/progress" {
-                    if let Some(p) = progress {
-                        p(ProgressUpdate {
-                            progress: v["params"]["progress"].as_f64().unwrap_or(0.0),
-                            total: v["params"]["total"].as_f64(),
-                            message: v["params"]["message"].as_str().map(str::to_string),
-                        });
-                    }
-                } else if v.get("method").is_some() {
-                    let _ = self.notes.send(v);
-                }
+            }
+        }
+        if let Some(data) = events.finish() {
+            if let Some(v) = self.on_event(&data, id, progress) {
+                return Ok(v);
             }
         }
         Err(GatewayError::Transport(
@@ -551,42 +715,67 @@ impl Inner {
         ))
     }
 
-    /// Follow the gateway's notification stream until it is closed for good.
+    /// Follow the gateway's notification stream. It is reopened after every
+    /// close or error, with a growing delay that resets only once an event
+    /// was received. It ends for good when the gateway has no stream or the
+    /// session is gone (404, 405), when a 401 survives a refresh, or when the
+    /// client is dropped.
     async fn listen(self: Arc<Self>) {
         let mut failures = 0u32;
-        while failures < 5 {
+        let mut refreshed = false;
+        loop {
             let Ok((token, generation)) = self.token().await else {
-                return;
+                failures += 1;
+                tokio::time::sleep(backoff(failures, jitter())).await;
+                continue;
             };
+            let session = self.session();
             let resp = self
-                .headers(self.http.get(&self.url), &token)
+                .headers(self.stream_http.get(&self.url), &token, session.as_deref())
                 .header(reqwest::header::ACCEPT, "text/event-stream")
                 .send()
                 .await;
             match resp {
                 Ok(r) if r.status().as_u16() == 401 => {
+                    if refreshed {
+                        return;
+                    }
+                    refreshed = true;
                     self.invalidate(generation).await;
-                    failures += 1;
+                    continue;
                 }
+                Ok(r) if matches!(r.status().as_u16(), 404 | 405) => return,
                 Ok(r) if r.status().is_success() => {
-                    failures = 0;
+                    refreshed = false;
                     let mut events = SseEvents::default();
                     let mut chunks = r.bytes_stream();
-                    while let Some(Ok(chunk)) = chunks.next().await {
-                        for data in events.push(&chunk) {
+                    let mut got_event = false;
+                    'read: while let Some(Ok(chunk)) = chunks.next().await {
+                        let Ok(datas) = events.push(&chunk) else {
+                            break 'read;
+                        };
+                        for data in datas {
                             if let Ok(v) = serde_json::from_str::<Value>(&data) {
+                                got_event = true;
                                 let _ = self.notes.send(v);
                             }
                         }
                     }
+                    if got_event {
+                        failures = 0;
+                    } else {
+                        failures += 1;
+                    }
                 }
-                // The gateway has no stream for this session (405 and the like).
-                Ok(_) => return,
-                Err(_) => failures += 1,
+                Ok(_) | Err(_) => failures += 1,
             }
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            tokio::time::sleep(backoff(failures, jitter())).await;
         }
     }
+}
+
+fn jitter() -> u8 {
+    uuid::Uuid::new_v4().as_bytes()[0]
 }
 
 /// The `result` of a JSON-RPC answer, or its error (scrubbed of `token`).
@@ -602,19 +791,24 @@ fn answer_result(v: Value, token: &str) -> Result<Value, GatewayError> {
         .ok_or_else(|| GatewayError::Protocol("no result".into()))
 }
 
-/// Splits a server-sent event stream into the `data` of each event.
+/// Splits a server-sent event stream into the `data` of each event, within
+/// size limits.
 #[derive(Default)]
 struct SseEvents {
     line: Vec<u8>,
     data: Vec<String>,
+    data_len: usize,
 }
 
 impl SseEvents {
-    fn push(&mut self, chunk: &[u8]) -> Vec<String> {
+    fn push(&mut self, chunk: &[u8]) -> Result<Vec<String>, GatewayError> {
         let mut out = Vec::new();
         for &b in chunk {
             if b != b'\n' {
                 self.line.push(b);
+                if self.line.len() > SSE_LINE_MAX {
+                    return Err(GatewayError::Protocol("an event line is too long".into()));
+                }
                 continue;
             }
             let line = String::from_utf8_lossy(&self.line).into_owned();
@@ -624,12 +818,34 @@ impl SseEvents {
                 if !self.data.is_empty() {
                     out.push(self.data.join("\n"));
                     self.data.clear();
+                    self.data_len = 0;
                 }
             } else if let Some(d) = line.strip_prefix("data:") {
+                self.data_len += d.len() + 1;
+                if self.data_len > SSE_EVENT_MAX {
+                    return Err(GatewayError::Protocol("an event is too large".into()));
+                }
                 self.data.push(d.strip_prefix(' ').unwrap_or(d).to_string());
             }
         }
-        out
+        Ok(out)
+    }
+
+    /// The event left open when the stream ended, if any.
+    fn finish(&mut self) -> Option<String> {
+        if !self.line.is_empty() {
+            let line = String::from_utf8_lossy(&self.line).into_owned();
+            self.line.clear();
+            if let Some(d) = line.trim_end_matches('\r').strip_prefix("data:") {
+                self.data.push(d.strip_prefix(' ').unwrap_or(d).to_string());
+            }
+        }
+        if self.data.is_empty() {
+            return None;
+        }
+        let d = self.data.join("\n");
+        self.data.clear();
+        Some(d)
     }
 }
 
@@ -906,14 +1122,25 @@ mod tests {
         let (s, api) = setup().await;
         mount_token(&s, "GWTOK", 3600, None).await;
         mount_handshake(&s).await;
-        let sse = "event: message\n\
-            data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":\"t\",\"progress\":1,\"total\":2,\"message\":\"half\"}}\n\n\
-            event: message\n\
-            data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"done\"}],\"isError\":false}}\n\n";
         Mock::given(method("POST"))
             .and(path("/gw"))
             .and(body_partial_json(json!({"method": "tools/call"})))
-            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .respond_with(|req: &Request| {
+                let b: Value = serde_json::from_slice(&req.body).unwrap();
+                let tok = b["params"]["_meta"]["progressToken"].clone();
+                let id = b["id"].clone();
+                let note = |t: Value, msg: &str| {
+                    json!({"jsonrpc":"2.0","method":"notifications/progress",
+                           "params":{"progressToken":t,"progress":1,"total":2,"message":msg}})
+                };
+                let sse = format!(
+                    "event: message\ndata: {}\n\ndata: not json\n\ndata: {}\n\ndata: {}\n\n",
+                    note(tok, "half"),
+                    note(json!("someone-else"), "foreign"),
+                    json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":"done"}],"isError":false}}),
+                );
+                ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream")
+            })
             .mount(&s)
             .await;
         let c = GatewayClient::connect(api, &[]).await.unwrap();
@@ -943,38 +1170,79 @@ mod tests {
         assert_eq!(call["params"]["arguments"], json!({"a": 1}));
     }
 
+    /// A JWT-shaped token of about 900 characters.
+    fn long_token() -> String {
+        let seg = |n: usize, c: &str| c.repeat(n);
+        format!(
+            "{}.{}.{}",
+            seg(40, "eyJhbGciOiJSUzI1NiIs"),
+            seg(30, "eyJzdWIiOiJ1c2VyIiw"),
+            seg(15, "c2lnbmF0dXJlc2ln")
+        )
+    }
+
+    fn windows_leaked(text: &str, token: &str) -> bool {
+        token
+            .as_bytes()
+            .windows(16)
+            .any(|w| text.contains(std::str::from_utf8(w).unwrap()))
+    }
+
     #[tokio::test]
     async fn token_never_in_error_text() {
+        let tok = long_token();
+        assert!(tok.len() > 800);
         let (s, api) = setup().await;
-        mount_token(&s, "SECRET-GW-TOKEN", 3600, None).await;
+        mount_token(&s, &tok, 3600, None).await;
         mount_handshake(&s).await;
+        // Http: the body echoes the header, and a bare copy
         Mock::given(method("POST"))
             .and(path("/gw"))
             .and(body_partial_json(json!({"method": "tools/list"})))
             .respond_with(
-                ResponseTemplate::new(500).set_body_string("bad: Bearer SECRET-GW-TOKEN echoed"),
+                ResponseTemplate::new(500)
+                    .set_body_string(format!("bad: Authorization: Bearer {tok} echoed {tok}")),
             )
             .mount(&s)
             .await;
+        // Rpc: the message echoes it
+        let rpc_tok = tok.clone();
         Mock::given(method("POST"))
             .and(path("/gw"))
             .and(body_partial_json(json!({"method": "tools/call"})))
-            .respond_with(|req: &Request| {
+            .respond_with(move |req: &Request| {
                 let id = serde_json::from_slice::<Value>(&req.body).unwrap()["id"].clone();
                 ResponseTemplate::new(200).set_body_json(json!({"jsonrpc": "2.0", "id": id,
-                    "error": {"code": -32000, "message": "nope SECRET-GW-TOKEN"}}))
+                    "error": {"code": -32000, "message": format!("nope {rpc_tok}")}}))
             })
             .mount(&s)
             .await;
+        // Protocol: a 200 that is not JSON and echoes it
+        let proto_tok = tok.clone();
+        Mock::given(method("POST"))
+            .and(path("/gw"))
+            .and(body_partial_json(json!({"method": "prompts/list"})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(format!("<html>{proto_tok}</html>")),
+            )
+            .mount(&s)
+            .await;
         let c = GatewayClient::connect(api, &[]).await.unwrap();
-        for e in [
+        let errs = [
             c.list_tools().await.err().unwrap(),
             c.call_tool("x", json!({}), None).await.err().unwrap(),
-        ] {
-            assert!(!e.to_string().contains("SECRET-GW-TOKEN"), "{e}");
-            assert!(!format!("{e:?}").contains("SECRET-GW-TOKEN"), "{e:?}");
+            c.list_prompts().await.err().unwrap(),
+        ];
+        assert!(matches!(errs[0], GatewayError::Http { .. }));
+        assert!(matches!(errs[1], GatewayError::Rpc { .. }));
+        assert!(matches!(errs[2], GatewayError::Protocol(_)));
+        for e in errs {
+            for text in [e.to_string(), format!("{e:?}")] {
+                assert!(!windows_leaked(&text, &tok), "{text}");
+                assert!(text.contains("<redacted>"), "{text}");
+            }
         }
-        assert!(!format!("{:?}", c.token_debug().await).contains("SECRET-GW-TOKEN"));
+        assert!(!windows_leaked(&c.token_debug().await, &tok));
     }
 
     #[tokio::test]
@@ -1042,5 +1310,300 @@ mod tests {
             .await;
         assert_eq!(api.mcp_config().await, Ok(FrontDoor::Gateway));
         assert_eq!(api.mcp_config().await, Ok(FrontDoor::Direct));
+    }
+
+    #[test]
+    fn scrub_hides_bearer_values_and_the_token() {
+        let t = scrub("a Bearer abc.def ghi tok-1 x", "tok-1");
+        assert_eq!(t, "a Bearer <redacted> ghi <redacted> x");
+        let long = format!("Bearer {}", "x".repeat(2000));
+        assert!(!snippet(&long, "").contains("xxxxxxxx"));
+    }
+
+    #[test]
+    fn sse_limits_and_final_event() {
+        let mut e = SseEvents::default();
+        assert!(e.push(&vec![b'a'; SSE_LINE_MAX + 1]).is_err());
+        let mut e = SseEvents::default();
+        let line = format!("data: {}\n", "a".repeat(SSE_LINE_MAX - 10));
+        let mut err = false;
+        for _ in 0..(SSE_EVENT_MAX / SSE_LINE_MAX + 2) {
+            err |= e.push(line.as_bytes()).is_err();
+        }
+        assert!(err, "an event without an end must hit the size limit");
+        let mut e = SseEvents::default();
+        assert!(e.push(b"data: {\"id\":1}").unwrap().is_empty());
+        assert_eq!(e.finish().as_deref(), Some("{\"id\":1}"));
+    }
+
+    #[test]
+    fn backoff_grows_and_is_capped() {
+        assert_eq!(backoff(0, 0), Duration::from_secs(1));
+        assert_eq!(backoff(3, 0), Duration::from_secs(8));
+        assert_eq!(backoff(30, 0), Duration::from_secs(60));
+        assert!(backoff(30, 255) >= Duration::from_secs(30));
+    }
+
+    #[test]
+    fn short_tokens_are_usable_for_a_moment() {
+        assert_eq!(usable_for(3600), Duration::from_secs(3570));
+        assert_eq!(usable_for(60), Duration::from_secs(30));
+        assert_eq!(usable_for(10), Duration::from_secs(5));
+        assert_eq!(usable_for(0), Duration::from_secs(1));
+    }
+
+    fn starting(retry_after: Option<u64>) -> QuomeError {
+        QuomeError::RetryLater {
+            message: "503 mcp_starting".into(),
+            retry_after,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_retry_after_does_not_hammer_the_platform() {
+        let calls = std::cell::Cell::new(0u32);
+        let t0 = Instant::now();
+        let r = wait_for_token(
+            || {
+                calls.set(calls.get() + 1);
+                std::future::ready(Err(starting(Some(0))))
+            },
+            START_BUDGET,
+            None,
+        )
+        .await;
+        assert!(matches!(r, Err(GatewayError::StillStarting)));
+        assert!(calls.get() <= 61, "{} requests", calls.get());
+        assert!(t0.elapsed() <= START_BUDGET);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_missing_retry_after_waits_five_seconds() {
+        let calls = std::cell::Cell::new(0u32);
+        let r = wait_for_token(
+            || {
+                calls.set(calls.get() + 1);
+                std::future::ready(Err(starting(None)))
+            },
+            START_BUDGET,
+            None,
+        )
+        .await;
+        assert!(matches!(r, Err(GatewayError::StillStarting)));
+        assert_eq!(calls.get(), 13);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_attempt_counts_against_the_budget() {
+        let r = wait_for_token(
+            || async {
+                tokio::time::sleep(Duration::from_secs(500)).await;
+                Err(starting(Some(1)))
+            },
+            START_BUDGET,
+            None,
+        )
+        .await;
+        assert!(matches!(r, Err(GatewayError::StillStarting)));
+    }
+
+    #[tokio::test]
+    async fn an_oversize_answer_is_refused() {
+        let (s, api) = setup().await;
+        mount_token(&s, "GWTOK", 3600, None).await;
+        mount_handshake(&s).await;
+        // an event line longer than the limit
+        Mock::given(method("POST"))
+            .and(path("/gw"))
+            .and(body_partial_json(json!({"method": "tools/call"})))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                format!("data: {}\n\n", "a".repeat(SSE_LINE_MAX + 10)),
+                "text/event-stream",
+            ))
+            .mount(&s)
+            .await;
+        // a plain body over the limit
+        Mock::given(method("POST"))
+            .and(path("/gw"))
+            .and(body_partial_json(json!({"method": "tools/list"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(vec![b' '; BODY_MAX + 1], "application/json"),
+            )
+            .mount(&s)
+            .await;
+        // an error body is only read at its start
+        Mock::given(method("POST"))
+            .and(path("/gw"))
+            .and(body_partial_json(json!({"method": "prompts/list"})))
+            .respond_with(ResponseTemplate::new(500).set_body_string("e".repeat(1_000_000)))
+            .mount(&s)
+            .await;
+        let c = GatewayClient::connect(api, &[]).await.unwrap();
+        let e = c.call_tool("x", json!({}), None).await.err().unwrap();
+        assert!(
+            matches!(&e, GatewayError::Protocol(m) if m.contains("too long")),
+            "{e}"
+        );
+        let e = c.list_tools().await.err().unwrap();
+        assert!(
+            matches!(&e, GatewayError::Protocol(m) if m.contains("too large")),
+            "{e}"
+        );
+        match c.list_prompts().await.err().unwrap() {
+            GatewayError::Http { status: 500, body } => assert!(body.len() <= SNIPPET),
+            e => panic!("{e}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_last_event_without_a_blank_line_is_used() {
+        let (s, api) = setup().await;
+        mount_token(&s, "GWTOK", 3600, None).await;
+        mount_handshake(&s).await;
+        Mock::given(method("POST"))
+            .and(path("/gw"))
+            .and(body_partial_json(json!({"method": "tools/list"})))
+            .respond_with(|req: &Request| {
+                let id = serde_json::from_slice::<Value>(&req.body).unwrap()["id"].clone();
+                let r = json!({"jsonrpc":"2.0","id":id,"result":{"tools":[]}});
+                ResponseTemplate::new(200).set_body_raw(format!("data: {r}"), "text/event-stream")
+            })
+            .mount(&s)
+            .await;
+        let c = GatewayClient::connect(api, &[]).await.unwrap();
+        assert!(c.list_tools().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_lost_session_is_its_own_error() {
+        let (s, api) = setup().await;
+        mount_token(&s, "GWTOK", 3600, None).await;
+        mount_handshake(&s).await;
+        Mock::given(method("POST"))
+            .and(path("/gw"))
+            .and(body_partial_json(json!({"method": "tools/list"})))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&s)
+            .await;
+        let c = GatewayClient::connect(api, &[]).await.unwrap();
+        let e = c.list_tools().await.err().unwrap();
+        assert!(matches!(e, GatewayError::SessionLost), "{e}");
+        assert!(e.to_string().contains("reconnect"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_refresh_is_an_error_and_the_next_call_retries() {
+        let (s, api) = setup().await;
+        mount_token(&s, "OLD", 60, Some(1)).await;
+        Mock::given(method("POST"))
+            .and(path(TOKEN_PATH))
+            .respond_with(
+                ResponseTemplate::new(403).set_body_json(json!({"reason": "capability_missing"})),
+            )
+            .mount(&s)
+            .await;
+        mount_handshake(&s).await;
+        mount_rpc(&s, "tools/list", tools_result()).await;
+        let skew = Arc::new(AtomicU64::new(0));
+        let clock = {
+            let skew = skew.clone();
+            let base = std::time::Instant::now();
+            Arc::new(move || base + Duration::from_secs(skew.load(Ordering::Relaxed)))
+        };
+        let c = GatewayClient::connect_with(api, &[], None, Options::default().clock(clock))
+            .await
+            .unwrap();
+        skew.store(100, Ordering::Relaxed);
+        let e = c.list_tools().await.err().unwrap();
+        assert!(matches!(e, GatewayError::MissingCapability), "{e}");
+        let e = c.list_tools().await.err().unwrap();
+        assert!(matches!(e, GatewayError::MissingCapability), "{e}");
+    }
+
+    #[tokio::test]
+    async fn a_refresh_may_not_move_the_gateway() {
+        let (s, api) = setup().await;
+        mount_token(&s, "OLD", 60, Some(1)).await;
+        Mock::given(method("POST"))
+            .and(path(TOKEN_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"access_token": "NEW", "expires_in": 60, "url": "http://127.0.0.1:9/elsewhere"}),
+            ))
+            .mount(&s)
+            .await;
+        mount_handshake(&s).await;
+        let skew = Arc::new(AtomicU64::new(0));
+        let clock = {
+            let skew = skew.clone();
+            let base = std::time::Instant::now();
+            Arc::new(move || base + Duration::from_secs(skew.load(Ordering::Relaxed)))
+        };
+        let c = GatewayClient::connect_with(api, &[], None, Options::default().clock(clock))
+            .await
+            .unwrap();
+        skew.store(100, Ordering::Relaxed);
+        let e = c.list_tools().await.err().unwrap();
+        assert!(matches!(e, GatewayError::InsecureUrl(_)), "{e}");
+    }
+
+    #[tokio::test]
+    async fn a_short_lived_token_is_not_refetched_per_request() {
+        let (s, api) = setup().await;
+        mount_token(&s, "SHORT", 10, None).await;
+        mount_handshake(&s).await;
+        mount_rpc(&s, "tools/list", tools_result()).await;
+        let c = GatewayClient::connect(api, &[]).await.unwrap();
+        c.list_tools().await.unwrap();
+        c.list_tools().await.unwrap();
+        assert_eq!(requests_to(&s, TOKEN_PATH).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn notifications_arrive_from_the_gateway_stream() {
+        let (s, api) = setup().await;
+        mount_token(&s, "GWTOK", 3600, None).await;
+        mount_handshake(&s).await;
+        Mock::given(method("GET"))
+            .and(path("/gw"))
+            .and(header("mcp-session-id", "sess-1"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(300))
+                    .set_body_raw(
+                        "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\n",
+                        "text/event-stream",
+                    ),
+            )
+            .mount(&s)
+            .await;
+        let c = GatewayClient::connect(api, &[]).await.unwrap();
+        let mut rx = c.notifications();
+        let v = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(v["method"], "notifications/tools/list_changed");
+    }
+
+    #[tokio::test]
+    async fn the_stream_listener_stops_when_the_gateway_has_none() {
+        let (s, api) = setup().await;
+        mount_token(&s, "GWTOK", 3600, None).await;
+        mount_handshake(&s).await;
+        Mock::given(method("GET"))
+            .and(path("/gw"))
+            .respond_with(ResponseTemplate::new(405))
+            .mount(&s)
+            .await;
+        let c = GatewayClient::connect(api, &[]).await.unwrap();
+        let h = c.stream.as_ref().unwrap();
+        for _ in 0..50 {
+            if h.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(h.is_finished());
     }
 }
