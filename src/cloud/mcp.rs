@@ -10,6 +10,7 @@ use super::email::{
     backoff, email_hint, normalize_address, AddressArgs, AddressKind, CreateAddressArgs,
     ListMessagesArgs, ReadArgs, WaitArgs, LIST_NOTE,
 };
+use super::gateway::GatewayClient;
 use super::git::{
     GitClient, GitCloneUrlArgs, GitCommitArgs, GitConn, GitDiffArgs, GitError, GitPrArgs,
     GitReadArgs, GitReposArgs, Waiting,
@@ -328,6 +329,12 @@ pub struct QuomeMcp {
     email_cursors: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
     /// Which local folders `sync_folder` and `deploy_app` may read.
     local: Arc<LocalScope>,
+    /// Which backend serves each app, as far as this session has learned.
+    app_backends: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+    /// The schema hash the gateway gave for each (app, tool) it described.
+    app_hashes: Arc<std::sync::Mutex<std::collections::HashMap<(String, String), String>>>,
+    /// The org's MCP gateway, connected on first need and reused.
+    gateway: Arc<tokio::sync::Mutex<Option<Arc<GatewayClient>>>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -581,6 +588,48 @@ pub struct SetKeyArgs {
     key: String,
     /// The secret value. It is stored write-only and never shown again.
     value: String,
+}
+
+/// The backend named by a relay `409` whose stable reason is exactly
+/// `use_<backend>`, when it is not the relay. Only the status and reason
+/// decide; message text never does.
+fn use_backend(e: &QuomeError) -> Option<String> {
+    let QuomeError::ApiRefused { status, reason, .. } = e else {
+        return None;
+    };
+    if *status != 409 {
+        return None;
+    }
+    let b = reason.strip_prefix("use_")?;
+    let ok = !b.is_empty()
+        && b != "relay"
+        && b.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    ok.then(|| b.to_string())
+}
+
+/// The JSON object a gateway result carries: its structured content, else the
+/// first text content that parses as JSON.
+fn gateway_body(r: &rmcp::model::CallToolResult) -> Option<serde_json::Value> {
+    r.structured_content
+        .clone()
+        .or_else(|| {
+            r.content.iter().find_map(|c| {
+                c.as_text()
+                    .and_then(|t| serde_json::from_str::<serde_json::Value>(&t.text).ok())
+            })
+        })
+        .filter(|v| v.is_object())
+}
+
+/// An app slug that may be sent to the gateway as `app:<slug>`.
+fn valid_app_slug(slug: &str) -> bool {
+    let mut cs = slug.chars();
+    slug.len() <= 63
+        && cs
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && cs.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
 }
 
 /// Turn an app-route error into a sentence for the agent. `action` finishes
@@ -1415,6 +1464,9 @@ impl QuomeMcp {
             creds,
             email_cursors: Arc::default(),
             local: Arc::new(default_scope()),
+            app_backends: Arc::default(),
+            app_hashes: Arc::default(),
+            gateway: Arc::default(),
             tool_router: Self::tool_router(),
         }
     }
@@ -1446,6 +1498,150 @@ impl QuomeMcp {
         self
     }
 
+    /// The org's MCP gateway client, connected on first use. A failure is
+    /// returned as the gateway client's own message (never the token).
+    async fn gateway_client(&self) -> Result<Arc<GatewayClient>, String> {
+        let mut held = self.gateway.lock().await;
+        if let Some(g) = held.as_ref() {
+            return Ok(g.clone());
+        }
+        let api = self.conn().api.clone();
+        let g = Arc::new(
+            GatewayClient::connect(api, &[])
+                .await
+                .map_err(|e| e.to_string())?,
+        );
+        *held = Some(g.clone());
+        Ok(g)
+    }
+
+    fn remember_backend(&self, app: &str, backend: &str) {
+        self.app_backends
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(app.to_string(), backend.to_string());
+    }
+
+    fn forget_backend(&self, app: &str) {
+        self.app_backends
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(app);
+    }
+
+    /// If the gateway's refusal is the error code `server_unknown`, forget
+    /// the remembered backend so the next call tries the relay again. Only
+    /// the parsed code counts, never message text.
+    fn forget_if_unknown_server(&self, app: &str, r: &rmcp::model::CallToolResult) {
+        let body = gateway_body(r);
+        if body
+            .as_ref()
+            .is_some_and(|v| v["error"]["code"] == "server_unknown")
+        {
+            self.forget_backend(app);
+        }
+    }
+
+    /// The backend learned for this tool, when it is not the relay.
+    fn gateway_backend(&self, app: &str) -> bool {
+        self.app_backends
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(app)
+            .is_some_and(|b| b != "relay")
+    }
+
+    /// Call an app tool through the gateway. Its result is passed on unchanged;
+    /// a refusal (`isError`) comes back as an error carrying the same text.
+    async fn gateway_call(
+        &self,
+        app: &str,
+        tool: &str,
+        args: serde_json::Value,
+    ) -> Result<String, String> {
+        if !valid_app_slug(app) {
+            return Err(format!("{app:?} is not a valid app slug."));
+        }
+        let g = self.gateway_client().await?;
+        let mut a = serde_json::json!({"server": format!("app:{app}"), "tool": tool, "args": args});
+        let hash = self
+            .app_hashes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(app.to_string(), tool.to_string()))
+            .cloned();
+        if let Some(h) = hash {
+            a["schema_hash"] = serde_json::Value::String(h);
+        }
+        let r = g
+            .call_tool("call_tool", a, None)
+            .await
+            .map_err(|e| e.to_string())?;
+        let text = json(&r)?;
+        if r.is_error == Some(true) {
+            self.forget_if_unknown_server(app, &r);
+            Err(text)
+        } else {
+            Ok(text)
+        }
+    }
+
+    /// Describe an app tool through the gateway, in the shape the relay's
+    /// describe answers, and remember the schema hash for later calls.
+    async fn gateway_describe(&self, app: &str, tool: &str) -> Result<String, String> {
+        if !valid_app_slug(app) {
+            return Err(format!("{app:?} is not a valid app slug."));
+        }
+        let g = self.gateway_client().await?;
+        let r = g
+            .call_tool(
+                "describe_tool",
+                serde_json::json!({"server": format!("app:{app}"), "tool": tool}),
+                None,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        if r.is_error == Some(true) {
+            let text = json(&r)?;
+            self.forget_if_unknown_server(app, &r);
+            return Err(text);
+        }
+        let v = gateway_body(&r).ok_or_else(|| {
+            "The org's MCP gateway sent no description for that tool.".to_string()
+        })?;
+        if let Some(h) = v["schema_hash"].as_str().filter(|h| !h.is_empty()) {
+            self.app_hashes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert((app.to_string(), tool.to_string()), h.to_string());
+        }
+        let mut out = serde_json::json!({"app": app, "tool": tool});
+        out["description"] = v["description"].clone();
+        if out["description"].is_null() {
+            out["description"] = "".into();
+        }
+        let schema = if v["input_schema"].is_null() {
+            &v["inputSchema"]
+        } else {
+            &v["input_schema"]
+        };
+        out["input_schema"] = schema.clone();
+        if !v["annotations"].is_null() {
+            out["annotations"] = v["annotations"].clone();
+        }
+        if let Some(c) = v["class"].as_str() {
+            out["class"] = c.into();
+        }
+        for k in ["needs_approval", "held"] {
+            if !v[k].is_null() {
+                out[k] = v[k].clone();
+            }
+        }
+        out["destructive"] =
+            (v["class"] == "destructive" || v["annotations"]["destructiveHint"] == true).into();
+        json(&out)
+    }
+
     fn conn(&self) -> Arc<Conn> {
         self.conn.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
@@ -1472,6 +1668,7 @@ impl QuomeMcp {
             profile: Arc::new(profile),
             playbooks: tokio::sync::OnceCell::new(),
         });
+        *self.gateway.lock().await = None;
         true
     }
 
@@ -2859,9 +3056,14 @@ impl QuomeMcp {
         &self,
         Parameters(a): Parameters<FindToolsArgs>,
     ) -> Result<String, String> {
-        let r = call!(self, |api| api
+        let mut r = call!(self, |api| api
             .find_app_tools(a.query.as_deref(), a.app.as_deref()))
         .map_err(|e| app_hint(e, "search app tools"))?;
+        for h in &mut r.results {
+            let b = h.backend.take().unwrap_or_else(|| "relay".into());
+            self.remember_backend(&h.app, &b);
+            h.backend = Some(b);
+        }
         let mut out = json(&r)?;
         if r.truncated {
             out.push_str("\nNarrow the query to see more.");
@@ -2877,10 +3079,19 @@ impl QuomeMcp {
         &self,
         Parameters(a): Parameters<AppToolArgs>,
     ) -> Result<String, String> {
-        json(
-            &call!(self, |api| api.describe_app_tool(&a.app, &a.tool))
-                .map_err(|e| app_hint(e, "describe app tools"))?,
-        )
+        if self.gateway_backend(&a.app) {
+            return self.gateway_describe(&a.app, &a.tool).await;
+        }
+        match call_raw!(self, |api| api.describe_app_tool(&a.app, &a.tool)) {
+            Ok(d) => json(&d),
+            Err(e) => match use_backend(&e) {
+                Some(b) => {
+                    self.remember_backend(&a.app, &b);
+                    self.gateway_describe(&a.app, &a.tool).await
+                }
+                None => Err(app_hint(fail(e), "describe app tools")),
+            },
+        }
     }
 
     #[tool(
@@ -2891,9 +3102,20 @@ impl QuomeMcp {
         Parameters(a): Parameters<CallToolArgs>,
     ) -> Result<String, String> {
         let args = serde_json::Value::Object(a.arguments);
-        let r = call!(self, |api| api.call_app_tool(&a.app, &a.tool, &args))
-            .map_err(|e| app_hint(e, "call destructive app tools"))?;
-        json(&r)
+        if self.gateway_backend(&a.app) {
+            return self.gateway_call(&a.app, &a.tool, args).await;
+        }
+        match call_raw!(self, |api| api.call_app_tool(&a.app, &a.tool, &args)) {
+            Ok(r) => json(&r),
+            Err(e) => match use_backend(&e) {
+                // The relay says another backend serves this app: one retry there.
+                Some(b) => {
+                    self.remember_backend(&a.app, &b);
+                    self.gateway_call(&a.app, &a.tool, args).await
+                }
+                None => Err(app_hint(fail(e), "call destructive app tools")),
+            },
+        }
     }
 
     #[tool(
@@ -10254,5 +10476,609 @@ mod tests {
         let v: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["state"], "awaiting_approval");
         assert!(v["message"].as_str().unwrap().contains("approve"));
+    }
+
+    // --- app tools served by the org's MCP gateway ---
+
+    /// Serve the gateway on the mock: a token route, the MCP handshake, and
+    /// `tools/call` answered by `answer(tool_name, arguments)`.
+    async fn mount_gateway(
+        s: &MockServer,
+        answer: impl Fn(&str, &Value) -> Value + Send + Sync + 'static,
+    ) {
+        Mock::given(method("POST"))
+            .and(path(api_path("/mcp/token")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"access_token":"GWTOK","expires_in":3600,"url":format!("{}/gw", s.uri())}),
+            ))
+            .mount(s)
+            .await;
+        let rpc = move |req: &wiremock::Request| {
+            let b: Value = serde_json::from_slice(&req.body).unwrap();
+            let id = b["id"].clone();
+            let result = match b["method"].as_str().unwrap() {
+                "initialize" => {
+                    return ResponseTemplate::new(200)
+                        .insert_header("mcp-session-id", "sess")
+                        .set_body_json(json!({"jsonrpc":"2.0","id":id,"result":{
+                            "protocolVersion":"2025-06-18","capabilities":{},
+                            "serverInfo":{"name":"gw","version":"1"}}}));
+                }
+                "tools/call" => answer(
+                    b["params"]["name"].as_str().unwrap(),
+                    &b["params"]["arguments"],
+                ),
+                _ => return ResponseTemplate::new(202),
+            };
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"jsonrpc":"2.0","id":id,"result":result}))
+        };
+        Mock::given(method("POST"))
+            .and(path("/gw"))
+            .respond_with(rpc)
+            .mount(s)
+            .await;
+    }
+
+    /// The `arguments` of every gateway `tools/call` so far, with the tool name.
+    async fn gateway_calls(s: &MockServer) -> Vec<(String, Value)> {
+        s.received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() == "/gw")
+            .filter_map(|r| serde_json::from_slice::<Value>(&r.body).ok())
+            .filter(|b| b["method"] == "tools/call")
+            .map(|b| {
+                (
+                    b["params"]["name"].as_str().unwrap().to_string(),
+                    b["params"]["arguments"].clone(),
+                )
+            })
+            .collect()
+    }
+
+    async fn relay_calls(s: &MockServer) -> usize {
+        s.received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path().contains("/app-installs/") && r.url.path().ends_with("/call"))
+            .count()
+    }
+
+    async fn mount_find(s: &MockServer, hits: Value) {
+        Mock::given(method("GET"))
+            .and(path(api_path("/app-installs/tools")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"results":hits,"truncated":false})),
+            )
+            .mount(s)
+            .await;
+    }
+
+    fn ok_result(text: &str) -> Value {
+        json!({"content":[{"type":"text","text":text}],"isError":false})
+    }
+
+    async fn mount_relay_409(s: &MockServer, reason: &str) {
+        Mock::given(method("POST"))
+            .and(path(api_path("/app-installs/sales/tools/t/call")))
+            .respond_with(
+                ResponseTemplate::new(409)
+                    .set_body_json(json!({"detail":"conflict","reason":reason})),
+            )
+            .mount(s)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn find_hits_show_backend() {
+        let (s, mut c) = start().await;
+        mount_find(
+            &s,
+            json!([
+                {"app":"sales","tool":"a","summary":"s","destructive":false,"backend":"gateway"},
+                {"app":"sales","tool":"b","summary":"s","destructive":false,"backend":"relay"},
+                {"app":"notes","tool":"c","summary":"s","destructive":false}
+            ]),
+        )
+        .await;
+        let (err, text) = c.call("find_app_tools", json!({})).await;
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        let backends: Vec<&str> = v["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["backend"].as_str().unwrap())
+            .collect();
+        assert_eq!(backends, ["gateway", "relay", "relay"]);
+    }
+
+    #[tokio::test]
+    async fn call_routes_gateway_backend_to_gateway() {
+        let (s, mut c) = start().await;
+        mount_find(
+            &s,
+            json!([{"app":"sales","tool":"t","summary":"s","destructive":false,"backend":"gateway"}]),
+        )
+        .await;
+        mount_gateway(&s, |_, _| ok_result("via gateway")).await;
+        Mock::given(method("POST"))
+            .and(path(api_path("/app-installs/sales/tools/t/call")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(0)
+            .mount(&s)
+            .await;
+        c.call("find_app_tools", json!({})).await;
+        let (err, text) = c
+            .call(
+                "call_app_tool",
+                json!({"app":"sales","tool":"t","arguments":{"x":1}}),
+            )
+            .await;
+        assert!(!err, "{text}");
+        assert!(text.contains("via gateway"), "{text}");
+        assert!(!text.contains("GWTOK"));
+        assert_eq!(relay_calls(&s).await, 0);
+        assert_eq!(
+            gateway_calls(&s).await,
+            vec![(
+                "call_tool".to_string(),
+                json!({"server":"app:sales","tool":"t","args":{"x":1}})
+            )]
+        );
+        // the client is reused
+        c.call(
+            "call_app_tool",
+            json!({"app":"sales","tool":"t","arguments":{}}),
+        )
+        .await;
+        let tokens = s
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() == api_path("/mcp/token"))
+            .count();
+        assert_eq!(tokens, 1);
+    }
+
+    #[tokio::test]
+    async fn relay_409_use_other_backend_retries_once_via_gateway() {
+        let (s, mut c) = start().await;
+        mount_relay_409(&s, "use_gateway").await;
+        mount_gateway(&s, |_, _| ok_result("moved")).await;
+        let (err, text) = c
+            .call(
+                "call_app_tool",
+                json!({"app":"sales","tool":"t","arguments":{"x":1}}),
+            )
+            .await;
+        assert!(!err, "{text}");
+        assert!(text.contains("moved"));
+        assert_eq!(relay_calls(&s).await, 1);
+        assert_eq!(gateway_calls(&s).await.len(), 1);
+        // remembered: the next call skips the relay
+        c.call(
+            "call_app_tool",
+            json!({"app":"sales","tool":"t","arguments":{}}),
+        )
+        .await;
+        assert_eq!(relay_calls(&s).await, 1);
+        assert_eq!(gateway_calls(&s).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn gateway_failure_after_409_is_not_retried() {
+        let (s, mut c) = start().await;
+        mount_relay_409(&s, "use_gateway").await;
+        mount_gateway(
+            &s,
+            |_, _| json!({"content":[{"type":"text","text":"refused"}],"isError":true}),
+        )
+        .await;
+        let (err, text) = c
+            .call(
+                "call_app_tool",
+                json!({"app":"sales","tool":"t","arguments":{}}),
+            )
+            .await;
+        assert!(err);
+        assert!(text.contains("refused"));
+        assert_eq!(relay_calls(&s).await, 1);
+        assert_eq!(gateway_calls(&s).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn other_409s_do_not_retry() {
+        for reason in ["something_else", "use_relay", "use_"] {
+            let (s, mut c) = start().await;
+            mount_relay_409(&s, reason).await;
+            mount_gateway(&s, |_, _| ok_result("no")).await;
+            let (err, text) = c
+                .call(
+                    "call_app_tool",
+                    json!({"app":"sales","tool":"t","arguments":{}}),
+                )
+                .await;
+            assert!(err, "{reason}");
+            assert!(text.contains(reason), "{text}");
+            assert_eq!(gateway_calls(&s).await.len(), 0, "{reason}");
+            assert_eq!(relay_calls(&s).await, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_backend_unchanged() {
+        let (s, mut c) = start().await;
+        mount_find(
+            &s,
+            json!([{"app":"sales","tool":"t","summary":"s","destructive":false,"backend":"relay"}]),
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path(api_path("/app-installs/sales/tools/t/call")))
+            .and(body_json(json!({"arguments":{"x":1}})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"content":[{"text":"relayed"}]})),
+            )
+            .expect(2)
+            .mount(&s)
+            .await;
+        c.call("find_app_tools", json!({})).await;
+        for _ in 0..2 {
+            let (err, text) = c
+                .call(
+                    "call_app_tool",
+                    json!({"app":"sales","tool":"t","arguments":{"x":1}}),
+                )
+                .await;
+            assert!(!err, "{text}");
+            assert!(text.contains("relayed"));
+        }
+        assert!(gateway_calls(&s).await.is_empty());
+        assert!(!s
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.url.path() == api_path("/mcp/token")));
+    }
+
+    #[tokio::test]
+    async fn describe_routes_gateway_backend_to_gateway() {
+        let (s, mut c) = start().await;
+        mount_find(
+            &s,
+            json!([{"app":"sales","tool":"t","summary":"s","destructive":false,"backend":"gateway"}]),
+        )
+        .await;
+        mount_gateway(&s, |name, _| {
+            assert_eq!(name, "describe_tool");
+            json!({"content":[{"type":"text","text":"{}"}],"isError":false,
+                   "structuredContent":{"description":"Sends mail","input_schema":{"type":"object"},
+                       "annotations":{"destructiveHint":true},"class":"destructive","schema_hash":"h1"}})
+        })
+        .await;
+        Mock::given(method("GET"))
+            .and(path(api_path("/app-installs/sales/tools/t")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(0)
+            .mount(&s)
+            .await;
+        c.call("find_app_tools", json!({})).await;
+        let (err, text) = c
+            .call("describe_app_tool", json!({"app":"sales","tool":"t"}))
+            .await;
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["app"], "sales");
+        assert_eq!(v["tool"], "t");
+        assert_eq!(v["description"], "Sends mail");
+        assert_eq!(v["input_schema"], json!({"type":"object"}));
+        assert_eq!(v["destructive"], true);
+        assert_eq!(
+            gateway_calls(&s).await,
+            vec![(
+                "describe_tool".to_string(),
+                json!({"server":"app:sales","tool":"t"})
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn describe_unknown_backend_409_retries_via_gateway() {
+        let (s, mut c) = start().await;
+        Mock::given(method("GET"))
+            .and(path(api_path("/app-installs/sales/tools/t")))
+            .respond_with(
+                ResponseTemplate::new(409)
+                    .set_body_json(json!({"detail":"conflict","reason":"use_gateway"})),
+            )
+            .mount(&s)
+            .await;
+        mount_gateway(
+            &s,
+            |_, _| json!({"content":[],"isError":false,"structuredContent":{"input_schema":{}}}),
+        )
+        .await;
+        let (err, text) = c
+            .call("describe_app_tool", json!({"app":"sales","tool":"t"}))
+            .await;
+        assert!(!err, "{text}");
+        assert_eq!(gateway_calls(&s).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn gateway_call_passes_remembered_schema_hash() {
+        let (s, mut c) = start().await;
+        mount_find(
+            &s,
+            json!([{"app":"sales","tool":"t","summary":"s","destructive":false,"backend":"gateway"}]),
+        )
+        .await;
+        mount_gateway(&s, |name, _| {
+            if name == "describe_tool" {
+                // no structured content: the hash comes from the text
+                json!({"content":[{"type":"text","text":"{\"input_schema\":{},\"schema_hash\":\"h42\"}"}],"isError":false})
+            } else {
+                ok_result("done")
+            }
+        })
+        .await;
+        c.call("find_app_tools", json!({})).await;
+        c.call(
+            "call_app_tool",
+            json!({"app":"sales","tool":"t","arguments":{}}),
+        )
+        .await;
+        c.call("describe_app_tool", json!({"app":"sales","tool":"t"}))
+            .await;
+        c.call(
+            "call_app_tool",
+            json!({"app":"sales","tool":"t","arguments":{"a":2}}),
+        )
+        .await;
+        let calls = gateway_calls(&s).await;
+        let only: Vec<&Value> = calls
+            .iter()
+            .filter(|(n, _)| n == "call_tool")
+            .map(|(_, a)| a)
+            .collect();
+        assert_eq!(only.len(), 2);
+        assert!(only[0].get("schema_hash").is_none());
+        assert_eq!(only[1]["schema_hash"], "h42");
+        assert_eq!(only[1]["args"], json!({"a":2}));
+    }
+
+    #[tokio::test]
+    async fn gateway_pending_result_passed_through_not_retried() {
+        let (s, mut c) = start().await;
+        mount_find(
+            &s,
+            json!([{"app":"sales","tool":"t","summary":"s","destructive":true,"backend":"gateway"}]),
+        )
+        .await;
+        mount_gateway(&s, |_, _| {
+            json!({"content":[{"type":"text","text":"parked"}],"isError":false,
+                   "structuredContent":{"status":"pending","approval_id":"ap1","expires_at":"2030-01-01T00:00:00Z"}})
+        })
+        .await;
+        c.call("find_app_tools", json!({})).await;
+        let (err, text) = c
+            .call(
+                "call_app_tool",
+                json!({"app":"sales","tool":"t","arguments":{}}),
+            )
+            .await;
+        assert!(!err, "{text}");
+        assert!(text.contains("\"approval_id\""), "{text}");
+        assert!(text.contains("ap1"));
+        assert_eq!(gateway_calls(&s).await.len(), 1);
+        assert_eq!(relay_calls(&s).await, 0);
+    }
+
+    #[tokio::test]
+    async fn free_text_use_backend_does_not_retry() {
+        let (s, mut c) = start().await;
+        Mock::given(method("POST"))
+            .and(path(api_path("/app-installs/sales/tools/t/call")))
+            .respond_with(ResponseTemplate::new(409).set_body_json(
+                json!({"detail":"use_gateway","reason":"busy","message":"use_gateway"}),
+            ))
+            .mount(&s)
+            .await;
+        mount_gateway(&s, |_, _| ok_result("no")).await;
+        let (err, _) = c
+            .call(
+                "call_app_tool",
+                json!({"app":"sales","tool":"t","arguments":{}}),
+            )
+            .await;
+        assert!(err);
+        assert!(gateway_calls(&s).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn non_409_with_use_reason_does_not_retry() {
+        let (s, mut c) = start().await;
+        Mock::given(method("POST"))
+            .and(path(api_path("/app-installs/sales/tools/t/call")))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_json(json!({"detail":"bad","reason":"use_gateway"})),
+            )
+            .mount(&s)
+            .await;
+        mount_gateway(&s, |_, _| ok_result("no")).await;
+        let (err, _) = c
+            .call(
+                "call_app_tool",
+                json!({"app":"sales","tool":"t","arguments":{}}),
+            )
+            .await;
+        assert!(err);
+        assert!(gateway_calls(&s).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn backend_is_remembered_per_app() {
+        let (s, mut c) = start().await;
+        mount_relay_409(&s, "use_gateway").await;
+        mount_gateway(&s, |_, _| ok_result("ok")).await;
+        c.call(
+            "call_app_tool",
+            json!({"app":"sales","tool":"t","arguments":{}}),
+        )
+        .await;
+        // another tool of the same app goes straight to the gateway
+        c.call(
+            "call_app_tool",
+            json!({"app":"sales","tool":"u","arguments":{}}),
+        )
+        .await;
+        assert_eq!(relay_calls(&s).await, 1);
+        assert_eq!(gateway_calls(&s).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn later_find_moves_app_back_to_relay() {
+        let (s, mut c) = start().await;
+        mount_relay_409(&s, "use_gateway").await;
+        mount_gateway(&s, |_, _| ok_result("ok")).await;
+        c.call(
+            "call_app_tool",
+            json!({"app":"sales","tool":"t","arguments":{}}),
+        )
+        .await;
+        mount_find(
+            &s,
+            json!([{"app":"sales","tool":"t","summary":"s","destructive":false,"backend":"relay"}]),
+        )
+        .await;
+        c.call("find_app_tools", json!({})).await;
+        c.call(
+            "call_app_tool",
+            json!({"app":"sales","tool":"t","arguments":{}}),
+        )
+        .await;
+        // the relay was tried again (it still answers 409, so the call is
+        // retried once through the gateway)
+        assert_eq!(relay_calls(&s).await, 2);
+        assert_eq!(gateway_calls(&s).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn server_unknown_answer_clears_remembered_backend() {
+        let (s, mut c) = start().await;
+        mount_find(
+            &s,
+            json!([{"app":"sales","tool":"t","summary":"s","destructive":false,"backend":"gateway"}]),
+        )
+        .await;
+        mount_gateway(&s, |_, _| {
+            json!({"content":[{"type":"text","text":"{\"error\":{\"code\":\"server_unknown\",\"message\":\"x\"}}"}],"isError":true})
+        })
+        .await;
+        Mock::given(method("POST"))
+            .and(path(api_path("/app-installs/sales/tools/t/call")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"content":[]})))
+            .mount(&s)
+            .await;
+        c.call("find_app_tools", json!({})).await;
+        let (err, _) = c
+            .call(
+                "call_app_tool",
+                json!({"app":"sales","tool":"t","arguments":{}}),
+            )
+            .await;
+        assert!(err);
+        assert_eq!(relay_calls(&s).await, 0);
+        let (err, _) = c
+            .call(
+                "call_app_tool",
+                json!({"app":"sales","tool":"t","arguments":{}}),
+            )
+            .await;
+        assert!(!err);
+        assert_eq!(relay_calls(&s).await, 1);
+    }
+
+    #[tokio::test]
+    async fn refusal_text_with_the_words_does_not_clear_backend() {
+        let (s, mut c) = start().await;
+        mount_find(
+            &s,
+            json!([{"app":"sales","tool":"t","summary":"s","destructive":false,"backend":"gateway"}]),
+        )
+        .await;
+        mount_gateway(&s, |_, _| {
+            json!({"content":[{"type":"text","text":"server_unknown is mentioned here"}],"isError":true,
+                   "structuredContent":{"error":{"code":"denied","message":"server_unknown unknown_server"}}})
+        })
+        .await;
+        c.call("find_app_tools", json!({})).await;
+        for _ in 0..2 {
+            let (err, _) = c
+                .call(
+                    "call_app_tool",
+                    json!({"app":"sales","tool":"t","arguments":{}}),
+                )
+                .await;
+            assert!(err);
+        }
+        assert_eq!(relay_calls(&s).await, 0);
+        assert_eq!(gateway_calls(&s).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn invalid_slug_is_never_sent_to_gateway() {
+        let (s, mut c) = start().await;
+        mount_find(
+            &s,
+            json!([{"app":"Bad:slug","tool":"t","summary":"s","destructive":false,"backend":"gateway"}]),
+        )
+        .await;
+        mount_gateway(&s, |_, _| ok_result("no")).await;
+        c.call("find_app_tools", json!({})).await;
+        let (err, text) = c
+            .call(
+                "call_app_tool",
+                json!({"app":"Bad:slug","tool":"t","arguments":{}}),
+            )
+            .await;
+        assert!(err);
+        assert!(text.contains("not a valid app slug"), "{text}");
+        let (err, _) = c
+            .call("describe_app_tool", json!({"app":"Bad:slug","tool":"t"}))
+            .await;
+        assert!(err);
+        assert!(gateway_calls(&s).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn gateway_describe_keeps_approval_and_held() {
+        let (s, mut c) = start().await;
+        mount_find(
+            &s,
+            json!([{"app":"sales","tool":"t","summary":"s","destructive":true,"backend":"gateway"}]),
+        )
+        .await;
+        mount_gateway(&s, |_, _| {
+            json!({"content":[],"isError":false,"structuredContent":{
+                "input_schema":{},"class":"destructive","needs_approval":true,"held":false}})
+        })
+        .await;
+        c.call("find_app_tools", json!({})).await;
+        let (err, text) = c
+            .call("describe_app_tool", json!({"app":"sales","tool":"t"}))
+            .await;
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["needs_approval"], true);
+        assert_eq!(v["held"], false);
+        assert_eq!(v["class"], "destructive");
     }
 }

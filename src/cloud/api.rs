@@ -379,6 +379,10 @@ pub struct ToolHit {
     pub tool: String,
     pub summary: String,
     pub destructive: bool,
+    /// Which backend serves the app: `relay`, or another value for the org's
+    /// MCP gateway. Absent from older servers, which means the relay.
+    #[serde(default)]
+    pub backend: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -687,6 +691,22 @@ fn map_error(status: u16, text: &str) -> QuomeError {
                 .join(": ");
             QuomeError::ApiError(format!("{code} {msg}").trim().to_string())
         }
+    }
+}
+
+/// `map_error`, keeping the status and `reason` of an API error answer so a
+/// caller can decide on them rather than on the message text.
+fn map_error_with_reason(status: u16, text: &str) -> QuomeError {
+    match map_error(status, text) {
+        QuomeError::ApiError(message) => {
+            let v: serde_json::Value = serde_json::from_str(text).unwrap_or_default();
+            QuomeError::ApiRefused {
+                message,
+                status,
+                reason: v["reason"].as_str().unwrap_or("").to_string(),
+            }
+        }
+        e => e,
     }
 }
 
@@ -1115,7 +1135,11 @@ impl CloudApi {
         tool: &str,
     ) -> Result<ToolDetail, QuomeError> {
         let p = self.org_path(&format!("/app-installs/{}/tools/{}", enc(slug), enc(tool)));
-        self.json(Method::GET, &p, |b| b).await
+        Ok(self
+            .send_mapping(Method::GET, &p, |b| b, map_error_with_reason)
+            .await?
+            .json()
+            .await?)
     }
 
     pub async fn call_app_tool(
@@ -1130,7 +1154,11 @@ impl CloudApi {
             enc(tool)
         ));
         let body = serde_json::json!({"arguments": arguments});
-        self.json(Method::POST, &p, |b| b.json(&body)).await
+        Ok(self
+            .send_mapping(Method::POST, &p, |b| b.json(&body), map_error_with_reason)
+            .await?
+            .json()
+            .await?)
     }
 
     pub async fn app_keys(&self, slug: &str) -> Result<AppKeys, QuomeError> {
@@ -2504,6 +2532,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.results[0].tool, "send_email");
+        assert_eq!(r.results[0].backend, None);
+    }
+
+    #[test]
+    fn tool_hit_reads_backend() {
+        let h: ToolHit = serde_json::from_value(serde_json::json!(
+            {"app":"a","tool":"t","summary":"s","destructive":false,"backend":"gateway"}
+        ))
+        .unwrap();
+        assert_eq!(h.backend.as_deref(), Some("gateway"));
     }
 
     #[tokio::test]
