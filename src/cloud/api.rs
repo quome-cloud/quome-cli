@@ -101,6 +101,37 @@ impl std::fmt::Debug for AuthToken {
     }
 }
 
+/// A short-lived token for the org's MCP gateway, brokered by the platform,
+/// with the gateway's MCP endpoint.
+#[derive(Clone, Deserialize, PartialEq)]
+pub struct McpToken {
+    pub access_token: String,
+    /// Seconds; a missing or null value means "do not cache".
+    #[serde(default, deserialize_with = "seconds_or_zero")]
+    pub expires_in: u64,
+    pub url: String,
+}
+
+/// Never prints the token itself.
+impl std::fmt::Debug for McpToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpToken")
+            .field("access_token", &"<redacted>")
+            .field("expires_in", &self.expires_in)
+            .field("url", &self.url)
+            .finish()
+    }
+}
+
+/// Which way an agent reaches the org's tools.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrontDoor {
+    /// The CLI serves the tools itself.
+    Direct,
+    /// The CLI forwards tool calls to the org's MCP gateway.
+    Gateway,
+}
+
 /// Per-request timeout for Git routes; the platform may hold a request up to
 /// 60 s while the org's git server starts.
 pub const GIT_REQUEST_TIMEOUT: Duration = Duration::from_secs(75);
@@ -821,6 +852,11 @@ impl CloudApi {
         Ok(check(resp, map_error).await?.json().await?)
     }
 
+    /// The platform's API base URL.
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base
+    }
+
     fn org_path(&self, rest: &str) -> String {
         format!("/orgs/{}{}", enc(&self.org), rest)
     }
@@ -1281,6 +1317,29 @@ impl CloudApi {
             b.json(&body)
         })
         .await
+    }
+
+    /// A token for the org's MCP gateway with `scope`. Goes through `send_git`
+    /// for its long timeout and because a 503 keeps its `Retry-After`.
+    pub async fn mcp_token(&self, scope: &[&str]) -> Result<McpToken, QuomeError> {
+        let body = serde_json::json!({ "scope": scope });
+        self.send_git(Method::POST, &self.org_path("/mcp/token"), |b| {
+            b.json(&body)
+        })
+        .await
+    }
+
+    /// How this org's agents reach its tools.
+    pub async fn mcp_config(&self) -> Result<FrontDoor, String> {
+        let v: serde_json::Value = self
+            .json(Method::GET, &self.org_path("/mcp/config"), |b| b)
+            .await
+            .map_err(|e| e.to_string())?;
+        match v["front_door"].as_str() {
+            Some("direct") => Ok(FrontDoor::Direct),
+            Some("gateway") => Ok(FrontDoor::Gateway),
+            _ => Err("the platform sent an unknown front door".into()),
+        }
     }
 
     /// The org's credential providers, as the platform sends them.
