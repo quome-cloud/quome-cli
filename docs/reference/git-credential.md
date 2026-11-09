@@ -41,6 +41,18 @@ Then use git as usual:
 git clone https://git.quome.cloud/acme/api.git
 ```
 
+### Repos outside the org (the egress host)
+
+The helper also answers for the org's egress host, `egress.<apps domain>`, which reaches repos on other Git hosts through the org's Credentials. Set it up the same way, with the egress host in place of the git host:
+
+```bash
+git config --global credential.https://egress.quome.cloud.helper ''
+git config --global --add credential.https://egress.quome.cloud.helper '!quome git-credential'
+git config --global credential.https://egress.quome.cloud.useHttpPath true
+```
+
+Egress URLs start with the org, then `git`, the host, and the repo: `https://egress.quome.cloud/acme/git/github.com/octo/app.git`. As on the git host, the first path segment (the org) is how the helper picks the connection, so `useHttpPath` is needed once several connections serve the host. Here the helper asks for Credentials access (`credentials_use`) instead of Git access. If the connection lacks it, nothing is printed on stdout and stderr says: Run `quome connect` again and allow Credentials access.
+
 ## What it answers
 
 For `get`, git sends the repo it wants on stdin and the helper prints the credential:
@@ -54,7 +66,7 @@ password_expiry_utc=1767225900
 
 `password` is a token that works for 5 minutes. `password_expiry_utc` is when it stops working, in Unix seconds; recent versions of git use it to ask again instead of reusing an expired token.
 
-The helper answers only for `https` URLs whose host and org match one of your connections. For anything else it prints nothing and exits successfully, so git moves on to its next helper. `--profile <name>` only narrows which connection is considered; the host, `https` and the org in the path must still match.
+The helper answers only for `https` URLs whose host is exactly `git.<apps domain>` or `egress.<apps domain>` of one of your connections and whose org matches. Look-alike hosts get nothing. For anything else it prints nothing and exits successfully, so git moves on to its next helper. `--profile <name>` only narrows which connection is considered; the host, `https` and the org in the path must still match.
 
 `store` and `erase` do nothing and print nothing: there is no password to remember or forget, because each `get` asks for a new token.
 

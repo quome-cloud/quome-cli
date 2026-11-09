@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use crate::cloud::api::{CloudApi, GitToken};
 use crate::cloud::auth::TokenSource;
-use crate::cloud::git::{git_host, GitClient};
+use crate::cloud::credentials::{cred_hint, CredentialsClient};
+use crate::cloud::git::{egress_host, git_host, GitClient};
 use crate::cloud::keys::{platform_store, AgentKey, KeyStore};
 use crate::cloud::state::{CloudState, Profile};
 use crate::errors::{QuomeError, Result};
@@ -56,13 +57,22 @@ pub fn parse_request(input: &str) -> Request {
     r
 }
 
-/// The profile that serves `req`, with its name. `None` when no connection
-/// serves that host.
+/// Which service answers for a host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredTarget {
+    /// `git.<apps_domain>`: the org's own Git repos.
+    OrgGit,
+    /// `egress.<apps_domain>`: outside repos through the credentials service.
+    Egress,
+}
+
+/// The profile that serves `req`, with its name and which service the host
+/// belongs to. `None` when no connection serves that host.
 pub fn pick_profile<'a>(
     state: &'a CloudState,
     req: &Request,
     forced: Option<&str>,
-) -> std::result::Result<Option<(String, &'a Profile)>, QuomeError> {
+) -> std::result::Result<Option<(String, &'a Profile, CredTarget)>, QuomeError> {
     let only = match forced {
         Some(name) => Some((name, state.profile(Some(name))?)),
         None => None,
@@ -76,20 +86,29 @@ pub fn pick_profile<'a>(
         .path
         .as_deref()
         .map(|p| p.trim_start_matches('/').split('/').next().unwrap_or(""));
-    let found: Vec<(&String, &Profile)> = state
+    let target_of = |p: &Profile| {
+        if git_host(p).to_lowercase() == host {
+            Some(CredTarget::OrgGit)
+        } else if egress_host(p).to_lowercase() == host {
+            Some(CredTarget::Egress)
+        } else {
+            None
+        }
+    };
+    let found: Vec<(&String, &Profile, CredTarget)> = state
         .profiles
         .iter()
         .filter(|(n, _)| only.is_none_or(|(name, _)| n.as_str() == name))
-        .filter(|(_, p)| git_host(p).to_lowercase() == host)
-        .filter(|(_, p)| org.is_none_or(|o| p.org_slug == o))
+        .filter_map(|(n, p)| target_of(p).map(|t| (n, p, t)))
+        .filter(|(_, p, _)| org.is_none_or(|o| p.org_slug == o))
         .collect();
     match found.as_slice() {
         [] => Ok(None),
-        [(n, p)] => Ok(Some(((*n).clone(), p))),
+        [(n, p, t)] => Ok(Some(((*n).clone(), p, *t))),
         many => many
             .iter()
-            .find(|(n, _)| **n == state.default)
-            .map(|(n, p)| Some(((*n).clone(), *p)))
+            .find(|(n, _, _)| **n == state.default)
+            .map(|(n, p, t)| Some(((*n).clone(), *p, *t)))
             .ok_or_else(|| {
                 QuomeError::CloudState(format!(
                     "Several Quome Cloud connections serve {}; run `git config --global \
@@ -102,11 +121,14 @@ pub fn pick_profile<'a>(
 
 /// git's answer for `token`, valid until `now_unix + expires_in`.
 pub fn answer(token: &GitToken, now_unix: u64) -> String {
-    format!(
-        "username=quome\npassword={}\npassword_expiry_utc={}\n",
-        token.access_token,
-        now_unix + token.expires_in
-    )
+    let mut out = format!("username=quome\npassword={}\n", token.access_token);
+    if token.expires_in > 0 {
+        out.push_str(&format!(
+            "password_expiry_utc={}\n",
+            now_unix + token.expires_in
+        ));
+    }
+    out
 }
 
 /// The text for git's stdout, or `None` for nothing. `now_unix` reads the
@@ -123,17 +145,31 @@ pub async fn run(
     }
     let state = CloudState::load_from(home)?;
     let req = parse_request(input);
-    let Some((name, profile)) = pick_profile(&state, &req, args.profile.as_deref())? else {
+    let Some((name, profile, target)) = pick_profile(&state, &req, args.profile.as_deref())? else {
         return Ok(None);
     };
     let p = Arc::new(profile.clone());
     let (key, vrc) = AgentKey::load_from(store, &name)?;
     let api = Arc::new(CloudApi::new(&p, TokenSource::new(&p, key, vrc)));
-    let git = GitClient::new(Arc::new(move || (api.clone(), p.clone())));
-    let token = git
-        .credential_token()
-        .await
-        .map_err(|e| QuomeError::Usage(e.message()))?;
+    let token = match target {
+        CredTarget::OrgGit => {
+            let git = GitClient::new(Arc::new(move || (api.clone(), p.clone())));
+            git.credential_token()
+                .await
+                .map_err(|e| QuomeError::Usage(e.message()))?
+        }
+        CredTarget::Egress => {
+            let creds = CredentialsClient::new(Arc::new(move || api.clone()));
+            let t = creds
+                .git_token()
+                .await
+                .map_err(|e| QuomeError::Usage(cred_hint(e)))?;
+            GitToken {
+                access_token: t.access_token,
+                expires_in: t.expires_in,
+            }
+        }
+    };
     // Read the clock after the mint, which may have waited for the server.
     Ok(Some(answer(&token, now_unix())))
 }
@@ -207,7 +243,7 @@ mod tests {
     #[test]
     fn pick_profile_by_host_and_path() {
         let st = two_profiles("work");
-        let (name, _) = pick_profile(
+        let (name, _, _) = pick_profile(
             &st,
             &req("https", "git.apps.example", Some("beta/x.git")),
             None,
@@ -215,7 +251,7 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(name, "home");
-        let (name, _) = pick_profile(&st, &req("https", "Git.Apps.Example:443", None), None)
+        let (name, _, _) = pick_profile(&st, &req("https", "Git.Apps.Example:443", None), None)
             .unwrap()
             .unwrap();
         assert_eq!(name, "work");
@@ -248,7 +284,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        let (name, _) = pick_profile(
+        let (name, _, _) = pick_profile(
             &st,
             &req("https", "git.apps.example", Some("acme/x.git")),
             forced,
@@ -264,6 +300,15 @@ mod tests {
         let st = two_profiles("other");
         let e = pick_profile(&st, &req("https", "git.apps.example", None), None).unwrap_err();
         assert!(e.to_string().contains("useHttpPath"), "{e}");
+    }
+
+    #[test]
+    fn answer_omits_expiry_without_a_lifetime() {
+        let t = GitToken {
+            access_token: "G1".into(),
+            expires_in: 0,
+        };
+        assert_eq!(answer(&t, 1_000), "username=quome\npassword=G1\n");
     }
 
     #[test]
@@ -477,5 +522,142 @@ mod tests {
             .await
             .unwrap();
         assert!(out.is_none());
+    }
+
+    const EGRESS: &str =
+        "protocol=https\nhost=egress.apps.example\npath=acme/git/github.com/o/r.git\n\n";
+
+    fn cred_broker() -> String {
+        format!("/api/v1/orgs/{ORG}/credentials/token")
+    }
+
+    #[test]
+    fn egress_host_picks_profile_by_slug() {
+        let st = two_profiles("work");
+        let (name, _, target) = pick_profile(
+            &st,
+            &req(
+                "https",
+                "egress.apps.example",
+                Some("beta/git/github.com/o/r.git"),
+            ),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!((name.as_str(), target), ("home", CredTarget::Egress));
+        let (_, _, target) = pick_profile(
+            &st,
+            &req("https", "git.apps.example", Some("beta/x.git")),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(target, CredTarget::OrgGit);
+        let st = two_profiles("other");
+        let e = pick_profile(&st, &req("https", "egress.apps.example", None), None).unwrap_err();
+        assert!(e.to_string().contains("useHttpPath"), "{e}");
+    }
+
+    #[test]
+    fn lookalike_hosts_and_foreign_slugs_are_not_served() {
+        let st = two_profiles("work");
+        let path = Some("acme/git/github.com/o/r.git");
+        for host in [
+            "egress.apps.example.attacker.example",
+            "xegress.apps.example",
+            "egress.apps.example.",
+            "egress.apps.examplex",
+            "evil.egress.apps.example",
+            "apps.example",
+            "git.apps.example.attacker.example",
+        ] {
+            assert!(
+                pick_profile(&st, &req("https", host, path), None)
+                    .unwrap()
+                    .is_none(),
+                "{host}"
+            );
+        }
+        assert!(pick_profile(
+            &st,
+            &req(
+                "https",
+                "egress.apps.example",
+                Some("other/git/github.com/o/r.git")
+            ),
+            None
+        )
+        .unwrap()
+        .is_none());
+        assert!(
+            pick_profile(&st, &req("http", "egress.apps.example", path), None)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn egress_get_prints_credentials_token() {
+        let e = env().await;
+        Mock::given(method("POST"))
+            .and(path(cred_broker()))
+            .and(body_json(json!({"scope": ["credentials_use"]})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "C1", "token_type": "Bearer", "expires_in": 300,
+                "url": "https://svc.example"
+            })))
+            .expect(1)
+            .mount(&e.server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(broker()))
+            .respond_with(token("G1"))
+            .expect(0)
+            .mount(&e.server)
+            .await;
+        let out = get(&e, EGRESS).await.unwrap();
+        assert_eq!(
+            out.as_deref(),
+            Some("username=quome\npassword=C1\npassword_expiry_utc=1300\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn egress_unknown_org_prints_nothing_and_calls_nothing() {
+        let e = env().await;
+        Mock::given(method("POST"))
+            .and(path(cred_broker()))
+            .respond_with(token("C1"))
+            .expect(0)
+            .mount(&e.server)
+            .await;
+        for input in [
+            "protocol=https\nhost=egress.apps.example\npath=other/git/github.com/o/r.git\n\n",
+            "protocol=https\nhost=egress.apps.example.attacker.example\npath=acme/git/github.com/o/r.git\n\n",
+            "protocol=http\nhost=egress.apps.example\npath=acme/git/github.com/o/r.git\n\n",
+        ] {
+            assert!(get(&e, input).await.unwrap().is_none(), "{input}");
+        }
+    }
+
+    #[tokio::test]
+    async fn egress_capability_missing_prints_nothing_and_hints_on_stderr() {
+        let e = env().await;
+        Mock::given(method("POST"))
+            .and(path(cred_broker()))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .set_body_json(json!({"error": "forbidden", "reason": "capability_missing"})),
+            )
+            .expect(1)
+            .mount(&e.server)
+            .await;
+        let err = get(&e, EGRESS).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Run `quome connect` again and allow Credentials access."),
+            "{err}"
+        );
     }
 }
