@@ -1,7 +1,7 @@
 //! The `quome mcp` server: Quome Cloud tools for Claude Code over MCP stdio.
 use super::api::{
-    CloudApi, CreateSandbox, DatabaseSearch, Download, Sandbox, WaitStep, MAX_EMAIL_WAIT,
-    MAX_EXEC_TIMEOUT,
+    check_cpus_fit, AppSettings, CloudApi, CreateSandbox, DatabaseSearch, Download, Sandbox,
+    WaitStep, MAX_EMAIL_WAIT, MAX_EXEC_TIMEOUT, MEMORY_RULE, SLEEP_RULE,
 };
 use super::auth::TokenSource;
 use super::auth_instance::{check_env, AuthCallError, AuthInstances, Scope, NOT_STARTED};
@@ -541,6 +541,160 @@ pub struct DeleteAppArgs {
     name: String,
     /// Set true to go ahead. Without it nothing changes and you get a preview.
     confirm: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateAppArgs {
+    /// App name, as given to deploy_app.
+    name: String,
+    /// New memory in GB: 0.5, 1, 2, 4, 8, 16, 32 or 64. Without `cpus`, the CPU count follows the memory. Omit to leave unchanged.
+    memory_gb: Option<f64>,
+    /// New CPU count: 1, 2, 4, 8 or 16, with at least 0.5 GB of memory per CPU. Omit to leave unchanged.
+    cpus: Option<u32>,
+    /// Make the app sleep after this many idle minutes (5 to 1440). Omit (or null) to leave unchanged; to stop it sleeping give `always_on: true` instead. Not with `always_on`.
+    sleep_after_minutes: Option<u32>,
+    /// Set true to keep the app always on: it never sleeps. Omit to leave unchanged. Not with `sleep_after_minutes`.
+    always_on: Option<bool>,
+    /// true: deploy the app automatically on each push to branch `ref` of `repo` (give both). false: turn automatic deploys off. Omit to leave unchanged.
+    auto_deploy: Option<bool>,
+    /// With `auto_deploy: true`: the repo of the org's Git, `<name>` or `<org>/<name>`.
+    repo: Option<String>,
+    /// With `auto_deploy: true`: the branch whose pushes deploy the app.
+    #[serde(rename = "ref")]
+    git_ref: Option<String>,
+}
+
+/// What `update_app` does to an app's automatic deploys.
+#[derive(Debug, PartialEq)]
+enum AutoDeployChange {
+    On { repo: String, git_ref: String },
+    Off,
+}
+
+impl UpdateAppArgs {
+    /// The changes asked for, or what is wrong with the call. Asks nothing of
+    /// the API.
+    fn changes(&self) -> Result<(AppSettings, Option<AutoDeployChange>), String> {
+        let sleep_after_minutes = match (self.sleep_after_minutes, self.always_on) {
+            (Some(_), Some(_)) => {
+                return Err(
+                    "Give sleep_after_minutes or always_on: true, not both: the first makes the app sleep when idle, the second stops it sleeping."
+                        .into(),
+                )
+            }
+            (None, Some(false)) => {
+                return Err(
+                    "always_on takes only true. To make the app sleep when idle, give sleep_after_minutes (5 to 1440); to leave sleeping as it is, omit both."
+                        .into(),
+                )
+            }
+            (Some(n), None) => Some(Some(n)),
+            (None, Some(true)) => Some(None),
+            (None, None) => None,
+        };
+        fn given(v: &Option<String>) -> Option<&str> {
+            v.as_deref().map(str::trim).filter(|v| !v.is_empty())
+        }
+        let stray = self.repo.is_some() || self.git_ref.is_some();
+        let auto = match self.auto_deploy {
+            Some(true) => match (given(&self.repo), given(&self.git_ref)) {
+                (Some(repo), Some(git_ref)) => Some(AutoDeployChange::On {
+                    repo: repo.into(),
+                    git_ref: git_ref.into(),
+                }),
+                _ => {
+                    return Err(
+                        "auto_deploy: true needs repo and ref: a repo of the org's Git and the branch whose pushes deploy the app."
+                            .into(),
+                    )
+                }
+            },
+            Some(false) if stray => {
+                return Err(
+                    "auto_deploy: false turns automatic deploys off and takes no repo or ref."
+                        .into(),
+                )
+            }
+            Some(false) => Some(AutoDeployChange::Off),
+            None if stray => {
+                return Err(
+                    "repo and ref go with auto_deploy: true (deploy on each push to that branch); give all three, or none."
+                        .into(),
+                )
+            }
+            None => None,
+        };
+        let settings = AppSettings {
+            memory_gb: self.memory_gb,
+            cpus: self.cpus,
+            sleep_after_minutes,
+        };
+        if settings.is_empty() && auto.is_none() {
+            return Err(
+                "Nothing to change: give at least one of memory_gb, cpus, sleep_after_minutes, always_on or auto_deploy."
+                    .into(),
+            );
+        }
+        if !settings.is_empty() {
+            settings.check().map_err(fail)?;
+        }
+        Ok((settings, auto))
+    }
+
+    /// The settings the call names, in the order `update_app` reports them.
+    fn named(&self) -> Vec<&'static str> {
+        [
+            ("memory_gb", self.memory_gb.is_some()),
+            ("cpus", self.cpus.is_some()),
+            ("sleep_after_minutes", self.sleep_after_minutes.is_some()),
+            ("always_on", self.always_on.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(name, given)| given.then_some(name))
+        .collect()
+    }
+}
+
+const SIZE_APPLIES_LATER: &str = "The new size is saved but not applied yet: it takes effect on the app's next start (a restart, a deploy or a wake from sleep). Until then the running app keeps its old size.";
+
+/// Turn an error from an app settings route into a sentence for the agent.
+/// `auto_deploy`: the call was to the automatic deploys route.
+fn update_app_hint(e: String, name: &str, auto_deploy: bool) -> String {
+    let advice = match error_reason(&e).unwrap_or("") {
+        "invalid_memory_gb" => MEMORY_RULE,
+        "invalid_cpus" => {
+            "cpus must be one of 1, 2, 4, 8, 16, with at least 0.5 GB of memory per CPU; memory_gb alone lets the CPU count follow the memory."
+        }
+        "invalid_sleep_after_minutes" => SLEEP_RULE,
+        "sleep_needs_egress_metering" => {
+            "This platform cannot put apps to sleep yet. Nothing was changed; call again without sleep_after_minutes."
+        }
+        "capability_missing" if auto_deploy => "Run `quome connect` again and allow Git access.",
+        "forbidden" | "capability_missing" => {
+            "This connection may not change this app. Run `quome connect` again and allow operating apps; if that is already allowed, ask an org owner or admin."
+        }
+        // The app was deleted after it was looked up.
+        "service" if e.starts_with("Not found: ") => return format!("No app named {name:?}."),
+        "repo_not_found" => "The repo is not in the org's Git; git_repos lists the org's repos.",
+        "invalid_repo" | "repo_owner" => return repo_hint(e),
+        "invalid_ref" | "ref_is_commit" => {
+            "ref must be a branch name such as main: automatic deploys follow a branch, not a tag, a commit or a refs/ path."
+        }
+        "app_managed" => {
+            "That app was installed from the catalog and its install manages it; automatic deploys cannot be set on it."
+        }
+        _ => return e,
+    };
+    advice.into()
+}
+
+/// A CPU count for a result: the API sends a float, whole counts read as integers.
+fn cpus_json(cpus: Option<f64>) -> serde_json::Value {
+    match cpus {
+        Some(c) if c.fract() == 0.0 && c >= 0.0 => serde_json::json!(c as u64),
+        c => serde_json::json!(c),
+    }
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -2994,6 +3148,66 @@ impl QuomeMcp {
     }
 
     #[tool(
+        description = "Change a deployed app's settings by name: its size (memory_gb, cpus), whether it sleeps when idle (sleep_after_minutes) or stays always on (always_on: true), and automatic deploys on each push to a branch of a repo in the org's Git (auto_deploy: true with repo and ref; false turns them off). Give at least one setting; the others stay as they are. Apps bill by memory size and the hours they run, so have the person's agreement before making an app larger or always on. A new size is only saved: it applies on the app's next start (a restart, a deploy or a wake from sleep), not to the running app. Returns the settings as they now are and which ones this call changed."
+    )]
+    async fn update_app(&self, Parameters(a): Parameters<UpdateAppArgs>) -> Result<String, String> {
+        let (settings, auto) = a.changes()?;
+        let Some(app) = self.find_app(&a.name).await? else {
+            return Err(format!("No app named {:?}.", a.name));
+        };
+        if let (Some(cpus), None) = (settings.cpus, settings.memory_gb) {
+            check_cpus_fit(cpus, app.memory_gb)
+                .map_err(|e| format!("The app has {} GB of memory. {}", app.memory_gb, fail(e)))?;
+        }
+        let mut changed = a.named();
+        let mut now = app.clone();
+        if !settings.is_empty() {
+            now = call!(self, |api| api.update_service(&app.id, &settings))
+                .map_err(|e| update_app_hint(e, &a.name, false))?;
+        }
+        if let Some(change) = &auto {
+            let set = match change {
+                AutoDeployChange::On { repo, git_ref } => {
+                    call!(self, |api| api.set_auto_deploy(&app.id, repo, git_ref)).map(Some)
+                }
+                AutoDeployChange::Off => {
+                    call!(self, |api| api.clear_auto_deploy(&app.id)).map(|()| None)
+                }
+            };
+            now.auto_deploy = set.map_err(|e| {
+                let hint = update_app_hint(e, &a.name, true);
+                if changed.is_empty() {
+                    return hint;
+                }
+                // The first request went through: say so, or a retry repeats it blindly.
+                format!(
+                    "{} {} saved{}, but automatic deploys were not changed: {hint}",
+                    changed.join(", "),
+                    if changed.len() == 1 { "was" } else { "were" },
+                    if settings.resizes() {
+                        " (a new size applies on the app's next start)"
+                    } else {
+                        ""
+                    },
+                )
+            })?;
+            changed.push("auto_deploy");
+        }
+        let mut out = serde_json::json!({
+            "name": now.name, "id": now.id,
+            "memory_gb": now.memory_gb, "cpus": cpus_json(now.cpus),
+            "sleep_after_minutes": now.sleep_after_minutes,
+            "always_on": now.sleep_after_minutes.is_none(),
+            "auto_deploy": now.auto_deploy,
+            "changed": changed,
+        });
+        if settings.resizes() {
+            out["note"] = SIZE_APPLIES_LATER.into();
+        }
+        json(&out)
+    }
+
+    #[tool(
         description = "Delete a Quome Cloud app you deployed: its service, URL and running container. Without confirm: true it only previews; with it, deletes. This cannot be undone."
     )]
     async fn delete_app(&self, Parameters(a): Parameters<DeleteAppArgs>) -> Result<String, String> {
@@ -4235,6 +4449,7 @@ mod tests {
             "deploy_app",
             "app_status",
             "app_logs",
+            "update_app",
             "delete_app",
             "sync_folder",
             "list_app_catalog",
@@ -6107,6 +6322,454 @@ mod tests {
             .unwrap()
             .iter()
             .any(|r| r.method.as_str() == "DELETE"));
+    }
+
+    /// The app `web` (id app1) as the services routes return it, `over` laid on top.
+    fn app_row(over: Value) -> Value {
+        let mut v = json!({"id":"app1","kind":"app","name":"web","memory_gb":1.0,"cpus":1,
+            "status":"running","sleep_after_minutes":15,"auto_deploy":null});
+        for (k, x) in over.as_object().unwrap() {
+            v[k] = x.clone();
+        }
+        v
+    }
+
+    /// The services list holding `web`, and a settings change that answers `patched`.
+    async fn update_app_setup(s: &MockServer, patched: Value) {
+        Mock::given(method("GET"))
+            .and(path(api_path("/services")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([app_row(json!({}))])))
+            .mount(s)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path(api_path("/services/app1")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(app_row(patched)))
+            .mount(s)
+            .await;
+    }
+
+    /// The JSON bodies of the `m` requests whose path ends with `suffix`.
+    async fn sent(s: &MockServer, m: &str, suffix: &str) -> Vec<Value> {
+        s.received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.method.as_str() == m && r.url.path().ends_with(suffix))
+            .map(|r| serde_json::from_slice(&r.body).unwrap_or(Value::Null))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn update_app_schema_and_description() {
+        let (_s, mut c) = start().await;
+        let v = c.rpc("tools/list", json!({})).await;
+        let tools = v["result"]["tools"].as_array().unwrap();
+        let t = tools.iter().find(|t| t["name"] == "update_app").unwrap();
+        let mut props: Vec<&str> = t["inputSchema"]["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        props.sort();
+        assert_eq!(
+            props,
+            [
+                "always_on",
+                "auto_deploy",
+                "cpus",
+                "memory_gb",
+                "name",
+                "ref",
+                "repo",
+                "sleep_after_minutes"
+            ]
+        );
+        assert_eq!(t["inputSchema"]["required"], json!(["name"]));
+        let d = t["description"].as_str().unwrap();
+        for want in ["bill", "agree", "next start"] {
+            assert!(d.contains(want), "{want}: {d}");
+        }
+    }
+
+    #[tokio::test]
+    async fn update_app_needs_a_setting_before_any_request() {
+        let (s, mut c) = start().await;
+        let (err, text) = c.call("update_app", json!({"name":"web"})).await;
+        assert!(err);
+        assert!(text.contains("at least one"), "{text}");
+        for field in [
+            "memory_gb",
+            "cpus",
+            "sleep_after_minutes",
+            "always_on",
+            "auto_deploy",
+        ] {
+            assert!(text.contains(field), "{field}: {text}");
+        }
+        assert!(s.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_app_refuses_bad_values_before_any_request() {
+        let (s, mut c) = start().await;
+        for (args, want) in [
+            (json!({"memory_gb": 3}), "0.5, 1, 2, 4, 8, 16, 32, 64"),
+            (json!({"cpus": 3}), "1, 2, 4, 8, 16"),
+            (json!({"cpus": 0}), "1, 2, 4, 8, 16"),
+            (json!({"memory_gb": 2, "cpus": 8}), "at least 4 GB"),
+            (json!({"sleep_after_minutes": 4}), "5 to 1440"),
+            (json!({"sleep_after_minutes": 1441}), "5 to 1440"),
+            (json!({"sleep_after_minutes": 0}), "always_on: true"),
+            (
+                json!({"sleep_after_minutes": 30, "always_on": true}),
+                "not both",
+            ),
+            (json!({"always_on": false}), "sleep_after_minutes"),
+            (json!({"auto_deploy": true}), "needs repo and ref"),
+            (
+                json!({"auto_deploy": true, "repo": "site"}),
+                "needs repo and ref",
+            ),
+            (
+                json!({"auto_deploy": true, "repo": " ", "ref": "main"}),
+                "needs repo and ref",
+            ),
+            (
+                json!({"auto_deploy": false, "repo": "site"}),
+                "takes no repo or ref",
+            ),
+            (json!({"repo": "site", "ref": "main"}), "auto_deploy: true"),
+            (json!({"memory_gb": 2, "ref": "main"}), "auto_deploy: true"),
+        ] {
+            let mut a = args.clone();
+            a["name"] = "web".into();
+            let (err, text) = c.call("update_app", a).await;
+            assert!(err, "{args}");
+            assert!(text.contains(want), "{args}: {text}");
+        }
+        assert!(s.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_app_checks_cpus_against_the_apps_memory_without_changing_anything() {
+        let (s, mut c) = start().await;
+        update_app_setup(&s, json!({})).await;
+        // `web` has 1 GB: 4 CPUs need 2.
+        let (err, text) = c.call("update_app", json!({"name":"web","cpus":4})).await;
+        assert!(err);
+        assert!(text.contains("at least 2 GB"), "{text}");
+        assert!(sent(&s, "PATCH", "/services/app1").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_app_unknown_name_changes_nothing() {
+        let (s, mut c) = start().await;
+        update_app_setup(&s, json!({})).await;
+        let (err, text) = c
+            .call("update_app", json!({"name":"nope","memory_gb":2}))
+            .await;
+        assert!(err);
+        assert!(text.contains("No app named"), "{text}");
+        assert!(sent(&s, "PATCH", "").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_app_sends_the_size_and_says_when_it_applies() {
+        let (s, mut c) = start().await;
+        update_app_setup(&s, json!({"memory_gb": 4.0, "cpus": 2})).await;
+        let (err, text) = c
+            .call("update_app", json!({"name":"web","memory_gb":4,"cpus":2}))
+            .await;
+        assert!(!err, "{text}");
+        assert_eq!(
+            sent(&s, "PATCH", "/services/app1").await,
+            vec![json!({"memory_gb": 4.0, "cpus": 2})]
+        );
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["name"], "web");
+        assert_eq!(v["memory_gb"], 4.0);
+        assert_eq!(v["cpus"], 2);
+        assert_eq!(v["sleep_after_minutes"], 15);
+        assert_eq!(v["always_on"], false);
+        assert_eq!(v["auto_deploy"], Value::Null);
+        assert_eq!(v["changed"], json!(["memory_gb", "cpus"]));
+        assert!(v["note"].as_str().unwrap().contains("next start"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn update_app_sends_one_size_setting_alone() {
+        for (args, body) in [
+            (json!({"memory_gb": 8}), json!({"memory_gb": 8.0})),
+            (json!({"cpus": 2}), json!({"cpus": 2})),
+        ] {
+            let (s, mut c) = start().await;
+            update_app_setup(&s, json!({})).await;
+            let mut a = args.clone();
+            a["name"] = "web".into();
+            let (err, text) = c.call("update_app", a).await;
+            assert!(!err, "{text}");
+            assert_eq!(sent(&s, "PATCH", "/services/app1").await, vec![body]);
+            assert!(text.contains("next start"), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn update_app_sets_sleeping_without_a_size_note() {
+        let (s, mut c) = start().await;
+        update_app_setup(&s, json!({"sleep_after_minutes": 30})).await;
+        let (err, text) = c
+            .call("update_app", json!({"name":"web","sleep_after_minutes":30}))
+            .await;
+        assert!(!err, "{text}");
+        assert_eq!(
+            sent(&s, "PATCH", "/services/app1").await,
+            vec![json!({"sleep_after_minutes": 30})]
+        );
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["sleep_after_minutes"], 30);
+        assert_eq!(v["always_on"], false);
+        assert_eq!(v["changed"], json!(["sleep_after_minutes"]));
+        assert!(v.get("note").is_none(), "{text}");
+    }
+
+    #[tokio::test]
+    async fn update_app_always_on_sends_an_explicit_null() {
+        let (s, mut c) = start().await;
+        update_app_setup(&s, json!({"sleep_after_minutes": null})).await;
+        let (err, text) = c
+            .call("update_app", json!({"name":"web","always_on":true}))
+            .await;
+        assert!(!err, "{text}");
+        let reqs = s.received_requests().await.unwrap();
+        let patch = reqs.iter().find(|r| r.method.as_str() == "PATCH").unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&patch.body),
+            r#"{"sleep_after_minutes":null}"#
+        );
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["sleep_after_minutes"], Value::Null);
+        assert_eq!(v["always_on"], true);
+        assert_eq!(v["changed"], json!(["always_on"]));
+    }
+
+    #[tokio::test]
+    async fn update_app_turns_automatic_deploys_on() {
+        let (s, mut c) = start().await;
+        update_app_setup(&s, json!({})).await;
+        Mock::given(method("PUT"))
+            .and(path(api_path("/apps/app1/auto-deploy")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"repo":"acme/site","ref":"main","pending_sha":null})),
+            )
+            .mount(&s)
+            .await;
+        let (err, text) = c
+            .call(
+                "update_app",
+                json!({"name":"web","auto_deploy":true,"repo":"site","ref":"main"}),
+            )
+            .await;
+        assert!(!err, "{text}");
+        assert_eq!(
+            sent(&s, "PUT", "/apps/app1/auto-deploy").await,
+            vec![json!({"repo":"site","ref":"main"})]
+        );
+        // Only automatic deploys were asked for: the size is not sent.
+        assert!(sent(&s, "PATCH", "").await.is_empty());
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["auto_deploy"], json!({"repo":"acme/site","ref":"main"}));
+        assert_eq!(v["memory_gb"], 1.0);
+        assert_eq!(v["changed"], json!(["auto_deploy"]));
+        assert!(v.get("note").is_none(), "{text}");
+    }
+
+    #[tokio::test]
+    async fn update_app_turns_automatic_deploys_off() {
+        let (s, mut c) = start().await;
+        Mock::given(method("GET"))
+            .and(path(api_path("/services")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([app_row(
+                json!({"auto_deploy": {"repo":"acme/site","ref":"main","pending_sha":null}})
+            )])))
+            .mount(&s)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(api_path("/apps/app1/auto-deploy")))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let (err, text) = c
+            .call("update_app", json!({"name":"web","auto_deploy":false}))
+            .await;
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["auto_deploy"], Value::Null);
+        assert_eq!(v["changed"], json!(["auto_deploy"]));
+    }
+
+    #[tokio::test]
+    async fn update_app_changes_settings_and_automatic_deploys_in_one_call() {
+        let (s, mut c) = start().await;
+        update_app_setup(&s, json!({"memory_gb": 2.0, "sleep_after_minutes": null})).await;
+        Mock::given(method("PUT"))
+            .and(path(api_path("/apps/app1/auto-deploy")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"repo":"acme/site","ref":"main"})),
+            )
+            .mount(&s)
+            .await;
+        let (err, text) = c
+            .call(
+                "update_app",
+                json!({"name":"web","memory_gb":2,"always_on":true,
+                       "auto_deploy":true,"repo":"acme/site","ref":"main"}),
+            )
+            .await;
+        assert!(!err, "{text}");
+        assert_eq!(
+            sent(&s, "PATCH", "/services/app1").await,
+            vec![json!({"memory_gb": 2.0, "sleep_after_minutes": null})]
+        );
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["memory_gb"], 2.0);
+        assert_eq!(v["always_on"], true);
+        assert_eq!(v["auto_deploy"], json!({"repo":"acme/site","ref":"main"}));
+        assert_eq!(
+            v["changed"],
+            json!(["memory_gb", "always_on", "auto_deploy"])
+        );
+        assert!(v["note"].as_str().unwrap().contains("next start"));
+    }
+
+    #[tokio::test]
+    async fn update_app_explains_a_refused_settings_change() {
+        for (status, reason, want) in [
+            (422, "invalid_memory_gb", "0.5, 1, 2, 4, 8, 16, 32, 64"),
+            (422, "invalid_cpus", "0.5 GB of memory per CPU"),
+            (422, "invalid_sleep_after_minutes", "5 to 1440"),
+            (
+                409,
+                "sleep_needs_egress_metering",
+                "cannot put apps to sleep",
+            ),
+            (403, "forbidden", "allow operating apps"),
+            (403, "capability_missing", "allow operating apps"),
+            (404, "service", "No app named \"web\""),
+        ] {
+            let (s, mut c) = start().await;
+            Mock::given(method("GET"))
+                .and(path(api_path("/services")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!([app_row(json!({}))])))
+                .mount(&s)
+                .await;
+            Mock::given(method("PATCH"))
+                .and(path(api_path("/services/app1")))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .set_body_json(json!({"detail": "refused", "reason": reason})),
+                )
+                .mount(&s)
+                .await;
+            let (err, text) = c
+                .call("update_app", json!({"name":"web","sleep_after_minutes":30}))
+                .await;
+            assert!(err, "{reason}");
+            assert!(text.contains(want), "{reason}: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn update_app_explains_refused_automatic_deploys() {
+        for (status, reason, want) in [
+            (422, "invalid_repo", "<name> or <org>/<name>"),
+            (422, "repo_owner", "this org"),
+            (422, "invalid_ref", "branch name"),
+            (422, "ref_is_commit", "branch name"),
+            (404, "repo_not_found", "git_repos"),
+            (404, "service", "No app named \"web\""),
+            (403, "capability_missing", "allow Git access"),
+            (403, "forbidden", "allow operating apps"),
+            (409, "app_managed", "installed from the catalog"),
+        ] {
+            let (s, mut c) = start().await;
+            update_app_setup(&s, json!({})).await;
+            Mock::given(method("PUT"))
+                .and(path(api_path("/apps/app1/auto-deploy")))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .set_body_json(json!({"detail": "refused", "reason": reason})),
+                )
+                .mount(&s)
+                .await;
+            let (err, text) = c
+                .call(
+                    "update_app",
+                    json!({"name":"web","auto_deploy":true,"repo":"site","ref":"main"}),
+                )
+                .await;
+            assert!(err, "{reason}");
+            assert!(text.contains(want), "{reason}: {text}");
+            // Nothing else was changed, so the message does not claim it was.
+            assert!(!text.contains("saved"), "{reason}: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn update_app_says_what_was_saved_when_automatic_deploys_are_refused() {
+        let (s, mut c) = start().await;
+        update_app_setup(&s, json!({"memory_gb": 2.0})).await;
+        Mock::given(method("PUT"))
+            .and(path(api_path("/apps/app1/auto-deploy")))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_json(json!({"detail": "not_found", "reason": "repo_not_found"})),
+            )
+            .mount(&s)
+            .await;
+        let (err, text) = c
+            .call(
+                "update_app",
+                json!({"name":"web","memory_gb":2,"auto_deploy":true,"repo":"nope","ref":"main"}),
+            )
+            .await;
+        assert!(err);
+        assert!(text.contains("memory_gb was saved"), "{text}");
+        assert!(text.contains("next start"), "{text}");
+        assert!(text.contains("git_repos"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn update_app_refuses_an_argument_it_does_not_know() {
+        let (s, mut c) = start().await;
+        let (err, text) = c.call("update_app", json!({"name":"web","memory":2})).await;
+        assert!(err);
+        assert!(text.contains("unknown field `memory`"), "{text}");
+        assert!(s.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_app_treats_null_as_left_out() {
+        let (s, mut c) = start().await;
+        update_app_setup(&s, json!({"memory_gb": 2.0})).await;
+        let (err, text) = c
+            .call(
+                "update_app",
+                json!({"name":"web","memory_gb":2,"cpus":null,"sleep_after_minutes":null,
+                       "always_on":null,"auto_deploy":null,"repo":null,"ref":null}),
+            )
+            .await;
+        assert!(!err, "{text}");
+        // A null sleep_after_minutes is not "always on": nothing about sleeping is sent.
+        assert_eq!(
+            sent(&s, "PATCH", "/services/app1").await,
+            vec![json!({"memory_gb": 2.0})]
+        );
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["changed"], json!(["memory_gb"]));
+        assert_eq!(v["always_on"], false);
     }
 
     fn sync_dir() -> tempfile::TempDir {
