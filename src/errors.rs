@@ -24,6 +24,15 @@ pub enum QuomeError {
     #[error("API error: {0}")]
     ApiError(String),
 
+    /// An API error answer that keeps its HTTP status and stable `reason`
+    /// beside the message (the text is the same as `ApiError`'s).
+    #[error("API error: {message}")]
+    ApiRefused {
+        message: String,
+        status: u16,
+        reason: String,
+    },
+
     /// The service answered 503 and may be ready shortly; `retry_after` is the
     /// `Retry-After` header in seconds, when sent as an integer.
     #[error("API error: {message}")]

@@ -329,8 +329,8 @@ pub struct QuomeMcp {
     email_cursors: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
     /// Which local folders `sync_folder` and `deploy_app` may read.
     local: Arc<LocalScope>,
-    /// Which backend serves each (app, tool), as far as this session has learned.
-    app_backends: Arc<std::sync::Mutex<std::collections::HashMap<(String, String), String>>>,
+    /// Which backend serves each app, as far as this session has learned.
+    app_backends: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
     /// The schema hash the gateway gave for each (app, tool) it described.
     app_hashes: Arc<std::sync::Mutex<std::collections::HashMap<(String, String), String>>>,
     /// The org's MCP gateway, connected on first need and reused.
@@ -590,22 +590,32 @@ pub struct SetKeyArgs {
     value: String,
 }
 
-/// The backend named by a relay `409` whose reason is `use_<backend>`, when it
-/// is not the relay.
+/// The backend named by a relay `409` whose stable reason is exactly
+/// `use_<backend>`, when it is not the relay. Only the status and reason
+/// decide; message text never does.
 fn use_backend(e: &QuomeError) -> Option<String> {
-    let QuomeError::ApiError(m) = e else {
+    let QuomeError::ApiRefused { status, reason, .. } = e else {
         return None;
     };
-    let m = m.strip_prefix("409 ")?;
-    let first = m.lines().next().unwrap_or("");
-    first.split(": ").find_map(|part| {
-        let b = part.trim().strip_prefix("use_")?;
-        let ok = !b.is_empty()
-            && b != "relay"
-            && b.chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-        ok.then(|| b.to_string())
-    })
+    if *status != 409 {
+        return None;
+    }
+    let b = reason.strip_prefix("use_")?;
+    let ok = !b.is_empty()
+        && b != "relay"
+        && b.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    ok.then(|| b.to_string())
+}
+
+/// An app slug that may be sent to the gateway as `app:<slug>`.
+fn valid_app_slug(slug: &str) -> bool {
+    let mut cs = slug.chars();
+    slug.len() <= 63
+        && cs
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && cs.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
 }
 
 /// Turn an app-route error into a sentence for the agent. `action` finishes
@@ -1491,19 +1501,34 @@ impl QuomeMcp {
         Ok(g)
     }
 
-    fn remember_backend(&self, app: &str, tool: &str, backend: &str) {
+    fn remember_backend(&self, app: &str, backend: &str) {
         self.app_backends
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert((app.to_string(), tool.to_string()), backend.to_string());
+            .insert(app.to_string(), backend.to_string());
+    }
+
+    fn forget_backend(&self, app: &str) {
+        self.app_backends
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(app);
+    }
+
+    /// If the gateway says it does not know the app's server, forget the
+    /// remembered backend so the next call tries the relay again.
+    fn forget_if_unknown_server(&self, app: &str, text: &str) {
+        if text.contains("unknown_server") {
+            self.forget_backend(app);
+        }
     }
 
     /// The backend learned for this tool, when it is not the relay.
-    fn gateway_backend(&self, app: &str, tool: &str) -> bool {
+    fn gateway_backend(&self, app: &str) -> bool {
         self.app_backends
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(&(app.to_string(), tool.to_string()))
+            .get(app)
             .is_some_and(|b| b != "relay")
     }
 
@@ -1515,6 +1540,9 @@ impl QuomeMcp {
         tool: &str,
         args: serde_json::Value,
     ) -> Result<String, String> {
+        if !valid_app_slug(app) {
+            return Err(format!("{app:?} is not a valid app slug."));
+        }
         let g = self.gateway_client().await?;
         let mut a = serde_json::json!({"server": format!("app:{app}"), "tool": tool, "args": args});
         let hash = self
@@ -1532,6 +1560,7 @@ impl QuomeMcp {
             .map_err(|e| e.to_string())?;
         let text = json(&r)?;
         if r.is_error == Some(true) {
+            self.forget_if_unknown_server(app, &text);
             Err(text)
         } else {
             Ok(text)
@@ -1541,6 +1570,9 @@ impl QuomeMcp {
     /// Describe an app tool through the gateway, in the shape the relay's
     /// describe answers, and remember the schema hash for later calls.
     async fn gateway_describe(&self, app: &str, tool: &str) -> Result<String, String> {
+        if !valid_app_slug(app) {
+            return Err(format!("{app:?} is not a valid app slug."));
+        }
         let g = self.gateway_client().await?;
         let r = g
             .call_tool(
@@ -1551,7 +1583,9 @@ impl QuomeMcp {
             .await
             .map_err(|e| e.to_string())?;
         if r.is_error == Some(true) {
-            return Err(json(&r)?);
+            let text = json(&r)?;
+            self.forget_if_unknown_server(app, &text);
+            return Err(text);
         }
         let v = r
             .structured_content
@@ -1588,6 +1622,11 @@ impl QuomeMcp {
         }
         if let Some(c) = v["class"].as_str() {
             out["class"] = c.into();
+        }
+        for k in ["needs_approval", "held"] {
+            if !v[k].is_null() {
+                out[k] = v[k].clone();
+            }
         }
         out["destructive"] =
             (v["class"] == "destructive" || v["annotations"]["destructiveHint"] == true).into();
@@ -3013,7 +3052,7 @@ impl QuomeMcp {
         .map_err(|e| app_hint(e, "search app tools"))?;
         for h in &mut r.results {
             let b = h.backend.take().unwrap_or_else(|| "relay".into());
-            self.remember_backend(&h.app, &h.tool, &b);
+            self.remember_backend(&h.app, &b);
             h.backend = Some(b);
         }
         let mut out = json(&r)?;
@@ -3031,14 +3070,14 @@ impl QuomeMcp {
         &self,
         Parameters(a): Parameters<AppToolArgs>,
     ) -> Result<String, String> {
-        if self.gateway_backend(&a.app, &a.tool) {
+        if self.gateway_backend(&a.app) {
             return self.gateway_describe(&a.app, &a.tool).await;
         }
         match call_raw!(self, |api| api.describe_app_tool(&a.app, &a.tool)) {
             Ok(d) => json(&d),
             Err(e) => match use_backend(&e) {
                 Some(b) => {
-                    self.remember_backend(&a.app, &a.tool, &b);
+                    self.remember_backend(&a.app, &b);
                     self.gateway_describe(&a.app, &a.tool).await
                 }
                 None => Err(app_hint(fail(e), "describe app tools")),
@@ -3054,7 +3093,7 @@ impl QuomeMcp {
         Parameters(a): Parameters<CallToolArgs>,
     ) -> Result<String, String> {
         let args = serde_json::Value::Object(a.arguments);
-        if self.gateway_backend(&a.app, &a.tool) {
+        if self.gateway_backend(&a.app) {
             return self.gateway_call(&a.app, &a.tool, args).await;
         }
         match call_raw!(self, |api| api.call_app_tool(&a.app, &a.tool, &args)) {
@@ -3062,7 +3101,7 @@ impl QuomeMcp {
             Err(e) => match use_backend(&e) {
                 // The relay says another backend serves this app: one retry there.
                 Some(b) => {
-                    self.remember_backend(&a.app, &a.tool, &b);
+                    self.remember_backend(&a.app, &b);
                     self.gateway_call(&a.app, &a.tool, args).await
                 }
                 None => Err(app_hint(fail(e), "call destructive app tools")),
@@ -10830,5 +10869,180 @@ mod tests {
         assert!(text.contains("ap1"));
         assert_eq!(gateway_calls(&s).await.len(), 1);
         assert_eq!(relay_calls(&s).await, 0);
+    }
+
+    #[tokio::test]
+    async fn free_text_use_backend_does_not_retry() {
+        let (s, mut c) = start().await;
+        Mock::given(method("POST"))
+            .and(path(api_path("/app-installs/sales/tools/t/call")))
+            .respond_with(ResponseTemplate::new(409).set_body_json(
+                json!({"detail":"use_gateway","reason":"busy","message":"use_gateway"}),
+            ))
+            .mount(&s)
+            .await;
+        mount_gateway(&s, |_, _| ok_result("no")).await;
+        let (err, _) = c
+            .call(
+                "call_app_tool",
+                json!({"app":"sales","tool":"t","arguments":{}}),
+            )
+            .await;
+        assert!(err);
+        assert!(gateway_calls(&s).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn non_409_with_use_reason_does_not_retry() {
+        let (s, mut c) = start().await;
+        Mock::given(method("POST"))
+            .and(path(api_path("/app-installs/sales/tools/t/call")))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_json(json!({"detail":"bad","reason":"use_gateway"})),
+            )
+            .mount(&s)
+            .await;
+        mount_gateway(&s, |_, _| ok_result("no")).await;
+        let (err, _) = c
+            .call(
+                "call_app_tool",
+                json!({"app":"sales","tool":"t","arguments":{}}),
+            )
+            .await;
+        assert!(err);
+        assert!(gateway_calls(&s).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn backend_is_remembered_per_app() {
+        let (s, mut c) = start().await;
+        mount_relay_409(&s, "use_gateway").await;
+        mount_gateway(&s, |_, _| ok_result("ok")).await;
+        c.call(
+            "call_app_tool",
+            json!({"app":"sales","tool":"t","arguments":{}}),
+        )
+        .await;
+        // another tool of the same app goes straight to the gateway
+        c.call(
+            "call_app_tool",
+            json!({"app":"sales","tool":"u","arguments":{}}),
+        )
+        .await;
+        assert_eq!(relay_calls(&s).await, 1);
+        assert_eq!(gateway_calls(&s).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn later_find_moves_app_back_to_relay() {
+        let (s, mut c) = start().await;
+        mount_relay_409(&s, "use_gateway").await;
+        mount_gateway(&s, |_, _| ok_result("ok")).await;
+        c.call(
+            "call_app_tool",
+            json!({"app":"sales","tool":"t","arguments":{}}),
+        )
+        .await;
+        mount_find(
+            &s,
+            json!([{"app":"sales","tool":"t","summary":"s","destructive":false,"backend":"relay"}]),
+        )
+        .await;
+        c.call("find_app_tools", json!({})).await;
+        c.call(
+            "call_app_tool",
+            json!({"app":"sales","tool":"t","arguments":{}}),
+        )
+        .await;
+        // the relay was tried again (it still answers 409, so the call is
+        // retried once through the gateway)
+        assert_eq!(relay_calls(&s).await, 2);
+        assert_eq!(gateway_calls(&s).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn unknown_server_answer_clears_remembered_backend() {
+        let (s, mut c) = start().await;
+        mount_find(
+            &s,
+            json!([{"app":"sales","tool":"t","summary":"s","destructive":false,"backend":"gateway"}]),
+        )
+        .await;
+        mount_gateway(&s, |_, _| {
+            json!({"content":[{"type":"text","text":"{\"error\":{\"code\":\"unknown_server\",\"message\":\"x\"}}"}],"isError":true})
+        })
+        .await;
+        Mock::given(method("POST"))
+            .and(path(api_path("/app-installs/sales/tools/t/call")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"content":[]})))
+            .mount(&s)
+            .await;
+        c.call("find_app_tools", json!({})).await;
+        let (err, _) = c
+            .call(
+                "call_app_tool",
+                json!({"app":"sales","tool":"t","arguments":{}}),
+            )
+            .await;
+        assert!(err);
+        assert_eq!(relay_calls(&s).await, 0);
+        let (err, _) = c
+            .call(
+                "call_app_tool",
+                json!({"app":"sales","tool":"t","arguments":{}}),
+            )
+            .await;
+        assert!(!err);
+        assert_eq!(relay_calls(&s).await, 1);
+    }
+
+    #[tokio::test]
+    async fn invalid_slug_is_never_sent_to_gateway() {
+        let (s, mut c) = start().await;
+        mount_find(
+            &s,
+            json!([{"app":"Bad:slug","tool":"t","summary":"s","destructive":false,"backend":"gateway"}]),
+        )
+        .await;
+        mount_gateway(&s, |_, _| ok_result("no")).await;
+        c.call("find_app_tools", json!({})).await;
+        let (err, text) = c
+            .call(
+                "call_app_tool",
+                json!({"app":"Bad:slug","tool":"t","arguments":{}}),
+            )
+            .await;
+        assert!(err);
+        assert!(text.contains("not a valid app slug"), "{text}");
+        let (err, _) = c
+            .call("describe_app_tool", json!({"app":"Bad:slug","tool":"t"}))
+            .await;
+        assert!(err);
+        assert!(gateway_calls(&s).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn gateway_describe_keeps_approval_and_held() {
+        let (s, mut c) = start().await;
+        mount_find(
+            &s,
+            json!([{"app":"sales","tool":"t","summary":"s","destructive":true,"backend":"gateway"}]),
+        )
+        .await;
+        mount_gateway(&s, |_, _| {
+            json!({"content":[],"isError":false,"structuredContent":{
+                "input_schema":{},"class":"destructive","needs_approval":true,"held":false}})
+        })
+        .await;
+        c.call("find_app_tools", json!({})).await;
+        let (err, text) = c
+            .call("describe_app_tool", json!({"app":"sales","tool":"t"}))
+            .await;
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["needs_approval"], true);
+        assert_eq!(v["held"], false);
+        assert_eq!(v["class"], "destructive");
     }
 }
