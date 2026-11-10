@@ -140,6 +140,15 @@ pub enum FrontDoor {
     Gateway,
 }
 
+/// Why the front door could not be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigError {
+    /// The platform has no such setting (an older server): tools are direct.
+    Absent,
+    /// The read failed (network, server error); it may work next time.
+    Failed(String),
+}
+
 /// Per-request timeout for Git routes; the platform may hold a request up to
 /// 60 s while the org's git server starts.
 pub const GIT_REQUEST_TIMEOUT: Duration = Duration::from_secs(75);
@@ -1485,15 +1494,18 @@ impl CloudApi {
     }
 
     /// How this org's agents reach its tools.
-    pub async fn mcp_config(&self) -> Result<FrontDoor, String> {
+    pub async fn mcp_config(&self) -> Result<FrontDoor, ConfigError> {
         let v: serde_json::Value = self
             .json(Method::GET, &self.org_path("/mcp/config"), |b| b)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| match e {
+                QuomeError::NotFound(_) => ConfigError::Absent,
+                e => ConfigError::Failed(e.to_string()),
+            })?;
         match v["front_door"].as_str() {
             Some("direct") => Ok(FrontDoor::Direct),
             Some("gateway") => Ok(FrontDoor::Gateway),
-            _ => Err("the platform sent an unknown front door".into()),
+            _ => Err(ConfigError::Absent),
         }
     }
 
