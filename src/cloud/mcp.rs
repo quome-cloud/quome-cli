@@ -3714,7 +3714,7 @@ impl QuomeMcp {
     }
 
     #[tool(
-        description = "Show an app's state by name (building, rolling_out, running, crashed, or the app's status), with its latest build and deploy. A failed deploy that left the previous version serving reads running; its failure is in latest_deploy. The URL is given only once a build has succeeded."
+        description = "Show an app's state by name (building, rolling_out, running, crashed, or the app's status), with its latest build and deploy. A failed deploy that left the previous version serving reads running; its failure is in latest_deploy. The URL is given only once a deploy has succeeded or the app is running."
     )]
     async fn app_status(&self, Parameters(a): Parameters<AppArgs>) -> Result<String, String> {
         let Some(app) = self.find_app(&a.name).await? else {
@@ -3724,7 +3724,9 @@ impl QuomeMcp {
         // Without the deploys, state falls back to the service status and latest_deploy is null.
         let deploys = call!(self, |api| api.list_deploys(&app.id)).unwrap_or_default();
         let latest = deploys.first();
-        let live = builds.iter().any(|b| b.status == "succeeded");
+        // A URL only once something can answer at it: a deploy that succeeded, or a
+        // running service. A built image whose rollouts all failed serves nothing.
+        let live = app.status == "running" || deploys.iter().any(|d| d.status == "succeeded");
         let tail = match builds.first() {
             Some(b) if b.status == "failed" => self.log_tail(&app.id, &b.id).await,
             _ => None,
@@ -6883,6 +6885,53 @@ mod tests {
         let v: Value = serde_json::from_str(&text).unwrap();
         assert!(v["url"].is_null(), "no succeeded build yet: {text}");
         assert_eq!(v["latest_build"]["status"], "building");
+    }
+
+    /// `app_status` for app1 whose service reads `status`, with these builds and deploys.
+    async fn app_status_of(status: &str, builds: Value, deploys: Value) -> Value {
+        let (s, mut c) = start().await;
+        sequence(&s, "GET", api_path("/services"), vec![svc(status)]).await;
+        sequence(&s, "GET", api_path("/apps/app1/builds"), vec![builds]).await;
+        sequence(&s, "GET", api_path("/apps/app1/deploys"), vec![deploys]).await;
+        let (err, text) = c.call("app_status", json!({"name":"web"})).await;
+        assert!(!err, "{text}");
+        serde_json::from_str(&text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn app_status_gives_no_url_when_every_deploy_failed_after_a_good_build() {
+        // The image built, but no rollout ever stayed up: there is nothing to visit.
+        let v = app_status_of(
+            "created",
+            json!([build("succeeded")]),
+            json!([
+                deploy_row("failed", json!("rollout failed"), crash("panic: boom")),
+                deploy_row("failed", json!("rollout failed"), crash("panic: boom")),
+            ]),
+        )
+        .await;
+        assert_eq!(v["state"], "crashed", "{v}");
+        assert!(v["url"].is_null(), "{v}");
+    }
+
+    #[tokio::test]
+    async fn app_status_gives_the_url_once_a_deploy_succeeded_even_while_asleep() {
+        let v = app_status_of(
+            "sleeping",
+            json!([build("succeeded")]),
+            json!([
+                deploy_row("failed", json!("rollout failed"), crash("boom")),
+                deploy_row("succeeded", Value::Null, Value::Null),
+            ]),
+        )
+        .await;
+        assert_eq!(v["url"], "https://web-acme.apps.example", "{v}");
+    }
+
+    #[tokio::test]
+    async fn app_status_gives_the_url_for_a_running_service_without_deploy_records() {
+        let v = app_status_of("running", json!([]), json!([])).await;
+        assert_eq!(v["url"], "https://web-acme.apps.example", "{v}");
     }
 
     async fn deploy_mocks(s: &MockServer, app_id: &str) {
