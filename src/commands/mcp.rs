@@ -52,6 +52,7 @@ pub async fn execute(args: Args) -> Result<()> {
     let reload = stored_reloader(home, Arc::from(store), name);
     QuomeMcp::new_shared(api, profile)
         .with_reloader(reload)
+        .with_latest_release(crate::auto_update::latest_release)
         .serve_stdio()
         .await
         .map_err(|e| QuomeError::CloudState(format!("MCP server stopped: {e}")))

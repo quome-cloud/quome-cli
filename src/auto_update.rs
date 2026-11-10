@@ -44,6 +44,10 @@ struct UpdateState {
     /// A newer version this install can't apply itself, cleared when the notice is shown.
     #[serde(default)]
     available: Option<String>,
+    /// The latest release past its soak, kept so a long-running `quome mcp` can tell it
+    /// is older than what is out.
+    #[serde(default)]
+    latest: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -79,7 +83,7 @@ fn parse_version(text: &str) -> Option<(u64, u64, u64)> {
     parts.next().is_none().then_some(version)
 }
 
-fn is_newer(candidate: &str, current: &str) -> bool {
+pub fn is_newer(candidate: &str, current: &str) -> bool {
     matches!((parse_version(candidate), parse_version(current)), (Some(a), Some(b)) if a > b)
 }
 
@@ -89,16 +93,46 @@ fn check_due(state: &UpdateState, now: DateTime<Utc>) -> bool {
         .is_none_or(|last| now - last >= chrono::Duration::hours(CHECK_EVERY_HOURS))
 }
 
-fn decide(release: &Release, current: &str, now: DateTime<Utc>) -> Decision {
+/// The release's version once everyone should run it: published, not a prerelease, soaked.
+fn settled_version(release: &Release, now: DateTime<Utc>) -> Option<String> {
     let old_enough = now - release.published_at >= chrono::Duration::hours(SOAK_HOURS);
-    if release.draft || release.prerelease || !old_enough || !is_newer(&release.tag_name, current) {
-        return Decision::Nothing;
+    if release.draft
+        || release.prerelease
+        || !old_enough
+        || parse_version(&release.tag_name).is_none()
+    {
+        return None;
     }
     let version = release
         .tag_name
         .strip_prefix('v')
         .unwrap_or(&release.tag_name);
-    Decision::Update(version.to_string())
+    Some(version.to_string())
+}
+
+fn decide(release: &Release, current: &str, now: DateTime<Utc>) -> Decision {
+    match settled_version(release, now) {
+        Some(version) if is_newer(&version, current) => Decision::Update(version),
+        _ => Decision::Nothing,
+    }
+}
+
+/// Remembers the latest settled release, newer than this binary or not.
+fn record_latest(state: &mut UpdateState, release: &Release, now: DateTime<Utc>) {
+    if let Some(version) = settled_version(release, now) {
+        state.latest = Some(version);
+    }
+}
+
+fn latest_release_in(path: &Path) -> Option<String> {
+    load(path).latest
+}
+
+/// The latest release the background check has seen, read from its state file: no network.
+/// Also starts the daily check when one is due, so a server running for days stays informed.
+pub fn latest_release() -> Option<String> {
+    start_background_check();
+    latest_release_in(&state_path()?)
 }
 
 /// The Homebrew that installed this binary, or `None` if Homebrew didn't.
@@ -209,10 +243,14 @@ pub async fn run() {
 
 async fn check_and_update() -> Option<()> {
     let release = fetch_latest(RELEASES_URL).await?;
-    let Decision::Update(version) = decide(&release, CURRENT, Utc::now()) else {
+    let now = Utc::now();
+    let path = state_path()?;
+    let mut state = load(&path);
+    record_latest(&mut state, &release, now);
+    let _ = save(&path, &state);
+    let Decision::Update(version) = decide(&release, CURRENT, now) else {
         return None;
     };
-    let path = state_path()?;
     let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
     match homebrew_for(&exe).filter(|brew| brew.exists()) {
         Some(brew) => {
@@ -383,6 +421,40 @@ mod tests {
     }
 
     #[test]
+    fn records_the_latest_settled_release_even_when_this_binary_is_current() {
+        let mut state = UpdateState::default();
+        // Still soaking: not yet the release everyone should run.
+        record_latest(&mut state, &release("v0.2.40", at(0)), at(5));
+        assert_eq!(state.latest, None);
+        record_latest(&mut state, &release("v0.2.40", at(0)), at(6));
+        assert_eq!(state.latest.as_deref(), Some("0.2.40"));
+        // A draft or prerelease never replaces it.
+        let mut pre = release("v0.2.41", at(0));
+        pre.prerelease = true;
+        record_latest(&mut state, &pre, at(9));
+        assert_eq!(state.latest.as_deref(), Some("0.2.40"));
+    }
+
+    #[test]
+    fn a_running_server_reads_the_latest_release_from_the_state_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(STATE_FILE);
+        assert_eq!(latest_release_in(&path), None);
+        let state = UpdateState {
+            latest: Some("0.2.40".into()),
+            ..Default::default()
+        };
+        save(&path, &state).unwrap();
+        assert_eq!(latest_release_in(&path).as_deref(), Some("0.2.40"));
+        // Showing the terminal notice leaves it for long-running servers.
+        let mut shown = load(&path);
+        shown.installed = None;
+        shown.available = None;
+        save(&path, &shown).unwrap();
+        assert_eq!(latest_release_in(&path).as_deref(), Some("0.2.40"));
+    }
+
+    #[test]
     fn finds_homebrew_only_for_homebrew_installs() {
         assert_eq!(
             homebrew_for(Path::new("/opt/homebrew/Cellar/quome/0.2.31/bin/quome")),
@@ -432,6 +504,7 @@ mod tests {
             last_check: Some(at(3)),
             installed: Some("0.2.32".into()),
             available: None,
+            latest: Some("0.2.32".into()),
         };
         save(&path, &state).unwrap();
         assert_eq!(load(&path), state);

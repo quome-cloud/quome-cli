@@ -63,6 +63,58 @@ pub struct Timing {
     pub log_retry: Duration,
 }
 
+/// How often a running server looks again at the latest release (a local read, no network).
+const RELEASE_RECHECK: Duration = Duration::from_secs(60 * 60);
+
+/// Where the latest released version comes from; `None` when it is not known.
+type LatestRelease = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
+/// Whether this server is older than the latest release, read at most every
+/// `RELEASE_RECHECK`. `quome mcp` runs for days, so an upgrade only reaches the
+/// agent once its MCP client starts the new binary.
+#[derive(Default)]
+struct ReleaseCheck {
+    source: Option<LatestRelease>,
+    state: std::sync::Mutex<ReleaseState>,
+}
+
+#[derive(Default)]
+struct ReleaseState {
+    read_at: Option<Instant>,
+    latest: Option<String>,
+    /// Said once in an ordinary tool result; the guide says it every time.
+    told: bool,
+}
+
+impl ReleaseCheck {
+    /// The restart advice for this result, if the server is outdated.
+    fn hint(&self, guide: bool) -> Option<String> {
+        let source = self.source.as_ref()?;
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.read_at.is_none_or(|t| t.elapsed() >= RELEASE_RECHECK) {
+            st.read_at = Some(Instant::now());
+            st.latest = source();
+        }
+        let current = env!("CARGO_PKG_VERSION");
+        let latest = st
+            .latest
+            .clone()
+            .filter(|v| crate::auto_update::is_newer(v, current))?;
+        if !guide {
+            if st.told {
+                return None;
+            }
+            st.told = true;
+        }
+        Some(format!(
+            "quome {latest} is out, but this MCP server is still quome {current}: it started \
+             before the upgrade, so its tools behave as {current}'s did. Ask the person to restart \
+             their MCP client (or reconnect its quome server) to run the new version; if \
+             `quome --version` still says {current}, run `quome upgrade` first."
+        ))
+    }
+}
+
 /// How long `create_sandbox` waits, once the sandbox runs, for its repo's clone.
 const CLONE_WAIT: Duration = Duration::from_secs(60);
 
@@ -398,6 +450,8 @@ pub struct QuomeMcp {
     door_gate: Arc<tokio::sync::Mutex<()>>,
     door_override: Option<FrontDoor>,
     door_refresh: Duration,
+    /// Whether this server is older than the latest release.
+    release: Arc<ReleaseCheck>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -1807,8 +1861,22 @@ impl QuomeMcp {
             door_gate: Arc::default(),
             door_override: default_front_door(),
             door_refresh: DOOR_REFRESH,
+            release: Arc::default(),
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Tell the agent to restart its MCP client when `latest` (the latest
+    /// released version) is newer than this binary. Never fails a tool call.
+    pub fn with_latest_release(
+        mut self,
+        latest: impl Fn() -> Option<String> + Send + Sync + 'static,
+    ) -> QuomeMcp {
+        self.release = Arc::new(ReleaseCheck {
+            source: Some(Arc::new(latest)),
+            state: Default::default(),
+        });
+        self
     }
 
     /// Use `git` for the Git tools (tests point it at a mock server).
@@ -3028,13 +3096,15 @@ impl QuomeMcp {
                 "failed" => {
                     let f = d.failure.as_ref();
                     let output = f.map(|f| f.console_tail.as_str()).unwrap_or("");
+                    // error leads: the failure message is written for people.
                     return Ok(serde_json::json!({
-                        "status": "failed", "build_status": "succeeded",
-                        "build_id": dep.build_id, "deploy_id": dep.deploy_id,
                         "error": f
                             .map(|f| f.message.clone())
                             .filter(|m| !m.is_empty())
                             .or(d.error),
+                        "status": "failed", "build_status": "succeeded",
+                        "build_id": dep.build_id, "deploy_id": dep.deploy_id,
+                        "oom": f.map(|f| f.oom),
                         "exit_code": f.and_then(|f| f.exit_code),
                         "signal": f.and_then(|f| f.signal),
                         "seconds_alive": f.and_then(|f| f.seconds_alive),
@@ -3700,7 +3770,7 @@ impl QuomeMcp {
     }
 
     #[tool(
-        description = "Deploy a local folder, or a repo of the org's Git, with a Dockerfile as a Quome Cloud app: create the app if needed, upload the folder (a repo needs no upload), build, then wait for the new revision to run, up to 10 minutes in all. Returns status running with the app URL when it is live; otherwise the build or rollout state and where to read the logs. When the container does not stay up, error says what was observed and container_output is its last lines. Give exactly one of folder and repo. Use repo (`<name>` or `<org>/<name>`, with optional ref: branch, tag or commit, default the repo's default branch) when the code already lives in the org's Git and there is no local checkout; the result's source gives the repo, ref and resolved commit."
+        description = "Deploy a local folder, or a repo of the org's Git, with a Dockerfile as a Quome Cloud app: create the app if needed, upload the folder (a repo needs no upload), build, then wait for the new revision to run, up to 10 minutes in all. Returns status running with the app URL when it is live; otherwise the build or rollout state and where to read the logs. When the container does not stay up, error says what was observed, oom is true when it ran out of memory, and container_output is its last lines. Give exactly one of folder and repo. Use repo (`<name>` or `<org>/<name>`, with optional ref: branch, tag or commit, default the repo's default branch) when the code already lives in the org's Git and there is no local checkout; the result's source gives the repo, ref and resolved commit."
     )]
     async fn deploy_app(
         &self,
@@ -3712,7 +3782,7 @@ impl QuomeMcp {
     }
 
     #[tool(
-        description = "Show an app's state by name (building, rolling_out, running, crashed, or the app's status), with its latest build and deploy. A failed deploy that left the previous version serving reads running; its failure is in latest_deploy. The URL is given only once a build has succeeded."
+        description = "Show an app's state by name (building, rolling_out, running, crashed, or the app's status), with its latest build and deploy. A failed deploy that left the previous version serving reads running; its failure is in latest_deploy. The URL is given only once a deploy has succeeded or the app is running."
     )]
     async fn app_status(&self, Parameters(a): Parameters<AppArgs>) -> Result<String, String> {
         let Some(app) = self.find_app(&a.name).await? else {
@@ -3722,7 +3792,9 @@ impl QuomeMcp {
         // Without the deploys, state falls back to the service status and latest_deploy is null.
         let deploys = call!(self, |api| api.list_deploys(&app.id)).unwrap_or_default();
         let latest = deploys.first();
-        let live = builds.iter().any(|b| b.status == "succeeded");
+        // A URL only once something can answer at it: a deploy that succeeded, or a
+        // running service. A built image whose rollouts all failed serves nothing.
+        let live = app.status == "running" || deploys.iter().any(|d| d.status == "succeeded");
         let tail = match builds.first() {
             Some(b) if b.status == "failed" => self.log_tail(&app.id, &b.id).await,
             _ => None,
@@ -4833,6 +4905,7 @@ impl rmcp::ServerHandler for QuomeMcp {
     ) -> Result<CallToolResponse, ErrorData> {
         // The CLI's own tools never wait for the front door or the gateway.
         let own = OWN_TOOLS.contains(&request.name.as_ref());
+        let guide = request.name == "guide";
         let serving = if own {
             Serving::Direct
         } else {
@@ -4848,6 +4921,9 @@ impl rmcp::ServerHandler for QuomeMcp {
             )?,
         };
         if let Some(h) = self.take_reconnect_hint() {
+            result.content.push(ContentBlock::text(h));
+        }
+        if let Some(h) = self.release.hint(guide) {
             result.content.push(ContentBlock::text(h));
         }
         Ok(result.into())
@@ -6132,6 +6208,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deploy_app_says_when_the_container_ran_out_of_memory_message_first() {
+        let (s, mut c) = start().await;
+        let dir = docker_dir();
+        deploy_setup(&s, &["created"], &["succeeded"]).await;
+        let mut f = crash("Killed");
+        f["message"] = json!("the app ran out of memory (0.5 GB); give it more memory_gb");
+        f["oom"] = json!(true);
+        f["signal"] = json!(9);
+        deploy_rows(&s, vec![deploy_row("failed", json!("rollout failed"), f)]).await;
+        let (err, text) = c.call("deploy_app", deploy_args(&dir)).await;
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["oom"], true, "{text}");
+        assert_eq!(v["signal"], 9);
+        // The message is written for people: it leads the result.
+        assert_eq!(
+            v.as_object().unwrap().keys().next().map(String::as_str),
+            Some("error"),
+            "{text}"
+        );
+        assert!(text
+            .trim_start_matches(['{', ' ', '\n'])
+            .starts_with("\"error\": \"the app ran out of memory"));
+    }
+
+    #[tokio::test]
+    async fn deploy_app_reads_a_failure_without_oom_as_not_out_of_memory() {
+        let (s, mut c) = start().await;
+        let dir = docker_dir();
+        deploy_setup(&s, &["created"], &["succeeded"]).await;
+        deploy_rows(&s, vec![deploy_row("failed", json!("x"), crash("boom"))]).await;
+        let (err, text) = c.call("deploy_app", deploy_args(&dir)).await;
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["status"], "failed", "{text}");
+        assert_eq!(v["oom"], false, "{text}");
+    }
+
+    #[tokio::test]
     async fn deploy_app_succeeds_from_the_deploy_row() {
         let (s, mut c) = start().await;
         let dir = docker_dir();
@@ -6537,6 +6652,28 @@ mod tests {
         assert_eq!(v["latest_deploy"]["error"], "rollout failed");
         assert_eq!(v["latest_deploy"]["failure"]["exit_code"], 1);
         assert_eq!(v["latest_deploy"]["failure"]["console_tail"], "panic: boom");
+        assert_eq!(v["latest_deploy"]["failure"]["oom"], false);
+    }
+
+    #[tokio::test]
+    async fn app_status_passes_the_out_of_memory_flag_through_message_first() {
+        let mut f = crash("Killed");
+        f["message"] = json!("the app ran out of memory (0.5 GB)");
+        f["oom"] = json!(true);
+        let v = app_status_with("created", deploy_row("failed", json!("rollout failed"), f)).await;
+        let failure = &v["latest_deploy"]["failure"];
+        assert_eq!(failure["oom"], true, "{v}");
+        assert_eq!(
+            failure
+                .as_object()
+                .unwrap()
+                .keys()
+                .next()
+                .map(String::as_str),
+            Some("message"),
+            "{v}"
+        );
+        assert_eq!(failure["message"], "the app ran out of memory (0.5 GB)");
     }
 
     #[tokio::test]
@@ -6820,6 +6957,145 @@ mod tests {
         let v: Value = serde_json::from_str(&text).unwrap();
         assert!(v["url"].is_null(), "no succeeded build yet: {text}");
         assert_eq!(v["latest_build"]["status"], "building");
+    }
+
+    /// A server that believes `latest` is the latest release, counting how often it asked.
+    async fn start_with_release(
+        latest: Option<&'static str>,
+    ) -> (MockServer, Client, Arc<std::sync::atomic::AtomicUsize>) {
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = asked.clone();
+        let (s, c) = start_with_server(
+            Timing {
+                poll: Duration::from_millis(5),
+                sandbox_wait: Duration::from_secs(5),
+                build_wait: Duration::from_secs(5),
+                email_backoff: Duration::from_millis(5),
+                log_wait: Duration::from_millis(200),
+                log_retry: Duration::from_millis(5),
+            },
+            |api| api,
+            move |m, _| {
+                m.with_latest_release(move || {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    latest.map(String::from)
+                })
+            },
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path(api_path("/agent-guide")))
+            .respond_with(ResponseTemplate::new(200).set_body_string("# Guide"))
+            .mount(&s)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(api_path("/sandboxes")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&s)
+            .await;
+        (s, c, asked)
+    }
+
+    /// Every text block of a tool call's result.
+    async fn call_blocks(c: &mut Client, tool: &str) -> Vec<String> {
+        let r = c
+            .rpc("tools/call", json!({"name": tool, "arguments": {}}))
+            .await;
+        r["result"]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|b| b["text"].as_str().map(String::from))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_outdated_server_says_restart_in_the_guide_and_once_in_a_result() {
+        let (_s, mut c, _) = start_with_release(Some("999.0.0")).await;
+        let guide = call_blocks(&mut c, "guide").await;
+        assert_eq!(guide[0], "# Guide", "the guide is first and unchanged");
+        let hint = guide[1..].join("\n");
+        assert!(hint.contains("999.0.0"), "{hint}");
+        assert!(hint.contains(env!("CARGO_PKG_VERSION")), "{hint}");
+        assert!(hint.contains("restart their MCP client"), "{hint}");
+
+        let first = call_blocks(&mut c, "list_sandboxes").await;
+        assert_eq!(first[0], "[]");
+        assert!(first[1..].join("\n").contains("999.0.0"), "{first:?}");
+        let second = call_blocks(&mut c, "list_sandboxes").await;
+        assert_eq!(second.len(), 1, "said once: {second:?}");
+        // The guide always carries it while the server is outdated.
+        assert!(call_blocks(&mut c, "guide").await.len() > 1);
+    }
+
+    #[tokio::test]
+    async fn a_current_server_or_an_unknown_release_adds_nothing() {
+        for latest in [Some(env!("CARGO_PKG_VERSION")), Some("0.0.1"), None] {
+            let (_s, mut c, _) = start_with_release(latest).await;
+            assert_eq!(call_blocks(&mut c, "guide").await.len(), 1, "{latest:?}");
+            assert_eq!(
+                call_blocks(&mut c, "list_sandboxes").await.len(),
+                1,
+                "{latest:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_release_check_is_cached() {
+        let (_s, mut c, asked) = start_with_release(Some("999.0.0")).await;
+        for _ in 0..3 {
+            call_blocks(&mut c, "guide").await;
+            call_blocks(&mut c, "list_sandboxes").await;
+        }
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// `app_status` for app1 whose service reads `status`, with these builds and deploys.
+    async fn app_status_of(status: &str, builds: Value, deploys: Value) -> Value {
+        let (s, mut c) = start().await;
+        sequence(&s, "GET", api_path("/services"), vec![svc(status)]).await;
+        sequence(&s, "GET", api_path("/apps/app1/builds"), vec![builds]).await;
+        sequence(&s, "GET", api_path("/apps/app1/deploys"), vec![deploys]).await;
+        let (err, text) = c.call("app_status", json!({"name":"web"})).await;
+        assert!(!err, "{text}");
+        serde_json::from_str(&text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn app_status_gives_no_url_when_every_deploy_failed_after_a_good_build() {
+        // The image built, but no rollout ever stayed up: there is nothing to visit.
+        let v = app_status_of(
+            "created",
+            json!([build("succeeded")]),
+            json!([
+                deploy_row("failed", json!("rollout failed"), crash("panic: boom")),
+                deploy_row("failed", json!("rollout failed"), crash("panic: boom")),
+            ]),
+        )
+        .await;
+        assert_eq!(v["state"], "crashed", "{v}");
+        assert!(v["url"].is_null(), "{v}");
+    }
+
+    #[tokio::test]
+    async fn app_status_gives_the_url_once_a_deploy_succeeded_even_while_asleep() {
+        let v = app_status_of(
+            "sleeping",
+            json!([build("succeeded")]),
+            json!([
+                deploy_row("failed", json!("rollout failed"), crash("boom")),
+                deploy_row("succeeded", Value::Null, Value::Null),
+            ]),
+        )
+        .await;
+        assert_eq!(v["url"], "https://web-acme.apps.example", "{v}");
+    }
+
+    #[tokio::test]
+    async fn app_status_gives_the_url_for_a_running_service_without_deploy_records() {
+        let v = app_status_of("running", json!([]), json!([])).await;
+        assert_eq!(v["url"], "https://web-acme.apps.example", "{v}");
     }
 
     async fn deploy_mocks(s: &MockServer, app_id: &str) {
