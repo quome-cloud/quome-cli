@@ -408,6 +408,9 @@ pub struct DeployFailure {
     pub console_tail: String,
     #[serde(default)]
     pub instance_id: String,
+    /// The container was killed for running out of memory.
+    #[serde(default)]
+    pub oom: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]

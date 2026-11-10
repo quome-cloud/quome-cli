@@ -3028,13 +3028,15 @@ impl QuomeMcp {
                 "failed" => {
                     let f = d.failure.as_ref();
                     let output = f.map(|f| f.console_tail.as_str()).unwrap_or("");
+                    // error leads: the failure message is written for people.
                     return Ok(serde_json::json!({
-                        "status": "failed", "build_status": "succeeded",
-                        "build_id": dep.build_id, "deploy_id": dep.deploy_id,
                         "error": f
                             .map(|f| f.message.clone())
                             .filter(|m| !m.is_empty())
                             .or(d.error),
+                        "status": "failed", "build_status": "succeeded",
+                        "build_id": dep.build_id, "deploy_id": dep.deploy_id,
+                        "oom": f.map(|f| f.oom),
                         "exit_code": f.and_then(|f| f.exit_code),
                         "signal": f.and_then(|f| f.signal),
                         "seconds_alive": f.and_then(|f| f.seconds_alive),
@@ -3700,7 +3702,7 @@ impl QuomeMcp {
     }
 
     #[tool(
-        description = "Deploy a local folder, or a repo of the org's Git, with a Dockerfile as a Quome Cloud app: create the app if needed, upload the folder (a repo needs no upload), build, then wait for the new revision to run, up to 10 minutes in all. Returns status running with the app URL when it is live; otherwise the build or rollout state and where to read the logs. When the container does not stay up, error says what was observed and container_output is its last lines. Give exactly one of folder and repo. Use repo (`<name>` or `<org>/<name>`, with optional ref: branch, tag or commit, default the repo's default branch) when the code already lives in the org's Git and there is no local checkout; the result's source gives the repo, ref and resolved commit."
+        description = "Deploy a local folder, or a repo of the org's Git, with a Dockerfile as a Quome Cloud app: create the app if needed, upload the folder (a repo needs no upload), build, then wait for the new revision to run, up to 10 minutes in all. Returns status running with the app URL when it is live; otherwise the build or rollout state and where to read the logs. When the container does not stay up, error says what was observed, oom is true when it ran out of memory, and container_output is its last lines. Give exactly one of folder and repo. Use repo (`<name>` or `<org>/<name>`, with optional ref: branch, tag or commit, default the repo's default branch) when the code already lives in the org's Git and there is no local checkout; the result's source gives the repo, ref and resolved commit."
     )]
     async fn deploy_app(
         &self,
@@ -6132,6 +6134,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deploy_app_says_when_the_container_ran_out_of_memory_message_first() {
+        let (s, mut c) = start().await;
+        let dir = docker_dir();
+        deploy_setup(&s, &["created"], &["succeeded"]).await;
+        let mut f = crash("Killed");
+        f["message"] = json!("the app ran out of memory (0.5 GB); give it more memory_gb");
+        f["oom"] = json!(true);
+        f["signal"] = json!(9);
+        deploy_rows(&s, vec![deploy_row("failed", json!("rollout failed"), f)]).await;
+        let (err, text) = c.call("deploy_app", deploy_args(&dir)).await;
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["oom"], true, "{text}");
+        assert_eq!(v["signal"], 9);
+        // The message is written for people: it leads the result.
+        assert_eq!(
+            v.as_object().unwrap().keys().next().map(String::as_str),
+            Some("error"),
+            "{text}"
+        );
+        assert!(text
+            .trim_start_matches(['{', ' ', '\n'])
+            .starts_with("\"error\": \"the app ran out of memory"));
+    }
+
+    #[tokio::test]
+    async fn deploy_app_reads_a_failure_without_oom_as_not_out_of_memory() {
+        let (s, mut c) = start().await;
+        let dir = docker_dir();
+        deploy_setup(&s, &["created"], &["succeeded"]).await;
+        deploy_rows(&s, vec![deploy_row("failed", json!("x"), crash("boom"))]).await;
+        let (err, text) = c.call("deploy_app", deploy_args(&dir)).await;
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["status"], "failed", "{text}");
+        assert_eq!(v["oom"], false, "{text}");
+    }
+
+    #[tokio::test]
     async fn deploy_app_succeeds_from_the_deploy_row() {
         let (s, mut c) = start().await;
         let dir = docker_dir();
@@ -6537,6 +6578,28 @@ mod tests {
         assert_eq!(v["latest_deploy"]["error"], "rollout failed");
         assert_eq!(v["latest_deploy"]["failure"]["exit_code"], 1);
         assert_eq!(v["latest_deploy"]["failure"]["console_tail"], "panic: boom");
+        assert_eq!(v["latest_deploy"]["failure"]["oom"], false);
+    }
+
+    #[tokio::test]
+    async fn app_status_passes_the_out_of_memory_flag_through_message_first() {
+        let mut f = crash("Killed");
+        f["message"] = json!("the app ran out of memory (0.5 GB)");
+        f["oom"] = json!(true);
+        let v = app_status_with("created", deploy_row("failed", json!("rollout failed"), f)).await;
+        let failure = &v["latest_deploy"]["failure"];
+        assert_eq!(failure["oom"], true, "{v}");
+        assert_eq!(
+            failure
+                .as_object()
+                .unwrap()
+                .keys()
+                .next()
+                .map(String::as_str),
+            Some("message"),
+            "{v}"
+        );
+        assert_eq!(failure["message"], "the app ran out of memory (0.5 GB)");
     }
 
     #[tokio::test]
