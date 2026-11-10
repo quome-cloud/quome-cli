@@ -63,6 +63,58 @@ pub struct Timing {
     pub log_retry: Duration,
 }
 
+/// How often a running server looks again at the latest release (a local read, no network).
+const RELEASE_RECHECK: Duration = Duration::from_secs(60 * 60);
+
+/// Where the latest released version comes from; `None` when it is not known.
+type LatestRelease = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
+/// Whether this server is older than the latest release, read at most every
+/// `RELEASE_RECHECK`. `quome mcp` runs for days, so an upgrade only reaches the
+/// agent once its MCP client starts the new binary.
+#[derive(Default)]
+struct ReleaseCheck {
+    source: Option<LatestRelease>,
+    state: std::sync::Mutex<ReleaseState>,
+}
+
+#[derive(Default)]
+struct ReleaseState {
+    read_at: Option<Instant>,
+    latest: Option<String>,
+    /// Said once in an ordinary tool result; the guide says it every time.
+    told: bool,
+}
+
+impl ReleaseCheck {
+    /// The restart advice for this result, if the server is outdated.
+    fn hint(&self, guide: bool) -> Option<String> {
+        let source = self.source.as_ref()?;
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.read_at.is_none_or(|t| t.elapsed() >= RELEASE_RECHECK) {
+            st.read_at = Some(Instant::now());
+            st.latest = source();
+        }
+        let current = env!("CARGO_PKG_VERSION");
+        let latest = st
+            .latest
+            .clone()
+            .filter(|v| crate::auto_update::is_newer(v, current))?;
+        if !guide {
+            if st.told {
+                return None;
+            }
+            st.told = true;
+        }
+        Some(format!(
+            "quome {latest} is out, but this MCP server is still quome {current}: it started \
+             before the upgrade, so its tools behave as {current}'s did. Ask the person to restart \
+             their MCP client (or reconnect its quome server) to run the new version; if \
+             `quome --version` still says {current}, run `quome upgrade` first."
+        ))
+    }
+}
+
 /// How long `create_sandbox` waits, once the sandbox runs, for its repo's clone.
 const CLONE_WAIT: Duration = Duration::from_secs(60);
 
@@ -398,6 +450,8 @@ pub struct QuomeMcp {
     door_gate: Arc<tokio::sync::Mutex<()>>,
     door_override: Option<FrontDoor>,
     door_refresh: Duration,
+    /// Whether this server is older than the latest release.
+    release: Arc<ReleaseCheck>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -1807,8 +1861,22 @@ impl QuomeMcp {
             door_gate: Arc::default(),
             door_override: default_front_door(),
             door_refresh: DOOR_REFRESH,
+            release: Arc::default(),
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Tell the agent to restart its MCP client when `latest` (the latest
+    /// released version) is newer than this binary. Never fails a tool call.
+    pub fn with_latest_release(
+        mut self,
+        latest: impl Fn() -> Option<String> + Send + Sync + 'static,
+    ) -> QuomeMcp {
+        self.release = Arc::new(ReleaseCheck {
+            source: Some(Arc::new(latest)),
+            state: Default::default(),
+        });
+        self
     }
 
     /// Use `git` for the Git tools (tests point it at a mock server).
@@ -4837,6 +4905,7 @@ impl rmcp::ServerHandler for QuomeMcp {
     ) -> Result<CallToolResponse, ErrorData> {
         // The CLI's own tools never wait for the front door or the gateway.
         let own = OWN_TOOLS.contains(&request.name.as_ref());
+        let guide = request.name == "guide";
         let serving = if own {
             Serving::Direct
         } else {
@@ -4852,6 +4921,9 @@ impl rmcp::ServerHandler for QuomeMcp {
             )?,
         };
         if let Some(h) = self.take_reconnect_hint() {
+            result.content.push(ContentBlock::text(h));
+        }
+        if let Some(h) = self.release.hint(guide) {
             result.content.push(ContentBlock::text(h));
         }
         Ok(result.into())
@@ -6885,6 +6957,98 @@ mod tests {
         let v: Value = serde_json::from_str(&text).unwrap();
         assert!(v["url"].is_null(), "no succeeded build yet: {text}");
         assert_eq!(v["latest_build"]["status"], "building");
+    }
+
+    /// A server that believes `latest` is the latest release, counting how often it asked.
+    async fn start_with_release(
+        latest: Option<&'static str>,
+    ) -> (MockServer, Client, Arc<std::sync::atomic::AtomicUsize>) {
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = asked.clone();
+        let (s, c) = start_with_server(
+            Timing {
+                poll: Duration::from_millis(5),
+                sandbox_wait: Duration::from_secs(5),
+                build_wait: Duration::from_secs(5),
+                email_backoff: Duration::from_millis(5),
+                log_wait: Duration::from_millis(200),
+                log_retry: Duration::from_millis(5),
+            },
+            |api| api,
+            move |m, _| {
+                m.with_latest_release(move || {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    latest.map(String::from)
+                })
+            },
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path(api_path("/agent-guide")))
+            .respond_with(ResponseTemplate::new(200).set_body_string("# Guide"))
+            .mount(&s)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(api_path("/sandboxes")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&s)
+            .await;
+        (s, c, asked)
+    }
+
+    /// Every text block of a tool call's result.
+    async fn call_blocks(c: &mut Client, tool: &str) -> Vec<String> {
+        let r = c
+            .rpc("tools/call", json!({"name": tool, "arguments": {}}))
+            .await;
+        r["result"]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|b| b["text"].as_str().map(String::from))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_outdated_server_says_restart_in_the_guide_and_once_in_a_result() {
+        let (_s, mut c, _) = start_with_release(Some("999.0.0")).await;
+        let guide = call_blocks(&mut c, "guide").await;
+        assert_eq!(guide[0], "# Guide", "the guide is first and unchanged");
+        let hint = guide[1..].join("\n");
+        assert!(hint.contains("999.0.0"), "{hint}");
+        assert!(hint.contains(env!("CARGO_PKG_VERSION")), "{hint}");
+        assert!(hint.contains("restart their MCP client"), "{hint}");
+
+        let first = call_blocks(&mut c, "list_sandboxes").await;
+        assert_eq!(first[0], "[]");
+        assert!(first[1..].join("\n").contains("999.0.0"), "{first:?}");
+        let second = call_blocks(&mut c, "list_sandboxes").await;
+        assert_eq!(second.len(), 1, "said once: {second:?}");
+        // The guide always carries it while the server is outdated.
+        assert!(call_blocks(&mut c, "guide").await.len() > 1);
+    }
+
+    #[tokio::test]
+    async fn a_current_server_or_an_unknown_release_adds_nothing() {
+        for latest in [Some(env!("CARGO_PKG_VERSION")), Some("0.0.1"), None] {
+            let (_s, mut c, _) = start_with_release(latest).await;
+            assert_eq!(call_blocks(&mut c, "guide").await.len(), 1, "{latest:?}");
+            assert_eq!(
+                call_blocks(&mut c, "list_sandboxes").await.len(),
+                1,
+                "{latest:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_release_check_is_cached() {
+        let (_s, mut c, asked) = start_with_release(Some("999.0.0")).await;
+        for _ in 0..3 {
+            call_blocks(&mut c, "guide").await;
+            call_blocks(&mut c, "list_sandboxes").await;
+        }
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     /// `app_status` for app1 whose service reads `status`, with these builds and deploys.
