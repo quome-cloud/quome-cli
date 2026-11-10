@@ -93,6 +93,9 @@ pub enum GatewayError {
     Transport(String),
     /// The gateway sent something that is not MCP, or too much of it.
     Protocol(String),
+    /// A connect failed a moment ago; this is its message, given again
+    /// without trying.
+    Recent(String),
 }
 
 impl std::fmt::Display for GatewayError {
@@ -129,6 +132,7 @@ impl std::fmt::Display for GatewayError {
             GatewayError::Transport(m) => {
                 write!(f, "The org's MCP gateway could not be reached: {m}")
             }
+            GatewayError::Recent(m) => write!(f, "{m}"),
             GatewayError::Protocol(m) => {
                 write!(f, "The org's MCP gateway sent an unexpected answer: {m}")
             }

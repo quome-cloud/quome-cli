@@ -1,9 +1,9 @@
 //! The `quome mcp` server: Quome Cloud tools for Claude Code over MCP stdio.
-use super::api::FrontDoor;
 use super::api::{
     check_cpus_fit, AppSettings, CloudApi, CreateSandbox, DatabaseSearch, Download, Sandbox,
     WaitStep, MAX_EMAIL_WAIT, MAX_EXEC_TIMEOUT, MEMORY_RULE, SLEEP_RULE,
 };
+use super::api::{ConfigError, FrontDoor};
 use super::auth::TokenSource;
 use super::auth_instance::{check_env, AuthCallError, AuthInstances, Scope, NOT_STARTED};
 use super::credentials::{cred_hint, cred_hint_for, CredAccess, CredError, CredentialsClient};
@@ -332,7 +332,16 @@ struct Door {
     /// The reconnect advice is owed to the next result.
     hint_due: bool,
     hinted: bool,
+    /// What the last request was served by, to tell the agent when its tool
+    /// list changes.
+    served: Option<u8>,
+    /// A failed gateway connect, kept for a few seconds so callers queued
+    /// behind it do not each wait out a start budget.
+    connect_failed: Option<(Instant, String)>,
 }
+
+/// How long a failed connect is remembered.
+const CONNECT_RETRY: Duration = Duration::from_secs(5);
 
 struct Conn {
     api: Arc<CloudApi>,
@@ -1828,15 +1837,39 @@ impl QuomeMcp {
         if let Some(g) = held.as_ref() {
             return Ok(g.clone());
         }
+        let recent = self
+            .door
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .connect_failed
+            .clone();
+        if let Some((at, msg)) = recent {
+            if at.elapsed() < CONNECT_RETRY {
+                return Err(GatewayError::Recent(msg));
+            }
+        }
         let api = self.conn().api.clone();
         let local: Vec<&str> = GATEWAY_LOCAL_TOOLS
             .iter()
             .chain(GATEWAY_ALIASES)
             .copied()
             .collect();
-        let g = Arc::new(GatewayClient::connect(api, &local).await?);
-        *held = Some(g.clone());
-        Ok(g)
+        match GatewayClient::connect(api, &local).await {
+            Ok(g) => {
+                let g = Arc::new(g);
+                *held = Some(g.clone());
+                Ok(g)
+            }
+            Err(e) => {
+                if !matches!(e, GatewayError::MissingCapability) {
+                    self.door
+                        .lock()
+                        .unwrap_or_else(|x| x.into_inner())
+                        .connect_failed = Some((Instant::now(), e.to_string()));
+                }
+                Err(e)
+            }
+        }
     }
 
     /// How tools are served now. The front door is read at first need and
@@ -1844,7 +1877,27 @@ impl QuomeMcp {
     /// other calls wait on. A connection without `mcp_call` falls back to
     /// direct and owes the agent a reconnect hint, once. Any other failure to
     /// reach the gateway is `Unavailable`: it never falls back to direct.
-    async fn serving_gateway(&self) -> Serving {
+    async fn serving_gateway(&self, peer: &Peer<RoleServer>) -> Serving {
+        let served = self.decide_serving().await;
+        // The tool list differs between the three, so tell the agent when it moves.
+        let kind = match &served {
+            Serving::Direct => 0u8,
+            Serving::Gateway(_) => 1,
+            Serving::Unavailable(_) => 2,
+        };
+        let moved = {
+            let mut d = self.door.lock().unwrap_or_else(|e| e.into_inner());
+            let moved = d.served.is_some_and(|k| k != kind);
+            d.served = Some(kind);
+            moved
+        };
+        if moved {
+            let _ = peer.notify_tool_list_changed().await;
+        }
+        served
+    }
+
+    async fn decide_serving(&self) -> Serving {
         {
             let _gate = self.door_gate.lock().await;
             let (stale, prev) = {
@@ -1859,7 +1912,18 @@ impl QuomeMcp {
                     Some(m) => m,
                     None => match self.conn().api.mcp_config().await {
                         Ok(m) => m,
-                        Err(_) => prev.unwrap_or(FrontDoor::Direct),
+                        Err(ConfigError::Absent) => FrontDoor::Direct,
+                        // Later failures keep the last known mode.
+                        Err(ConfigError::Failed(_)) if prev.is_some() => {
+                            prev.unwrap_or(FrontDoor::Direct)
+                        }
+                        // Never read yet: the org may have chosen the gateway, so
+                        // serve nothing direct, and read again on the next call.
+                        Err(ConfigError::Failed(e)) => {
+                            return Serving::Unavailable(format!(
+                                "The org's MCP gateway setting could not be read; try again shortly. ({e})"
+                            ));
+                        }
                     },
                 };
                 {
@@ -4728,6 +4792,7 @@ impl rmcp::ServerHandler for QuomeMcp {
         ServerInfo::new(
             ServerCapabilities::builder()
                 .enable_tools()
+                .enable_tool_list_changed()
                 .enable_prompts()
                 .build(),
         )
@@ -4738,9 +4803,9 @@ impl rmcp::ServerHandler for QuomeMcp {
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _ctx: RequestContext<RoleServer>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        let tools = match self.serving_gateway().await {
+        let tools = match self.serving_gateway(&ctx.peer).await {
             Serving::Gateway(g) => self.gateway_tools(&g).await?,
             Serving::Direct => self.tool_router.list_all(),
             // Only what needs no gateway; direct tools would bypass the org's policy.
@@ -4763,7 +4828,7 @@ impl rmcp::ServerHandler for QuomeMcp {
         let serving = if own {
             Serving::Direct
         } else {
-            self.serving_gateway().await
+            self.serving_gateway(&ctx.peer).await
         };
         let mut result = match serving {
             Serving::Gateway(g) => self.gateway_dispatch(&g, request, ctx).await?,
@@ -4783,9 +4848,9 @@ impl rmcp::ServerHandler for QuomeMcp {
     async fn list_prompts(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _ctx: RequestContext<RoleServer>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<ListPromptsResult, ErrorData> {
-        match self.serving_gateway().await {
+        match self.serving_gateway(&ctx.peer).await {
             Serving::Gateway(g) => {
                 let prompts = g.list_prompts().await.map_err(prompt_error)?;
                 return Ok(ListPromptsResult::with_all_items(prompts));
@@ -4824,9 +4889,9 @@ impl rmcp::ServerHandler for QuomeMcp {
     async fn get_prompt(
         &self,
         request: GetPromptRequestParams,
-        _ctx: RequestContext<RoleServer>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<GetPromptResult, ErrorData> {
-        let serving = self.serving_gateway().await;
+        let serving = self.serving_gateway(&ctx.peer).await;
         if let Serving::Unavailable(m) = &serving {
             return Err(ErrorData::internal_error(m.clone(), None));
         }
@@ -13116,5 +13181,143 @@ mod tests {
         let (s, mut c) = start_door(|m| m.with_front_door(Some(FrontDoor::Gateway))).await;
         mount_gw(&s, |_, _| Ok(gw_tools())).await;
         assert!(tool_names(&mut c).await.contains(&"find_tools".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_first_failed_config_read_serves_nothing_direct_and_is_not_cached() {
+        let (s, mut c) = start_live().await;
+        Mock::given(method("GET"))
+            .and(path(api_path("/mcp/config")))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&s)
+            .await;
+        mount_config(&s, "direct").await;
+        Mock::given(method("GET"))
+            .and(path(api_path("/sandboxes")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&s)
+            .await;
+        let names = tool_names(&mut c).await;
+        assert_eq!(names, ["sync_folder", "git_clone_url"]);
+        // the failure is not kept: the next call reads again and finds direct
+        let (err, text) = c.call("list_sandboxes", json!({})).await;
+        assert!(!err, "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_first_failed_config_read_says_try_again() {
+        let (s, mut c) = start_live().await;
+        Mock::given(method("GET"))
+            .and(path(api_path("/mcp/config")))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&s)
+            .await;
+        let (err, text) = c.call("list_sandboxes", json!({})).await;
+        assert!(err);
+        assert!(text.contains("try again"), "{text}");
+        assert_eq!(rest_hits(&s.received_requests().await.unwrap()), 0);
+    }
+
+    #[tokio::test]
+    async fn a_missing_config_route_means_direct() {
+        let (s, mut c) = start_live().await;
+        Mock::given(method("GET"))
+            .and(path(api_path("/mcp/config")))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({"detail":"nope"})))
+            .mount(&s)
+            .await;
+        assert!(tool_names(&mut c).await.contains(&"guide".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_later_failed_config_read_keeps_the_last_mode() {
+        let (s, mut c) = start_door(|m| {
+            m.with_front_door(None)
+                .with_door_refresh(Duration::from_millis(100))
+        })
+        .await;
+        Mock::given(method("GET"))
+            .and(path(api_path("/mcp/config")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"front_door":"gateway"})))
+            .up_to_n_times(1)
+            .mount(&s)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(api_path("/mcp/config")))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&s)
+            .await;
+        mount_gw(&s, |_, _| Ok(gw_tools())).await;
+        assert!(tool_names(&mut c).await.contains(&"find_tools".to_string()));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(tool_names(&mut c).await.contains(&"find_tools".to_string()));
+    }
+
+    /// Wait for the next `notifications/tools/list_changed`, after `rpc`s.
+    async fn saw_list_changed(c: &mut Client) -> bool {
+        for _ in 0..20 {
+            if c.notes
+                .iter()
+                .any(|n| n["method"] == "notifications/tools/list_changed")
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            c.rpc("ping", json!({})).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn the_agent_is_told_when_the_gateway_comes_up() {
+        let (s, mut c) = start_live().await;
+        mount_config(&s, "gateway").await;
+        // the gateway is down for the first call, then up
+        Mock::given(method("POST"))
+            .and(path(api_path("/mcp/token")))
+            .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(1)
+            .mount(&s)
+            .await;
+        mount_gw(&s, |_, _| Ok(gw_tools())).await;
+        let v = c
+            .rpc(
+                "initialize",
+                json!({"protocolVersion":"2025-06-18","capabilities":{},
+                       "clientInfo":{"name":"t","version":"0"}}),
+            )
+            .await;
+        assert_eq!(v["result"]["capabilities"]["tools"]["listChanged"], true);
+        assert_eq!(tool_names(&mut c).await, ["sync_folder", "git_clone_url"]);
+        assert!(!saw_list_changed(&mut c).await);
+        c.notes.clear();
+        tokio::time::sleep(Duration::from_secs(5) + Duration::from_millis(100)).await;
+        assert!(tool_names(&mut c).await.contains(&"find_tools".to_string()));
+        assert!(saw_list_changed(&mut c).await, "{:?}", c.notes);
+    }
+
+    #[tokio::test]
+    async fn a_failed_connect_is_remembered_for_a_moment() {
+        let (s, mut c) = start_live().await;
+        mount_config(&s, "gateway").await;
+        Mock::given(method("POST"))
+            .and(path(api_path("/mcp/token")))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&s)
+            .await;
+        for _ in 0..3 {
+            let (err, text) = c.call("list_sandboxes", json!({})).await;
+            assert!(err);
+            assert!(text.contains("try again"), "{text}");
+        }
+        let tokens = s
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() == api_path("/mcp/token"))
+            .count();
+        assert_eq!(tokens, 1);
     }
 }
