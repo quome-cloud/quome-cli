@@ -1,7 +1,10 @@
 //! Playbooks: task recipes the Quome Cloud API renders for an agent.
 //! Types for the list and render routes, and the tool names this binary serves.
+use super::api::{CloudApi, FrontDoor};
 use super::clients::{ClientId, SkillFile};
+use super::gateway::{front_door_override, GatewayClient};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
 pub struct PlaybookArg {
@@ -100,6 +103,52 @@ pub const TOOL_NAMES: &[&str] = &[
     "database_commit",
     "playbook",
 ];
+
+/// The tools `quome mcp` serves itself when the org's MCP gateway serves the
+/// rest.
+pub const GATEWAY_LOCAL_TOOLS: &[&str] = &["sync_folder", "git_clone_url", "deploy_app"];
+
+/// The old app-tool names, kept as aliases of the gateway's find, describe
+/// and call tools.
+pub const GATEWAY_ALIASES: &[&str] = &["find_app_tools", "describe_app_tool", "call_app_tool"];
+
+/// The names of the tools this agent may call, which decide the playbooks it is
+/// offered. When the org's MCP gateway is the front door and the agent's
+/// connection may use it, they are the gateway's tools, then the CLI's own,
+/// then the old app-tool names. Otherwise (and when the gateway cannot be
+/// asked) they are the fixed list of tools the CLI serves directly.
+pub async fn callable_tools(api: &Arc<CloudApi>) -> Vec<String> {
+    let fixed = || TOOL_NAMES.iter().map(|n| n.to_string()).collect();
+    let door = match front_door_override() {
+        Some(d) => d,
+        None => api.mcp_config().await.unwrap_or(FrontDoor::Direct),
+    };
+    if door != FrontDoor::Gateway {
+        return fixed();
+    }
+    let own: Vec<&str> = GATEWAY_LOCAL_TOOLS
+        .iter()
+        .chain(GATEWAY_ALIASES)
+        .copied()
+        .collect();
+    let Ok(g) = GatewayClient::connect(api.clone(), &own).await else {
+        return fixed();
+    };
+    let Ok(listed) = g.list_tools().await else {
+        return fixed();
+    };
+    let mut names: Vec<String> = Vec::new();
+    for n in listed
+        .iter()
+        .map(|t| t.name.to_string())
+        .chain(own.iter().map(|n| n.to_string()))
+    {
+        if !names.contains(&n) {
+            names.push(n);
+        }
+    }
+    names
+}
 
 /// Lowercase kebab form of a playbook name, valid as a skill name and folder.
 fn skill_slug(name: &str) -> String {

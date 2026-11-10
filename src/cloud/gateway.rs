@@ -5,7 +5,7 @@
 //! The token lives only in memory and is scrubbed from every error. Whatever
 //! the gateway sends back is untrusted data: it is passed through unchanged,
 //! but everything read from it is size-bounded.
-use super::api::{CloudApi, McpToken};
+use super::api::{CloudApi, FrontDoor, McpToken};
 use super::auth::CONNECT_TIMEOUT;
 use super::auth_instance::PROTOCOL_VERSION;
 use crate::errors::QuomeError;
@@ -82,7 +82,13 @@ pub enum GatewayError {
     /// The gateway answered with an HTTP error.
     Http { status: u16, body: String },
     /// The gateway answered with a JSON-RPC error.
-    Rpc { code: i64, message: String },
+    Rpc {
+        code: i64,
+        message: String,
+        /// The gateway's name for the error (`data.code`), when it sent a
+        /// plain one.
+        reason: Option<String>,
+    },
     /// The gateway could not be reached or the answer broke off.
     Transport(String),
     /// The gateway sent something that is not MCP, or too much of it.
@@ -114,7 +120,7 @@ impl std::fmt::Display for GatewayError {
             GatewayError::Http { status, body } => {
                 write!(f, "The org's MCP gateway answered {status}: {body}")
             }
-            GatewayError::Rpc { code, message } => {
+            GatewayError::Rpc { code, message, .. } => {
                 write!(
                     f,
                     "The org's MCP gateway reported an error ({code}): {message}"
@@ -136,11 +142,18 @@ impl std::error::Error for GatewayError {}
 #[derive(Default)]
 pub(crate) struct Options {
     clock: Option<Clock>,
+    listen_idle: Option<Duration>,
 }
 
 impl Options {
     pub(crate) fn clock(mut self, clock: Clock) -> Self {
         self.clock = Some(clock);
+        self
+    }
+
+    /// How long the notification stream may stay silent before it is reopened.
+    pub(crate) fn listen_idle(mut self, idle: Duration) -> Self {
+        self.listen_idle = Some(idle);
         self
     }
 }
@@ -163,6 +176,10 @@ struct Inner {
     next_id: AtomicU64,
     notes: broadcast::Sender<Value>,
     clock: Clock,
+    /// The tools the CLI serves itself, declared again with every new session.
+    local_tools: Vec<String>,
+    /// Held while a session is opened, so concurrent callers open one.
+    opening: Mutex<()>,
 }
 
 pub struct GatewayClient {
@@ -175,6 +192,20 @@ impl Drop for GatewayClient {
         if let Some(h) = self.stream.take() {
             h.abort();
         }
+    }
+}
+
+/// The front door named by `QUOME_MCP_FRONT_DOOR` (`direct` or `gateway`),
+/// which wins over what the platform says. Anything else is ignored.
+pub fn front_door_override() -> Option<FrontDoor> {
+    parse_front_door(std::env::var("QUOME_MCP_FRONT_DOOR").ok().as_deref()?)
+}
+
+fn parse_front_door(v: &str) -> Option<FrontDoor> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "direct" => Some(FrontDoor::Direct),
+        "gateway" => Some(FrontDoor::Gateway),
+        _ => None,
     }
 }
 
@@ -213,7 +244,7 @@ async fn fetch_token(
 
 /// Make token requests with `attempt` until one succeeds, waiting through
 /// `mcp_starting`. Each wait is at least 1 s, and the time attempts take
-/// counts against `budget`.
+/// counts against `budget`, which is never passed.
 async fn wait_for_token<F, Fut>(
     mut attempt: F,
     budget: Duration,
@@ -227,7 +258,10 @@ where
     let mut announced = false;
     loop {
         let remaining = budget.saturating_sub(start.elapsed());
-        let result = match tokio::time::timeout(remaining.max(MIN_RETRY), attempt()).await {
+        if remaining.is_zero() {
+            return Err(GatewayError::StillStarting);
+        }
+        let result = match tokio::time::timeout(remaining, attempt()).await {
             Ok(r) => r,
             Err(_) => return Err(GatewayError::StillStarting),
         };
@@ -351,13 +385,14 @@ impl GatewayClient {
         let token = fetch_token(&api, progress.as_ref()).await?;
         let url = check_gateway_url(&token.url, &api, &token.access_token)?;
         // Never follow a redirect: the token must only go to the address it came with.
+        let listen_idle = opts.listen_idle.unwrap_or(LISTEN_IDLE);
         let build = |idle: bool| {
             let mut b = reqwest::Client::builder()
                 .https_only(!crate::url_policy::is_loopback_http(&url))
                 .redirect(reqwest::redirect::Policy::none())
                 .connect_timeout(CONNECT_TIMEOUT);
             if idle {
-                b = b.read_timeout(LISTEN_IDLE);
+                b = b.read_timeout(listen_idle);
             }
             b.build()
                 .map_err(|e| GatewayError::Transport(e.without_url().to_string()))
@@ -376,21 +411,10 @@ impl GatewayClient {
             next_id: AtomicU64::new(0),
             notes,
             clock,
+            local_tools: local_tools.iter().map(|t| t.to_string()).collect(),
+            opening: Mutex::new(()),
         });
-        inner
-            .request(
-                "initialize",
-                json!({
-                    "protocolVersion": PROTOCOL_VERSION,
-                    "capabilities": {},
-                    "clientInfo": {"name": "quome-cli", "version": env!("CARGO_PKG_VERSION")},
-                    "_meta": {LOCAL_TOOLS_META: local_tools},
-                }),
-                None,
-                REQUEST_TIMEOUT,
-            )
-            .await?;
-        inner.notify("notifications/initialized").await?;
+        inner.open_session().await?;
         let stream = tokio::spawn(inner.clone().listen());
         Ok(GatewayClient {
             inner,
@@ -520,14 +544,12 @@ impl Inner {
         b: reqwest::RequestBuilder,
         token: &str,
         session: Option<&str>,
+        accept: &str,
     ) -> reqwest::RequestBuilder {
         let b = b
             .bearer_auth(token)
             .header("MCP-Protocol-Version", PROTOCOL_VERSION)
-            .header(
-                reqwest::header::ACCEPT,
-                "application/json, text/event-stream",
-            );
+            .header(reqwest::header::ACCEPT, accept);
         match session {
             Some(sid) => b.header("Mcp-Session-Id", sid),
             None => b,
@@ -542,9 +564,60 @@ impl Inner {
             .map(|_| ())
     }
 
-    /// One JSON-RPC request; returns the `result`. `progress` is a sink and
-    /// the progress token its reports carry.
+    /// Open a session: `initialize`, then the `initialized` notification.
+    async fn open_session(&self) -> Result<(), GatewayError> {
+        self.request_once(
+            "initialize",
+            json!({
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "quome-cli", "version": env!("CARGO_PKG_VERSION")},
+                "_meta": {LOCAL_TOOLS_META: self.local_tools},
+            }),
+            None,
+            REQUEST_TIMEOUT,
+        )
+        .await?;
+        self.notify("notifications/initialized").await
+    }
+
+    /// Replace the session `lost`, unless another caller already did.
+    async fn reopen_session(&self, lost: Option<String>) -> Result<(), GatewayError> {
+        let _opening = self.opening.lock().await;
+        if self.session() != lost {
+            return Ok(());
+        }
+        if let Ok(mut s) = self.session.lock() {
+            *s = None;
+        }
+        self.open_session().await
+    }
+
+    /// One JSON-RPC request; returns the `result`. A gateway that lost the
+    /// session (it may have scaled to zero) gets a new one, once, and the
+    /// request is sent again. `progress` is a sink and the progress token its
+    /// reports carry.
     async fn request(
+        &self,
+        method: &str,
+        params: Value,
+        progress: Option<(&ProgressSink, &str)>,
+        timeout: Duration,
+    ) -> Result<Value, GatewayError> {
+        let session = self.session();
+        match self
+            .request_once(method, params.clone(), progress, timeout)
+            .await
+        {
+            Err(GatewayError::SessionLost) => {
+                self.reopen_session(session).await?;
+                self.request_once(method, params, progress, timeout).await
+            }
+            other => other,
+        }
+    }
+
+    async fn request_once(
         &self,
         method: &str,
         params: Value,
@@ -597,7 +670,12 @@ impl Inner {
             let (token, generation) = self.token().await?;
             let session = self.session();
             let resp = self
-                .headers(self.http.post(&self.url), &token, session.as_deref())
+                .headers(
+                    self.http.post(&self.url),
+                    &token,
+                    session.as_deref(),
+                    "application/json, text/event-stream",
+                )
                 .timeout(timeout)
                 .json(body)
                 .send()
@@ -717,12 +795,15 @@ impl Inner {
 
     /// Follow the gateway's notification stream. It is reopened after every
     /// close or error, with a growing delay that resets only once an event
-    /// was received. It ends for good when the gateway has no stream or the
-    /// session is gone (404, 405), when a 401 survives a refresh, or when the
-    /// client is dropped.
+    /// was received. A stream that goes quiet past the idle limit is reopened
+    /// at once and does not count as a failure. A lost session is opened again
+    /// once. It ends for good when the gateway has no stream (404 without a
+    /// session, 405), when a 401 survives a refresh, or when the client is
+    /// dropped.
     async fn listen(self: Arc<Self>) {
         let mut failures = 0u32;
         let mut refreshed = false;
+        let mut reopened = false;
         loop {
             let Ok((token, generation)) = self.token().await else {
                 failures += 1;
@@ -731,10 +812,15 @@ impl Inner {
             };
             let session = self.session();
             let resp = self
-                .headers(self.stream_http.get(&self.url), &token, session.as_deref())
-                .header(reqwest::header::ACCEPT, "text/event-stream")
+                .headers(
+                    self.stream_http.get(&self.url),
+                    &token,
+                    session.as_deref(),
+                    "text/event-stream",
+                )
                 .send()
                 .await;
+            let mut idle = false;
             match resp {
                 Ok(r) if r.status().as_u16() == 401 => {
                     if refreshed {
@@ -744,34 +830,71 @@ impl Inner {
                     self.invalidate(generation).await;
                     continue;
                 }
-                Ok(r) if matches!(r.status().as_u16(), 404 | 405) => return,
-                Ok(r) if r.status().is_success() => {
+                Ok(r) => {
+                    // Only two 401s in a row, with nothing between, end the listener.
                     refreshed = false;
-                    let mut events = SseEvents::default();
-                    let mut chunks = r.bytes_stream();
-                    let mut got_event = false;
-                    'read: while let Some(Ok(chunk)) = chunks.next().await {
-                        let Ok(datas) = events.push(&chunk) else {
-                            break 'read;
-                        };
-                        for data in datas {
-                            if let Ok(v) = serde_json::from_str::<Value>(&data) {
-                                got_event = true;
-                                let _ = self.notes.send(v);
+                    let status = r.status().as_u16();
+                    if status == 404 && session.is_some() {
+                        if reopened {
+                            return;
+                        }
+                        reopened = true;
+                        if self.reopen_session(session).await.is_err() {
+                            failures += 1;
+                            tokio::time::sleep(backoff(failures, jitter())).await;
+                        }
+                        continue;
+                    }
+                    if matches!(status, 404 | 405) {
+                        return;
+                    }
+                    if r.status().is_success() {
+                        reopened = false;
+                        let mut events = SseEvents::default();
+                        let mut chunks = r.bytes_stream();
+                        let mut got_event = false;
+                        'read: while let Some(chunk) = chunks.next().await {
+                            let chunk = match chunk {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    idle = is_idle(&e);
+                                    break 'read;
+                                }
+                            };
+                            let Ok(datas) = events.push(&chunk) else {
+                                break 'read;
+                            };
+                            for data in datas {
+                                if let Ok(v) = serde_json::from_str::<Value>(&data) {
+                                    got_event = true;
+                                    let _ = self.notes.send(v);
+                                }
                             }
                         }
-                    }
-                    if got_event {
-                        failures = 0;
+                        if got_event {
+                            failures = 0;
+                        } else if !idle {
+                            failures += 1;
+                        }
                     } else {
                         failures += 1;
                     }
                 }
-                Ok(_) | Err(_) => failures += 1,
+                Err(e) if is_idle(&e) => idle = true,
+                Err(_) => failures += 1,
+            }
+            if idle {
+                continue;
             }
             tokio::time::sleep(backoff(failures, jitter())).await;
         }
     }
+}
+
+/// True when the stream went quiet for longer than the idle limit (not a
+/// connection that could not be made).
+fn is_idle(e: &reqwest::Error) -> bool {
+    e.is_timeout() && !e.is_connect()
 }
 
 fn jitter() -> u8 {
@@ -784,6 +907,15 @@ fn answer_result(v: Value, token: &str) -> Result<Value, GatewayError> {
         return Err(GatewayError::Rpc {
             code: err["code"].as_i64().unwrap_or(0),
             message: snippet(err["message"].as_str().unwrap_or("unknown error"), token),
+            reason: err["data"]["code"]
+                .as_str()
+                .filter(|r| {
+                    !r.is_empty()
+                        && r.len() <= 64
+                        && r.chars()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                })
+                .map(str::to_string),
         });
     }
     v.get("result")
@@ -1390,7 +1522,8 @@ mod tests {
         )
         .await;
         assert!(matches!(r, Err(GatewayError::StillStarting)));
-        assert_eq!(calls.get(), 13);
+        // attempts at 0, 5, ... 55 s; none starts once the budget is spent
+        assert_eq!(calls.get(), 12);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1605,5 +1738,268 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         assert!(h.is_finished());
+    }
+
+    /// A mock whose first answer to `method_name` is a 404 (a gateway that
+    /// scaled to zero and lost its sessions), and whose handshake hands out
+    /// a new session id each time.
+    async fn mount_handshake_counting(s: &MockServer) {
+        let n = Arc::new(AtomicU64::new(0));
+        Mock::given(method("POST"))
+            .and(path("/gw"))
+            .and(body_partial_json(json!({"method": "initialize"})))
+            .respond_with(move |req: &Request| {
+                let id = serde_json::from_slice::<Value>(&req.body).unwrap()["id"].clone();
+                let k = n.fetch_add(1, Ordering::SeqCst) + 1;
+                ResponseTemplate::new(200)
+                    .insert_header("mcp-session-id", format!("sess-{k}").as_str())
+                    .set_body_json(json!({"jsonrpc": "2.0", "id": id, "result": {
+                        "protocolVersion": "2025-06-18", "capabilities": {},
+                        "serverInfo": {"name": "gw", "version": "1"}}}))
+            })
+            .mount(s)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/gw"))
+            .and(body_partial_json(
+                json!({"method": "notifications/initialized"}),
+            ))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(s)
+            .await;
+    }
+
+    async fn count_method(s: &MockServer, m: &str) -> usize {
+        requests_to(s, "/gw")
+            .await
+            .iter()
+            .filter(|r| body(r)["method"] == m)
+            .count()
+    }
+
+    #[tokio::test]
+    async fn a_lost_session_is_opened_again_and_the_request_retried() {
+        let (s, api) = setup().await;
+        mount_token(&s, "GWTOK", 3600, None).await;
+        mount_handshake_counting(&s).await;
+        Mock::given(method("POST"))
+            .and(path("/gw"))
+            .and(body_partial_json(json!({"method": "tools/list"})))
+            .and(header("mcp-session-id", "sess-1"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&s)
+            .await;
+        mount_rpc(&s, "tools/list", tools_result()).await;
+        let c = GatewayClient::connect_with(
+            api,
+            &["exec"],
+            None,
+            Options::default().listen_idle(Duration::from_secs(30)),
+        )
+        .await
+        .unwrap();
+        let tools = c.list_tools().await.unwrap();
+        assert_eq!(tools[0].name, "x");
+        assert_eq!(count_method(&s, "initialize").await, 2);
+        let last = requests_to(&s, "/gw").await.into_iter().last().unwrap();
+        assert_eq!(last.headers.get("mcp-session-id").unwrap(), "sess-2");
+        // the new session declares the same local tools
+        let inits: Vec<_> = requests_to(&s, "/gw")
+            .await
+            .iter()
+            .map(body)
+            .filter(|b| b["method"] == "initialize")
+            .collect();
+        assert_eq!(
+            inits[1]["params"]["_meta"]["cloud.quome/local_tools"],
+            json!(["exec"])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lost_session_is_opened_again_only_once_per_request() {
+        let (s, api) = setup().await;
+        mount_token(&s, "GWTOK", 3600, None).await;
+        mount_handshake_counting(&s).await;
+        Mock::given(method("POST"))
+            .and(path("/gw"))
+            .and(body_partial_json(json!({"method": "tools/list"})))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&s)
+            .await;
+        let c = GatewayClient::connect(api, &[]).await.unwrap();
+        let e = c.list_tools().await.err().unwrap();
+        assert!(matches!(e, GatewayError::SessionLost), "{e}");
+        assert_eq!(count_method(&s, "initialize").await, 2);
+        assert_eq!(count_method(&s, "tools/list").await, 2);
+    }
+
+    #[tokio::test]
+    async fn the_listener_survives_401_then_500_then_401() {
+        let (s, api) = setup().await;
+        mount_token(&s, "GWTOK", 3600, None).await;
+        mount_handshake(&s).await;
+        for (status, n) in [(401, 1), (500, 1), (401, 1)] {
+            Mock::given(method("GET"))
+                .and(path("/gw"))
+                .respond_with(ResponseTemplate::new(status))
+                .up_to_n_times(n)
+                .with_priority(1)
+                .mount(&s)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/gw"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\n",
+                "text/event-stream",
+            ))
+            .with_priority(5)
+            .mount(&s)
+            .await;
+        let c = GatewayClient::connect(api, &[]).await.unwrap();
+        let mut rx = c.notifications();
+        let v = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("the listener gave up")
+            .unwrap();
+        assert_eq!(v["method"], "notifications/tools/list_changed");
+    }
+
+    #[tokio::test]
+    async fn a_quiet_stream_timing_out_is_not_a_failure() {
+        let (s, api) = setup().await;
+        mount_token(&s, "GWTOK", 3600, None).await;
+        mount_handshake(&s).await;
+        // The first stream says nothing for longer than the idle limit.
+        Mock::given(method("GET"))
+            .and(path("/gw"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(400))
+                    .set_body_raw("", "text/event-stream"),
+            )
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&s)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/gw"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\n",
+                "text/event-stream",
+            ))
+            .with_priority(5)
+            .mount(&s)
+            .await;
+        let t0 = Instant::now();
+        let c = GatewayClient::connect_with(
+            api,
+            &[],
+            None,
+            Options::default().listen_idle(Duration::from_millis(100)),
+        )
+        .await
+        .unwrap();
+        let mut rx = c.notifications();
+        tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        // a failure would have waited at least a second before reopening
+        assert!(
+            t0.elapsed() < Duration::from_millis(900),
+            "{:?}",
+            t0.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_notification_stream_sends_one_accept_header() {
+        let (s, api) = setup().await;
+        mount_token(&s, "GWTOK", 3600, None).await;
+        mount_handshake(&s).await;
+        Mock::given(method("GET"))
+            .and(path("/gw"))
+            .respond_with(ResponseTemplate::new(405))
+            .mount(&s)
+            .await;
+        let c = GatewayClient::connect(api, &[]).await.unwrap();
+        let h = c.stream.as_ref().unwrap();
+        for _ in 0..50 {
+            if h.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let gets: Vec<_> = requests_to(&s, "/gw")
+            .await
+            .into_iter()
+            .filter(|r| r.method.as_str() == "GET")
+            .collect();
+        assert!(!gets.is_empty());
+        let accepts: Vec<_> = gets[0].headers.get_all("accept").iter().collect();
+        assert_eq!(accepts.len(), 1, "{accepts:?}");
+        assert_eq!(accepts[0], "text/event-stream");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_start_wait_never_passes_the_budget() {
+        let t0 = tokio::time::Instant::now();
+        let calls = Arc::new(AtomicU64::new(0));
+        let c2 = calls.clone();
+        let r = wait_for_token(
+            move || {
+                let n = c2.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if n == 0 {
+                        tokio::time::sleep(Duration::from_millis(58_500)).await;
+                        Err(starting(Some(1)))
+                    } else {
+                        std::future::pending().await
+                    }
+                }
+            },
+            START_BUDGET,
+            None,
+        )
+        .await;
+        assert!(matches!(r, Err(GatewayError::StillStarting)));
+        assert!(t0.elapsed() <= START_BUDGET, "{:?}", t0.elapsed());
+    }
+
+    #[tokio::test]
+    async fn an_rpc_error_keeps_its_code_name() {
+        let (s, api) = setup().await;
+        mount_token(&s, "GWTOK", 3600, None).await;
+        mount_handshake(&s).await;
+        Mock::given(method("POST"))
+            .and(path("/gw"))
+            .and(body_partial_json(json!({"method": "prompts/get"})))
+            .respond_with(|req: &Request| {
+                let id = serde_json::from_slice::<Value>(&req.body).unwrap()["id"].clone();
+                ResponseTemplate::new(200).set_body_json(json!({"jsonrpc": "2.0", "id": id,
+                    "error": {"code": -32602, "message": "no such prompt",
+                              "data": {"code": "prompt_unknown"}}}))
+            })
+            .mount(&s)
+            .await;
+        let c = GatewayClient::connect(api, &[]).await.unwrap();
+        let e = c.get_prompt("x", BTreeMap::new()).await.err().unwrap();
+        match e {
+            GatewayError::Rpc { code, reason, .. } => {
+                assert_eq!(code, -32602);
+                assert_eq!(reason.as_deref(), Some("prompt_unknown"));
+            }
+            other => panic!("{other}"),
+        }
+    }
+
+    #[test]
+    fn the_front_door_override_names_one_of_two() {
+        assert_eq!(parse_front_door("gateway"), Some(FrontDoor::Gateway));
+        assert_eq!(parse_front_door(" Direct "), Some(FrontDoor::Direct));
+        assert_eq!(parse_front_door("relay"), None);
+        assert_eq!(parse_front_door(""), None);
     }
 }

@@ -4,12 +4,13 @@ use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::cloud::api::CloudApi;
 use crate::cloud::auth::TokenSource;
 use crate::cloud::clients::{adapters, paths, render_skills, skill_targets, ClientId};
 use crate::cloud::keys::{platform_store, AgentKey};
-use crate::cloud::playbooks::{Playbook, TOOL_NAMES};
+use crate::cloud::playbooks::{callable_tools, Playbook};
 use crate::cloud::state::CloudState;
 use crate::errors::{QuomeError, Result};
 
@@ -262,7 +263,7 @@ pub fn installed_of(
 
 /// Sync skills into the installed ones of `clients`.
 pub async fn sync_skills(
-    api: &CloudApi,
+    api: &Arc<CloudApi>,
     home: &Path,
     clients: &[ClientId],
     opts: SyncOpts<'_>,
@@ -271,7 +272,7 @@ pub async fn sync_skills(
 }
 
 pub async fn sync_skills_with(
-    api: &CloudApi,
+    api: &Arc<CloudApi>,
     home: &Path,
     clients: &[ClientId],
     on_path: &(dyn Fn(&str) -> bool + Sync),
@@ -289,7 +290,9 @@ pub async fn sync_skills_with(
     if targets.is_empty() {
         return Ok(report);
     }
-    let pbs = api.agent_playbooks(TOOL_NAMES).await?;
+    let tools = callable_tools(api).await;
+    let tools: Vec<&str> = tools.iter().map(String::as_str).collect();
+    let pbs = api.agent_playbooks(&tools).await?;
     let hash = catalog_hash(&pbs);
     if opts.refresh_only {
         // Same catalog as last time and every skill still in place: nothing to do.
@@ -336,14 +339,14 @@ pub async fn sync_skills_with(
 /// transport) and drops every failure. It only updates roots that `quome
 /// connect` or `quome skills sync` already set up for this profile; it never
 /// creates one.
-pub async fn background_sync(api: &CloudApi, home: &Path, profile: &str) {
+pub async fn background_sync(api: &Arc<CloudApi>, home: &Path, profile: &str) {
     let _ = sync_skills(api, home, &ClientId::ALL, SyncOpts::refresh(profile)).await;
 }
 
 /// Fire-and-forget `background_sync` over a connection the caller shares, so it
 /// never delays the handshake or opens a second token source.
 pub fn spawn_background_sync(
-    api: std::sync::Arc<CloudApi>,
+    api: Arc<CloudApi>,
     home: PathBuf,
     profile: String,
 ) -> tokio::task::JoinHandle<()> {
@@ -384,7 +387,7 @@ pub async fn execute(cmd: SkillsCommands) -> Result<()> {
     };
     let name = profile.unwrap_or(state.default);
     let (key, vrc) = AgentKey::load_from(store.as_ref(), &name)?;
-    let api = CloudApi::new(&p, TokenSource::new(&p, key, vrc));
+    let api = Arc::new(CloudApi::new(&p, TokenSource::new(&p, key, vrc)));
     let home = dirs::home_dir()
         .ok_or_else(|| QuomeError::CloudState("cannot find home directory".into()))?;
     let clients = if client.is_empty() {
@@ -404,12 +407,13 @@ pub async fn execute(cmd: SkillsCommands) -> Result<()> {
 mod tests {
     use super::*;
     use crate::cloud::auth::tests::profile;
+    use crate::cloud::playbooks::TOOL_NAMES;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const ORG: &str = "11111111-1111-1111-1111-111111111111";
 
-    async fn setup() -> (MockServer, CloudApi) {
+    async fn setup() -> (MockServer, Arc<CloudApi>) {
         let s = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/.well-known/openid-configuration"))
@@ -427,7 +431,7 @@ mod tests {
             .await;
         let p = profile(&s.uri());
         let api = CloudApi::new(&p, TokenSource::new(&p, AgentKey::generate(), "vrc".into()));
-        (s, api)
+        (s, Arc::new(api))
     }
 
     fn pb(name: &str) -> serde_json::Value {
@@ -735,7 +739,7 @@ mod tests {
         let before = std::fs::read(a.join(MANIFEST)).unwrap();
         // Resolves to () with no panic and no error surface; the function body
         // has no print of any kind (stdout is the MCP transport).
-        spawn_background_sync(std::sync::Arc::new(api), h.path().to_path_buf(), "p".into())
+        spawn_background_sync(api, h.path().to_path_buf(), "p".into())
             .await
             .unwrap();
         assert_eq!(std::fs::read(a.join(MANIFEST)).unwrap(), before);
@@ -1062,5 +1066,132 @@ mod tests {
         assert!(r.failures.is_empty());
         assert_eq!(r.clients[0].removed, 0);
         assert_eq!(read_manifest(&a).unwrap().names, ["quome-ship"]);
+    }
+
+    // --- the tools a playbook may need, when the org's MCP gateway serves them ---
+
+    const MCP: &str = "/api/v1/orgs/11111111-1111-1111-1111-111111111111/mcp";
+
+    async fn mount_playbooks(s: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v1/orgs/{ORG}/agent-playbooks")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vec![pb("ship")]))
+            .mount(s)
+            .await;
+    }
+
+    async fn mount_front_door(s: &MockServer, door: &str) {
+        Mock::given(method("GET"))
+            .and(path(format!("{MCP}/config")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"front_door": door})),
+            )
+            .mount(s)
+            .await;
+    }
+
+    async fn mount_gateway(s: &MockServer) {
+        Mock::given(method("POST"))
+            .and(path(format!("{MCP}/token")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "GWTOK", "expires_in": 3600, "url": format!("{}/gw", s.uri())
+            })))
+            .mount(s)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/gw"))
+            .respond_with(ResponseTemplate::new(405))
+            .mount(s)
+            .await;
+        let rpc = |req: &wiremock::Request| {
+            let b: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+            let id = b["id"].clone();
+            match b["method"].as_str().unwrap() {
+                "initialize" => ResponseTemplate::new(200)
+                    .insert_header("mcp-session-id", "sess")
+                    .set_body_json(serde_json::json!({"jsonrpc":"2.0","id":id,"result":{
+                        "protocolVersion":"2025-06-18","capabilities":{},
+                        "serverInfo":{"name":"gw","version":"1"}}})),
+                "tools/list" => ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"tools":[
+                        {"name":"find_tools","inputSchema":{"type":"object"}},
+                        {"name":"list_sandboxes","inputSchema":{"type":"object"}},
+                        {"name":"deploy_app","inputSchema":{"type":"object"}}]}}),
+                ),
+                _ => ResponseTemplate::new(202),
+            }
+        };
+        Mock::given(method("POST"))
+            .and(path("/gw"))
+            .respond_with(rpc)
+            .mount(s)
+            .await;
+    }
+
+    /// The `tools` query of the playbook list request.
+    async fn asked_tools(s: &MockServer) -> String {
+        let reqs = s.received_requests().await.unwrap();
+        let r = reqs
+            .iter()
+            .find(|r| r.url.path().ends_with("/agent-playbooks"))
+            .expect("playbooks were not asked for");
+        r.url
+            .query_pairs()
+            .find(|(k, _)| k == "tools")
+            .map(|(_, v)| v.into_owned())
+            .unwrap()
+    }
+
+    async fn run_sync(api: &Arc<CloudApi>) {
+        let h = home_with(&[".codex"]);
+        sync_skills_with(
+            api,
+            h.path(),
+            &ClientId::ALL,
+            &none,
+            SyncOpts::explicit("p"),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn skills_sync_tools_param_is_gateway_callable_set() {
+        let (s, api) = setup().await;
+        mount_front_door(&s, "gateway").await;
+        mount_gateway(&s).await;
+        mount_playbooks(&s).await;
+        run_sync(&api).await;
+        // what the gateway lists, then the CLI's own, then the old app-tool names
+        assert_eq!(
+            asked_tools(&s).await,
+            "find_tools,list_sandboxes,deploy_app,sync_folder,git_clone_url,find_app_tools,describe_app_tool,call_app_tool"
+        );
+    }
+
+    #[tokio::test]
+    async fn skills_sync_uses_the_fixed_list_when_direct() {
+        let (s, api) = setup().await;
+        mount_front_door(&s, "direct").await;
+        mount_playbooks(&s).await;
+        run_sync(&api).await;
+        assert_eq!(asked_tools(&s).await, TOOL_NAMES.join(","));
+    }
+
+    #[tokio::test]
+    async fn skills_sync_uses_the_fixed_list_without_mcp_call() {
+        let (s, api) = setup().await;
+        mount_front_door(&s, "gateway").await;
+        Mock::given(method("POST"))
+            .and(path(format!("{MCP}/token")))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .set_body_json(serde_json::json!({"reason": "capability_missing"})),
+            )
+            .mount(&s)
+            .await;
+        mount_playbooks(&s).await;
+        run_sync(&api).await;
+        assert_eq!(asked_tools(&s).await, TOOL_NAMES.join(","));
     }
 }

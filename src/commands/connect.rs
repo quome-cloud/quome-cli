@@ -457,7 +457,8 @@ pub async fn run(opts: Options, deps: &Deps<'_>) -> Result<Outcome> {
         // `api` above was built before the org was known; make one that has it.
         let synced = match AgentKey::load_from(deps.store, &profile_name) {
             Ok((k, v)) => {
-                let api = CloudApi::new(&profile, TokenSource::new(&profile, k, v));
+                let api =
+                    std::sync::Arc::new(CloudApi::new(&profile, TokenSource::new(&profile, k, v)));
                 crate::commands::skills::sync_skills_with(
                     &api,
                     &deps.home,
@@ -1329,7 +1330,7 @@ mod tests {
         };
         let (k, v) = AgentKey::load_from(&store, "work").unwrap();
         let p = st.profile(Some("work")).unwrap().clone();
-        let api = CloudApi::new(&p, TokenSource::new(&p, k, v));
+        let api = std::sync::Arc::new(CloudApi::new(&p, TokenSource::new(&p, k, v)));
         let none = |_: &str| false;
         // An unchanged catalog is skipped; remove a skill so the refresh acts.
         std::fs::remove_dir_all(home.join(".agents/skills/quome-ship")).unwrap();
