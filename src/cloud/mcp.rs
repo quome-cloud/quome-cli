@@ -26,10 +26,10 @@ use base64::Engine;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters},
     model::{
-        CallToolRequestParams, CallToolResult, ContentBlock, ErrorData, GetPromptRequestParams,
-        GetPromptResult, Implementation, ListPromptsResult, ListToolsResult,
-        PaginatedRequestParams, ProgressNotificationParam, Prompt, PromptArgument, PromptMessage,
-        Role, ServerCapabilities, ServerInfo, Tool,
+        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
+        GetPromptRequestParams, GetPromptResponse, GetPromptResult, Implementation,
+        ListPromptsResult, ListToolsResult, PaginatedRequestParams, ProgressNotificationParam,
+        Prompt, PromptArgument, PromptMessage, Role, ServerCapabilities, ServerConfig, Tool,
     },
     service::{Peer, RequestContext},
     tool, tool_handler, tool_router, RoleServer, ServiceExt,
@@ -844,6 +844,18 @@ fn gateway_body(r: &rmcp::model::CallToolResult) -> Option<serde_json::Value> {
 const RECONNECT_FOR_GATEWAY: &str = "This agent is not yet allowed to use the org's MCP gateway, so these tools were served directly. Ask the person to run `quome connect` again to allow it.";
 
 /// A tool result that is an error, with `text`.
+/// The result of one of the CLI's own tools. They always complete; none asks the client for
+/// input or starts a task.
+fn completed(response: CallToolResponse) -> Result<CallToolResult, ErrorData> {
+    match response {
+        CallToolResponse::Complete(result) => Ok(result),
+        _ => Err(ErrorData::internal_error(
+            "tool did not complete".to_string(),
+            None,
+        )),
+    }
+}
+
 fn error_result(text: impl Into<String>) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(text)])
 }
@@ -2297,11 +2309,11 @@ impl QuomeMcp {
         let name = request.name.to_string();
         let args = request.arguments.clone().unwrap_or_default();
         match name.as_str() {
-            "sync_folder" | "git_clone_url" => {
-                self.tool_router
-                    .call(ToolCallContext::new(self, request, ctx))
-                    .await
-            }
+            "sync_folder" | "git_clone_url" => self
+                .tool_router
+                .call(ToolCallContext::new(self, request, ctx))
+                .await
+                .and_then(completed),
             "deploy_app" => self.gateway_deploy(g, args, ctx).await,
             "find_app_tools" => Ok(self
                 .gateway_find_apps(g, parse(&args)?)
@@ -4788,8 +4800,8 @@ const INSTRUCTIONS: &str = "Quome Cloud tools: sandboxes, previews, app deploys,
 
 #[tool_handler]
 impl rmcp::ServerHandler for QuomeMcp {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_tool_list_changed()
@@ -4811,18 +4823,14 @@ impl rmcp::ServerHandler for QuomeMcp {
             // Only what needs no gateway; direct tools would bypass the org's policy.
             Serving::Unavailable(_) => self.own_tools(),
         };
-        Ok(ListToolsResult {
-            tools,
-            meta: None,
-            next_cursor: None,
-        })
+        Ok(ListToolsResult::with_all_items(tools))
     }
 
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
         ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
+    ) -> Result<CallToolResponse, ErrorData> {
         // The CLI's own tools never wait for the front door or the gateway.
         let own = OWN_TOOLS.contains(&request.name.as_ref());
         let serving = if own {
@@ -4833,16 +4841,16 @@ impl rmcp::ServerHandler for QuomeMcp {
         let mut result = match serving {
             Serving::Gateway(g) => self.gateway_dispatch(&g, request, ctx).await?,
             Serving::Unavailable(m) => error_result(m),
-            Serving::Direct => {
+            Serving::Direct => completed(
                 self.tool_router
                     .call(ToolCallContext::new(self, request, ctx))
-                    .await?
-            }
+                    .await?,
+            )?,
         };
         if let Some(h) = self.take_reconnect_hint() {
             result.content.push(ContentBlock::text(h));
         }
-        Ok(result)
+        Ok(result.into())
     }
 
     async fn list_prompts(
@@ -4890,43 +4898,47 @@ impl rmcp::ServerHandler for QuomeMcp {
         &self,
         request: GetPromptRequestParams,
         ctx: RequestContext<RoleServer>,
-    ) -> Result<GetPromptResult, ErrorData> {
-        let serving = self.serving_gateway(&ctx.peer).await;
-        if let Serving::Unavailable(m) = &serving {
-            return Err(ErrorData::internal_error(m.clone(), None));
+    ) -> Result<GetPromptResponse, ErrorData> {
+        let result: Result<GetPromptResult, ErrorData> = async move {
+            let serving = self.serving_gateway(&ctx.peer).await;
+            if let Serving::Unavailable(m) = &serving {
+                return Err(ErrorData::internal_error(m.clone(), None));
+            }
+            let args: std::collections::BTreeMap<String, String> = request
+                .arguments
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(k, v)| {
+                    let v = match v {
+                        serde_json::Value::String(s) => s,
+                        other => other.to_string(),
+                    };
+                    (k, v)
+                })
+                .collect();
+            if let Serving::Gateway(g) = serving {
+                return g
+                    .get_prompt(&request.name, args)
+                    .await
+                    .map_err(prompt_error);
+            }
+            let text =
+                call_raw!(self, |api| api.render_playbook(&request.name, &args)).map_err(|e| {
+                    let caller = is_caller_error(&e);
+                    let m = fail(e);
+                    if caller {
+                        ErrorData::invalid_params(m, None)
+                    } else {
+                        ErrorData::internal_error(m, None)
+                    }
+                })?;
+            Ok(GetPromptResult::new(vec![PromptMessage::new_text(
+                Role::User,
+                text,
+            )]))
         }
-        let args: std::collections::BTreeMap<String, String> = request
-            .arguments
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(k, v)| {
-                let v = match v {
-                    serde_json::Value::String(s) => s,
-                    other => other.to_string(),
-                };
-                (k, v)
-            })
-            .collect();
-        if let Serving::Gateway(g) = serving {
-            return g
-                .get_prompt(&request.name, args)
-                .await
-                .map_err(prompt_error);
-        }
-        let text =
-            call_raw!(self, |api| api.render_playbook(&request.name, &args)).map_err(|e| {
-                let caller = is_caller_error(&e);
-                let m = fail(e);
-                if caller {
-                    ErrorData::invalid_params(m, None)
-                } else {
-                    ErrorData::internal_error(m, None)
-                }
-            })?;
-        Ok(GetPromptResult::new(vec![PromptMessage::new_text(
-            Role::User,
-            text,
-        )]))
+        .await;
+        result.map(Into::into)
     }
 }
 
