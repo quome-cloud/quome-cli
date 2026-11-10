@@ -299,11 +299,27 @@ fn default_front_door() -> Option<FrontDoor> {
     return Some(FrontDoor::Direct);
 }
 
+/// How tools are served for one request.
+enum Serving {
+    /// The CLI serves them.
+    Direct,
+    /// The org's MCP gateway serves them.
+    Gateway(Arc<GatewayClient>),
+    /// The org's front door is the gateway, which cannot be reached now.
+    Unavailable(String),
+}
+
 /// How often the front door is read again.
 const DOOR_REFRESH: Duration = Duration::from_secs(300);
 
 /// Most tools one search of the gateway returns.
 const FIND_LIMIT: u64 = 25;
+
+/// Tools the CLI serves itself in every mode, with no gateway.
+const OWN_TOOLS: &[&str] = &["sync_folder", "git_clone_url"];
+
+/// How many apps are searched at once.
+const FIND_PARALLEL: usize = 8;
 
 /// What this session knows about how the org's agents are served.
 #[derive(Default)]
@@ -316,8 +332,6 @@ struct Door {
     /// The reconnect advice is owed to the next result.
     hint_due: bool,
     hinted: bool,
-    /// The gateway client whose notices are being relayed to the agent.
-    relay_for: usize,
 }
 
 struct Conn {
@@ -370,7 +384,9 @@ pub struct QuomeMcp {
     gateway: Arc<tokio::sync::Mutex<Option<Arc<GatewayClient>>>>,
     /// Whether tools are served through the gateway, read at first need and
     /// again every `door_refresh`.
-    door: Arc<tokio::sync::Mutex<Door>>,
+    door: Arc<std::sync::Mutex<Door>>,
+    /// Held while the front door is read, so one read serves all callers.
+    door_gate: Arc<tokio::sync::Mutex<()>>,
     door_override: Option<FrontDoor>,
     door_refresh: Duration,
     tool_router: ToolRouter<Self>,
@@ -875,54 +891,6 @@ fn with_hints(mut r: CallToolResult) -> CallToolResult {
         r.content.push(ContentBlock::text(h));
     }
     r
-}
-
-/// The log message for an approval notice from the gateway: the notice's
-/// method ends in `approval` and it carries an id and a status.
-fn approval_notice(v: &serde_json::Value) -> Option<serde_json::Value> {
-    let method = v["method"].as_str()?;
-    let rest = method.strip_prefix("notifications/")?;
-    if rest.rsplit('/').next() != Some("approval") {
-        return None;
-    }
-    let id = plain_id(&v["params"]["approval_id"])?;
-    let status = v["params"]["status"].as_str().filter(|s| {
-        !s.is_empty() && s.len() <= 32 && s.chars().all(|c| c.is_ascii_lowercase() || c == '_')
-    })?;
-    Some(serde_json::json!({
-        "approval_id": id,
-        "status": status,
-        "hint": format!("Call get_result with approval_id {id} to see the outcome."),
-    }))
-}
-
-/// Pass the gateway's approval notices on to the agent as log messages.
-#[allow(deprecated)]
-fn relay_notices(
-    mut rx: tokio::sync::broadcast::Receiver<serde_json::Value>,
-    peer: Peer<RoleServer>,
-) {
-    tokio::spawn(async move {
-        loop {
-            match rx.recv().await {
-                Ok(v) => {
-                    if let Some(data) = approval_notice(&v) {
-                        let _ = peer
-                            .notify_logging_message(
-                                rmcp::model::LoggingMessageNotificationParam::new(
-                                    rmcp::model::LoggingLevel::Info,
-                                    data,
-                                )
-                                .with_logger("approval"),
-                            )
-                            .await;
-                    }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-            }
-        }
-    });
 }
 
 /// A sink that passes the gateway's progress reports on to the agent, when
@@ -1815,6 +1783,7 @@ impl QuomeMcp {
             app_hashes: Arc::default(),
             gateway: Arc::default(),
             door: Arc::default(),
+            door_gate: Arc::default(),
             door_override: default_front_door(),
             door_refresh: DOOR_REFRESH,
             tool_router: Self::tool_router(),
@@ -1870,58 +1839,72 @@ impl QuomeMcp {
         Ok(g)
     }
 
-    /// The gateway client when tools are served through it: the org's front
-    /// door is the gateway and the agent's connection may use it. `None` means
-    /// the tools are served directly. A connection without the capability
-    /// falls back to direct and owes the agent a reconnect hint, once.
-    async fn serving_gateway(
-        &self,
-        peer: &Peer<RoleServer>,
-    ) -> Result<Option<Arc<GatewayClient>>, String> {
-        let mut door = self.door.lock().await;
-        if door
-            .read_at
-            .is_none_or(|t| t.elapsed() >= self.door_refresh)
+    /// How tools are served now. The front door is read at first need and
+    /// every `door_refresh`; the gateway is connected outside any lock that
+    /// other calls wait on. A connection without `mcp_call` falls back to
+    /// direct and owes the agent a reconnect hint, once. Any other failure to
+    /// reach the gateway is `Unavailable`: it never falls back to direct.
+    async fn serving_gateway(&self) -> Serving {
         {
-            door.mode = match self.door_override {
-                Some(m) => Some(m),
-                None => match self.conn().api.mcp_config().await {
-                    Ok(m) => Some(m),
-                    Err(_) => door.mode.or(Some(FrontDoor::Direct)),
-                },
+            let _gate = self.door_gate.lock().await;
+            let (stale, prev) = {
+                let d = self.door.lock().unwrap_or_else(|e| e.into_inner());
+                (
+                    d.read_at.is_none_or(|t| t.elapsed() >= self.door_refresh),
+                    d.mode,
+                )
             };
-            door.read_at = Some(Instant::now());
-            door.no_call = false;
+            if stale {
+                let now = match self.door_override {
+                    Some(m) => m,
+                    None => match self.conn().api.mcp_config().await {
+                        Ok(m) => m,
+                        Err(_) => prev.unwrap_or(FrontDoor::Direct),
+                    },
+                };
+                {
+                    let mut d = self.door.lock().unwrap_or_else(|e| e.into_inner());
+                    d.mode = Some(now);
+                    d.read_at = Some(Instant::now());
+                    d.no_call = false;
+                }
+                if prev == Some(FrontDoor::Gateway) && now == FrontDoor::Direct {
+                    // Let go of the gateway session; a connect in progress keeps it.
+                    if let Ok(mut held) = self.gateway.try_lock() {
+                        *held = None;
+                    }
+                }
+            }
         }
-        if door.mode != Some(FrontDoor::Gateway) || door.no_call {
-            return Ok(None);
+        let (gateway, no_call) = {
+            let d = self.door.lock().unwrap_or_else(|e| e.into_inner());
+            (d.mode == Some(FrontDoor::Gateway), d.no_call)
+        };
+        if !gateway || no_call {
+            return Serving::Direct;
         }
         match self.gateway_connect().await {
-            Ok(g) => {
-                let key = Arc::as_ptr(&g) as usize;
-                if door.relay_for != key {
-                    door.relay_for = key;
-                    relay_notices(g.notifications(), peer.clone());
-                }
-                Ok(Some(g))
-            }
+            Ok(g) => Serving::Gateway(g),
             Err(GatewayError::MissingCapability) => {
-                door.no_call = true;
-                door.hint_due = !door.hinted;
-                Ok(None)
+                let mut d = self.door.lock().unwrap_or_else(|e| e.into_inner());
+                d.no_call = true;
+                d.hint_due = !d.hinted;
+                Serving::Direct
             }
-            Err(e) => Err(e.to_string()),
+            Err(e) => Serving::Unavailable(format!(
+                "The org's MCP gateway is starting or unreachable; try again shortly. ({e})"
+            )),
         }
     }
 
     /// The reconnect advice, the first time it is asked for after a fall back.
-    async fn take_reconnect_hint(&self) -> Option<&'static str> {
-        let mut door = self.door.lock().await;
-        if !door.hint_due {
+    fn take_reconnect_hint(&self) -> Option<&'static str> {
+        let mut d = self.door.lock().unwrap_or_else(|e| e.into_inner());
+        if !d.hint_due {
             return None;
         }
-        door.hint_due = false;
-        door.hinted = true;
+        d.hint_due = false;
+        d.hinted = true;
         Some(RECONNECT_FOR_GATEWAY)
     }
 
@@ -2065,51 +2048,93 @@ impl QuomeMcp {
         json(&out)
     }
 
-    /// `find_app_tools` through the gateway: its `find_tools`, kept to the
-    /// tools of apps, in the shape the relay's search answers.
+    /// `find_app_tools` through the gateway: the apps' servers (the one named,
+    /// else every `app:` server `list_servers` shows) searched one by one with
+    /// the gateway's `find_tools`, so other servers' tools cannot crowd apps
+    /// out. The answer has the shape the relay's search had.
     async fn gateway_find_apps(
         &self,
         g: &GatewayClient,
         a: FindToolsArgs,
     ) -> Result<CallToolResult, String> {
-        let mut args = serde_json::json!({"limit": FIND_LIMIT});
-        if let Some(q) = a.query {
-            args["query"] = q.into();
-        }
-        if let Some(app) = a.app {
-            if !valid_app_slug(&app) {
-                return Err(format!("{app:?} is not a valid app slug."));
+        use futures_util::StreamExt;
+        let single = a.app.is_some();
+        let servers: Vec<String> = match a.app {
+            Some(app) => {
+                if !valid_app_slug(&app) {
+                    return Err(format!("{app:?} is not a valid app slug."));
+                }
+                vec![format!("app:{app}")]
             }
-            args["server"] = format!("app:{app}").into();
-        }
-        let r = g
-            .call_tool("find_tools", args, None)
-            .await
-            .map_err(|e| e.to_string())?;
-        if r.is_error == Some(true) {
-            return Ok(with_hints(r));
-        }
-        let body = gateway_body(&r)
-            .ok_or_else(|| "The org's MCP gateway sent no search results.".to_string())?;
-        let hits = body["tools"].as_array().cloned().unwrap_or_default();
+            None => {
+                let r = g
+                    .call_tool("list_servers", serde_json::json!({}), None)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if r.is_error == Some(true) {
+                    return Ok(with_hints(r));
+                }
+                let body = gateway_body(&r)
+                    .ok_or_else(|| "The org's MCP gateway sent no server list.".to_string())?;
+                body["servers"]
+                    .as_array()
+                    .map(|v| v.as_slice())
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|s| s["id"].as_str())
+                    .filter(|id| id.strip_prefix("app:").is_some_and(valid_app_slug))
+                    .map(str::to_string)
+                    .collect()
+            }
+        };
+        let query = a.query;
+        let answers = futures_util::stream::iter(servers)
+            .map(|server| {
+                let mut args = serde_json::json!({"limit": FIND_LIMIT, "server": server});
+                if let Some(q) = &query {
+                    args["query"] = q.clone().into();
+                }
+                async move { g.call_tool("find_tools", args, None).await }
+            })
+            .buffered(FIND_PARALLEL)
+            .collect::<Vec<_>>()
+            .await;
         let mut results = Vec::new();
-        for h in &hits {
-            let Some(app) = h["server"].as_str().and_then(|s| s.strip_prefix("app:")) else {
+        let mut truncated = false;
+        for answer in answers {
+            let r = match answer {
+                Ok(r) => r,
+                Err(e) if single => return Err(e.to_string()),
+                Err(_) => continue,
+            };
+            if r.is_error == Some(true) {
+                if single {
+                    return Ok(with_hints(r));
+                }
+                continue;
+            }
+            let Some(body) = gateway_body(&r) else {
                 continue;
             };
-            if !valid_app_slug(app) {
-                continue;
+            let hits = body["tools"].as_array().cloned().unwrap_or_default();
+            truncated |= hits.len() as u64 >= FIND_LIMIT;
+            for h in &hits {
+                let Some(app) = h["server"].as_str().and_then(|s| s.strip_prefix("app:")) else {
+                    continue;
+                };
+                if !valid_app_slug(app) {
+                    continue;
+                }
+                self.remember_backend(app, "gateway");
+                results.push(serde_json::json!({
+                    "app": app,
+                    "tool": h["tool"],
+                    "summary": h["summary"],
+                    "destructive": h["destructive"] == true,
+                    "backend": "gateway",
+                }));
             }
-            self.remember_backend(app, "gateway");
-            results.push(serde_json::json!({
-                "app": app,
-                "tool": h["tool"],
-                "summary": h["summary"],
-                "destructive": h["destructive"] == true,
-                "backend": "gateway",
-            }));
         }
-        let truncated = hits.len() as u64 >= FIND_LIMIT;
         let mut out = json(&serde_json::json!({"results": results, "truncated": truncated}))?;
         if truncated {
             out.push_str("\nNarrow the query to see more.");
@@ -2252,6 +2277,14 @@ impl QuomeMcp {
         }
     }
 
+    /// The tools that need no gateway.
+    fn own_tools(&self) -> Vec<Tool> {
+        OWN_TOOLS
+            .iter()
+            .filter_map(|n| self.tool_router.get(n).cloned())
+            .collect()
+    }
+
     /// The tools served through the gateway: the CLI's own, the gateway's
     /// (its fixed tools and the platform's inline tools), then the old
     /// app-tool names, marked deprecated.
@@ -2322,7 +2355,7 @@ impl QuomeMcp {
             playbooks: tokio::sync::OnceCell::new(),
         });
         *self.gateway.lock().await = None;
-        *self.door.lock().await = Door::default();
+        *self.door.lock().unwrap_or_else(|e| e.into_inner()) = Door::default();
         true
     }
 
@@ -4705,15 +4738,13 @@ impl rmcp::ServerHandler for QuomeMcp {
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        ctx: RequestContext<RoleServer>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        let gateway = self
-            .serving_gateway(&ctx.peer)
-            .await
-            .map_err(|m| ErrorData::internal_error(m, None))?;
-        let tools = match gateway {
-            Some(g) => self.gateway_tools(&g).await?,
-            None => self.tool_router.list_all(),
+        let tools = match self.serving_gateway().await {
+            Serving::Gateway(g) => self.gateway_tools(&g).await?,
+            Serving::Direct => self.tool_router.list_all(),
+            // Only what needs no gateway; direct tools would bypass the org's policy.
+            Serving::Unavailable(_) => self.own_tools(),
         };
         Ok(ListToolsResult {
             tools,
@@ -4727,19 +4758,23 @@ impl rmcp::ServerHandler for QuomeMcp {
         request: CallToolRequestParams,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let gateway = match self.serving_gateway(&ctx.peer).await {
-            Ok(g) => g,
-            Err(m) => return Ok(error_result(m)),
+        // The CLI's own tools never wait for the front door or the gateway.
+        let own = OWN_TOOLS.contains(&request.name.as_ref());
+        let serving = if own {
+            Serving::Direct
+        } else {
+            self.serving_gateway().await
         };
-        let mut result = match gateway {
-            Some(g) => self.gateway_dispatch(&g, request, ctx).await?,
-            None => {
+        let mut result = match serving {
+            Serving::Gateway(g) => self.gateway_dispatch(&g, request, ctx).await?,
+            Serving::Unavailable(m) => error_result(m),
+            Serving::Direct => {
                 self.tool_router
                     .call(ToolCallContext::new(self, request, ctx))
                     .await?
             }
         };
-        if let Some(h) = self.take_reconnect_hint().await {
+        if let Some(h) = self.take_reconnect_hint() {
             result.content.push(ContentBlock::text(h));
         }
         Ok(result)
@@ -4748,15 +4783,15 @@ impl rmcp::ServerHandler for QuomeMcp {
     async fn list_prompts(
         &self,
         _request: Option<PaginatedRequestParams>,
-        ctx: RequestContext<RoleServer>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<ListPromptsResult, ErrorData> {
-        let gateway = self
-            .serving_gateway(&ctx.peer)
-            .await
-            .map_err(|m| ErrorData::internal_error(m, None))?;
-        if let Some(g) = gateway {
-            let prompts = g.list_prompts().await.map_err(prompt_error)?;
-            return Ok(ListPromptsResult::with_all_items(prompts));
+        match self.serving_gateway().await {
+            Serving::Gateway(g) => {
+                let prompts = g.list_prompts().await.map_err(prompt_error)?;
+                return Ok(ListPromptsResult::with_all_items(prompts));
+            }
+            Serving::Unavailable(m) => return Err(ErrorData::internal_error(m, None)),
+            Serving::Direct => {}
         }
         let conn = self.conn();
         let list = conn
@@ -4789,12 +4824,12 @@ impl rmcp::ServerHandler for QuomeMcp {
     async fn get_prompt(
         &self,
         request: GetPromptRequestParams,
-        ctx: RequestContext<RoleServer>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<GetPromptResult, ErrorData> {
-        let gateway = self
-            .serving_gateway(&ctx.peer)
-            .await
-            .map_err(|m| ErrorData::internal_error(m, None))?;
+        let serving = self.serving_gateway().await;
+        if let Serving::Unavailable(m) = &serving {
+            return Err(ErrorData::internal_error(m.clone(), None));
+        }
         let args: std::collections::BTreeMap<String, String> = request
             .arguments
             .unwrap_or_default()
@@ -4807,7 +4842,7 @@ impl rmcp::ServerHandler for QuomeMcp {
                 (k, v)
             })
             .collect();
-        if let Some(g) = gateway {
+        if let Serving::Gateway(g) = serving {
             return g
                 .get_prompt(&request.name, args)
                 .await
@@ -12517,45 +12552,168 @@ mod tests {
         assert_eq!(names, ["list_sandboxes", "request_access", "get_result"]);
     }
 
+    /// A gateway that has two app servers and a busy platform server: a search
+    /// across everything fills its limit with platform tools.
+    async fn mount_crowded_gateway(s: &MockServer) {
+        mount_gw(s, |m, p| match m {
+            "tools/call" if p["name"] == "list_servers" => Ok(json!({"content":[],"isError":false,
+                "structuredContent":{"servers":[
+                    {"id":"platform","kind":"platform"},
+                    {"id":"app:sales","kind":"app","app":"sales"},
+                    {"id":"github","kind":"third_party"},
+                    {"id":"app:mail","kind":"app","app":"mail"}]}})),
+            "tools/call" if p["name"] == "find_tools" => {
+                let hits = match p["arguments"]["server"].as_str() {
+                    Some("app:sales") => vec![
+                        json!({"server":"app:sales","tool":"list_leads","summary":"leads","destructive":false}),
+                    ],
+                    Some("app:mail") => vec![
+                        json!({"server":"app:mail","tool":"send","summary":"send","destructive":true}),
+                    ],
+                    _ => (0..25)
+                        .map(|i| json!({"server":"platform","tool":format!("t{i}"),"summary":"x","destructive":false}))
+                        .collect(),
+                };
+                Ok(json!({"content":[],"isError":false,"structuredContent":{"tools":hits}}))
+            }
+            _ => Ok(gw_tools()),
+        })
+        .await;
+    }
+
     #[tokio::test]
     async fn alias_find_filters_app_servers() {
         let (s, mut c) = start_live().await;
         mount_config(&s, "gateway").await;
-        mount_gw(&s, |m, _| match m {
-            "tools/call" => Ok(json!({"content":[{"type":"text","text":"x"}],"isError":false,
-                "structuredContent":{"tools":[
-                    {"server":"app:sales","tool":"list_leads","summary":"leads","destructive":false},
-                    {"server":"github","tool":"create_issue","summary":"issue","destructive":true},
-                    {"server":"platform","tool":"exec","summary":"run","destructive":true},
-                    {"server":"app:mail","tool":"send","summary":"send","destructive":true}]}})),
-            _ => Ok(gw_tools()),
-        })
-        .await;
+        mount_crowded_gateway(&s).await;
         let (err, text) = c.call("find_app_tools", json!({"query":"lead"})).await;
         assert!(!err, "{text}");
-        let v: Value = serde_json::from_str(&text).unwrap();
-        let hits = v["results"].as_array().unwrap();
-        let got: Vec<(&str, &str)> = hits
+        let v: Value =
+            serde_json::from_str(text.split('\n').next().unwrap_or("")).unwrap_or_else(|_| {
+                serde_json::from_str(&text[..text.rfind('}').unwrap() + 1]).unwrap()
+            });
+        let got: Vec<(&str, &str)> = v["results"]
+            .as_array()
+            .unwrap()
             .iter()
             .map(|h| (h["app"].as_str().unwrap(), h["tool"].as_str().unwrap()))
             .collect();
+        // platform hits cannot crowd the apps out
         assert_eq!(got, [("sales", "list_leads"), ("mail", "send")]);
-        let (_, p) = gw_requests(&s)
+        assert_eq!(v["truncated"], false);
+        let searched: Vec<String> = gw_requests(&s)
             .await
             .into_iter()
-            .find(|(m, _)| m == "tools/call")
-            .unwrap();
-        assert_eq!(p["name"], "find_tools");
-        assert_eq!(p["arguments"]["query"], "lead");
-        assert!(p["arguments"].get("server").is_none());
-        // naming an app asks about that app's server only
+            .filter(|(m, p)| m == "tools/call" && p["name"] == "find_tools")
+            .map(|(_, p)| p["arguments"]["server"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(searched.len(), 2);
+        assert!(searched.contains(&"app:sales".to_string()));
+        assert!(searched.contains(&"app:mail".to_string()));
+        // naming an app asks about that app's server only, without listing servers
+        let before = gw_requests(&s).await.len();
         c.call("find_app_tools", json!({"app":"sales"})).await;
-        let last = gw_requests(&s)
+        let after: Vec<_> = gw_requests(&s).await.into_iter().skip(before).collect();
+        let calls: Vec<_> = after.iter().filter(|(m, _)| m == "tools/call").collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1["name"], "find_tools");
+        assert_eq!(calls[0].1["arguments"]["server"], "app:sales");
+    }
+
+    #[tokio::test]
+    async fn a_search_that_fills_its_limit_is_marked_truncated() {
+        let (s, mut c) = start_live().await;
+        mount_config(&s, "gateway").await;
+        mount_gw(&s, |m, p| match m {
+            "tools/call" if p["name"] == "list_servers" => Ok(json!({"content":[],"isError":false,
+                "structuredContent":{"servers":[{"id":"app:sales","kind":"app"}]}})),
+            "tools/call" => {
+                let hits: Vec<Value> = (0..25)
+                    .map(|i| json!({"server":"app:sales","tool":format!("t{i}"),"summary":"x"}))
+                    .collect();
+                Ok(json!({"content":[],"isError":false,"structuredContent":{"tools":hits}}))
+            }
+            _ => Ok(gw_tools()),
+        })
+        .await;
+        let (_, text) = c.call("find_app_tools", json!({})).await;
+        assert!(text.contains("\"truncated\": true"), "{text}");
+        assert!(text.contains("Narrow the query"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_gateway_keeps_local_tools_and_never_serves_direct() {
+        let (s, mut c) = start_live().await;
+        mount_config(&s, "gateway").await;
+        Mock::given(method("POST"))
+            .and(path(api_path("/mcp/token")))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .insert_header("retry-after", "120")
+                    .set_body_json(json!({"reason":"mcp_starting"})),
+            )
+            .mount(&s)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(api_path("/sandboxes")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&s)
+            .await;
+        let names = tool_names(&mut c).await;
+        assert_eq!(names, ["sync_folder", "git_clone_url"]);
+        // local tools still work (this one fails on its own argument check)
+        let (err, text) = c
+            .call(
+                "sync_folder",
+                json!({"sandbox":"x","folder":".","dest":"/etc"}),
+            )
+            .await;
+        assert!(err);
+        assert!(!text.contains("gateway"), "{text}");
+        // everything else says so, and is not served directly
+        let (err, text) = c.call("list_sandboxes", json!({})).await;
+        assert!(err);
+        assert!(text.contains("starting or unreachable"), "{text}");
+        let (err, _) = c.call("guide", json!({})).await;
+        assert!(err);
+        assert_eq!(rest_hits(&s.received_requests().await.unwrap()), 0);
+        let v = c.rpc("prompts/list", json!({})).await;
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("starting or unreachable"));
+    }
+
+    #[tokio::test]
+    async fn local_tools_answer_while_the_gateway_is_connecting() {
+        let (s, mut c) = start_live().await;
+        mount_config(&s, "gateway").await;
+        Mock::given(method("POST"))
+            .and(path(api_path("/mcp/token")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(4))
+                    .set_body_json(json!({"access_token":"GWTOK","expires_in":3600,
+                        "url":format!("{}/gw", s.uri())})),
+            )
+            .mount(&s)
+            .await;
+        // a call that waits for the gateway, left pending
+        let pending = json!({"jsonrpc":"2.0","id":900,"method":"tools/call",
+            "params":{"name":"list_sandboxes","arguments":{}}});
+        c.w.write_all(format!("{pending}\n").as_bytes())
             .await
-            .into_iter()
-            .rfind(|(m, _)| m == "tools/call")
             .unwrap();
-        assert_eq!(last.1["arguments"]["server"], "app:sales");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let t0 = Instant::now();
+        let (err, _) = c
+            .call(
+                "sync_folder",
+                json!({"sandbox":"x","folder":".","dest":"/etc"}),
+            )
+            .await;
+        assert!(err);
+        assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
     }
 
     #[tokio::test]
@@ -12958,70 +13116,5 @@ mod tests {
         let (s, mut c) = start_door(|m| m.with_front_door(Some(FrontDoor::Gateway))).await;
         mount_gw(&s, |_, _| Ok(gw_tools())).await;
         assert!(tool_names(&mut c).await.contains(&"find_tools".to_string()));
-    }
-
-    #[tokio::test]
-    async fn approval_notices_reach_the_agent_as_log_messages() {
-        let (s, mut c) = start_live().await;
-        mount_config(&s, "gateway").await;
-        // the gateway's stream carries an approval notice
-        Mock::given(method("GET"))
-            .and(path("/gw"))
-            .respond_with(ResponseTemplate::new(200).set_body_raw(
-                "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/example/approval\",\"params\":{\"approval_id\":\"apr_9\",\"status\":\"approved\"}}\n\n",
-                "text/event-stream",
-            ))
-            .mount(&s)
-            .await;
-        mount_gw_without_stream(&s).await;
-        tool_names(&mut c).await;
-        let mut seen = None;
-        for _ in 0..40 {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            c.rpc("ping", json!({})).await;
-            seen = c
-                .notes
-                .iter()
-                .find(|n| n["method"] == "notifications/message")
-                .cloned();
-            if seen.is_some() {
-                break;
-            }
-        }
-        let n = seen.expect("no log message arrived");
-        let text = n["params"]["data"].to_string();
-        assert!(text.contains("apr_9"), "{text}");
-        assert!(text.contains("approved"), "{text}");
-        assert!(text.contains("get_result"), "{text}");
-    }
-
-    /// `mount_gw` minus its stream route, for tests that mount their own.
-    async fn mount_gw_without_stream(s: &MockServer) {
-        Mock::given(method("POST"))
-            .and(path(api_path("/mcp/token")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                json!({"access_token":"GWTOK","expires_in":3600,"url":format!("{}/gw", s.uri())}),
-            ))
-            .mount(s)
-            .await;
-        let rpc = move |req: &wiremock::Request| {
-            let b: Value = serde_json::from_slice(&req.body).unwrap();
-            let id = b["id"].clone();
-            match b["method"].as_str().unwrap() {
-                "initialize" => ResponseTemplate::new(200)
-                    .insert_header("mcp-session-id", "sess")
-                    .set_body_json(json!({"jsonrpc":"2.0","id":id,"result":{
-                        "protocolVersion":"2025-06-18","capabilities":{},
-                        "serverInfo":{"name":"gw","version":"1"}}})),
-                "tools/list" => ResponseTemplate::new(200)
-                    .set_body_json(json!({"jsonrpc":"2.0","id":id,"result":gw_tools()})),
-                _ => ResponseTemplate::new(202),
-            }
-        };
-        Mock::given(method("POST"))
-            .and(path("/gw"))
-            .respond_with(rpc)
-            .mount(s)
-            .await;
     }
 }

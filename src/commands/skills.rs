@@ -914,8 +914,16 @@ mod tests {
             std::fs::read_to_string(a.join(MANIFEST)).unwrap(),
             r#"{"catalog_hash":"x","names":[]}"#
         );
-        drop(s);
-        background_sync(&api, h.path(), "p").await;
+        // A host nothing listens on, with the front door pinned: no stray
+        // server can answer.
+        let dead = {
+            let p = profile("http://127.0.0.1:1");
+            Arc::new(CloudApi::new(
+                &p,
+                TokenSource::new(&p, AgentKey::generate(), "vrc".into()),
+            ))
+        };
+        background_sync(&dead, h.path(), "p").await;
         assert_eq!(std::fs::read_dir(&a).unwrap().count(), 1);
     }
 
