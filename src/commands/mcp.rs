@@ -36,6 +36,7 @@ pub async fn execute(args: Args) -> Result<()> {
         Err(e) => return Err(e),
     };
     let name = args.profile.unwrap_or(state.default);
+    crate::errors::set_reconnect_command(&profile.api_url, &name);
     let (key, vrc) = AgentKey::load_from(store.as_ref(), &name)?;
     let api = CloudApi::new(&profile, TokenSource::new(&profile, key, vrc));
     let home = dirs::home_dir()
