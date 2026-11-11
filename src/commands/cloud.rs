@@ -139,6 +139,12 @@ pub async fn execute(command: CloudCommands) -> Result<()> {
     match command {
         CloudCommands::Status(a) => {
             let store = platform_store().map_err(unsupported)?;
+            if let Ok(st) = CloudState::load_from(&home) {
+                let name = a.profile.clone().unwrap_or_else(|| st.default.clone());
+                if let Ok(p) = st.profile(Some(&name)) {
+                    crate::errors::set_reconnect_command(&p.api_url, &name);
+                }
+            }
             let (out, code) = status(&home, a.profile.as_deref(), a.json, store.as_ref()).await?;
             println!("{out}");
             if code != 0 {
