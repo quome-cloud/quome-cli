@@ -1330,7 +1330,7 @@ pub struct CacheSetArgs {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CredentialsRequestArgs {
-    /// A route id from credentials_routes to ask for. Give exactly one of route, repo or git_exception.
+    /// A route id from credentials_routes to ask for. Give exactly one of route, repo, git_exception or token_cap.
     route: Option<String>,
     /// A GitHub repo (`github.com/<owner>/<name>`) to ask for.
     repo: Option<String>,
@@ -1338,8 +1338,19 @@ pub struct CredentialsRequestArgs {
     push: Option<bool>,
     /// A time-boxed exception to a repo's git rules.
     git_exception: Option<CredentialsGitException>,
+    /// Ask for a higher model token budget (see models_list for your cap and use).
+    token_cap: Option<CredentialsTokenCap>,
     /// Why you need it, in plain words; the person reads this.
     reason: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialsTokenCap {
+    /// The tokens a day (input plus output) you ask to be allowed, at least 1.
+    tokens_per_day: u64,
+    /// How many hours the raise should last, 1 to 168. Without it the service uses 24.
+    hours: Option<u64>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -4364,7 +4375,25 @@ impl QuomeMcp {
     }
 
     #[tool(
-        description = "Ask a person for access you do not have: a route (route), a GitHub repo (repo, with push to push as well as fetch), or a time-boxed git exception (git_exception: repo, ref, allow force_push, delete_branch or tag, minutes 1 to 1440). Give exactly one, and a reason the person reads. A person decides; you are not notified, so call credentials_routes later to see whether it landed.",
+        description = "The model routes you may call through the org's credentials service, each with its base URL and the environment variable that holds your key, and your token budget: the cap, what you have used in the last 24 hours, when room frees up, and any approved raise. To ask for more, use credentials_request with token_cap.",
+        annotations(read_only_hint = true)
+    )]
+    async fn models_list(&self, ctx: RequestContext<RoleServer>) -> Result<String, String> {
+        let progress = Progress::new(ctx);
+        let (_, v) = progress
+            .run(self.cred_call(
+                CredAccess::Use,
+                reqwest::Method::GET,
+                "/_v1/models",
+                &serde_json::Value::Null,
+                &progress,
+            ))
+            .await?;
+        json(&v)
+    }
+
+    #[tool(
+        description = "Ask a person for access you do not have: a route (route), a GitHub repo (repo, with push to push as well as fetch), or a time-boxed git exception (git_exception: repo, ref, allow force_push, delete_branch or tag, minutes 1 to 1440), or a raise of your model token budget (token_cap: tokens_per_day, hours 1 to 168, default 24; see models_list). Give exactly one, and a reason the person reads. A person decides; you are not notified, so call credentials_routes later to see whether it landed.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     async fn credentials_request(
@@ -4376,9 +4405,13 @@ impl QuomeMcp {
             a.route.is_some(),
             a.repo.is_some(),
             a.git_exception.is_some(),
+            a.token_cap.is_some(),
         ];
         if targets.iter().filter(|t| **t).count() != 1 {
-            return Err("Give exactly one of route, repo or git_exception.".into());
+            return Err(
+                "exactly_one_target: Give exactly one of route, repo, git_exception or token_cap."
+                    .into(),
+            );
         }
         if a.push.is_some() && a.repo.is_none() {
             return Err("push is only valid with repo.".into());
@@ -4393,6 +4426,14 @@ impl QuomeMcp {
         if let Some(x) = &a.git_exception {
             nonblank("git_exception.repo", &x.repo)?;
             nonblank("git_exception.ref", &x.git_ref)?;
+        }
+        if let Some(t) = &a.token_cap {
+            if t.tokens_per_day < 1 {
+                return Err("invalid_token_cap: tokens_per_day must be at least 1.".into());
+            }
+            if t.hours.is_some_and(|h| !(1..=168).contains(&h)) {
+                return Err("invalid_token_cap: hours must be 1 to 168.".into());
+            }
         }
         let mut body = serde_json::Map::new();
         if let Some(r) = &a.route {
@@ -4417,6 +4458,13 @@ impl QuomeMcp {
             }
             body.insert("git_exception".into(), e);
         }
+        if let Some(t) = &a.token_cap {
+            let mut c = serde_json::json!({"tokens_per_day": t.tokens_per_day});
+            if let Some(h) = t.hours {
+                c["hours"] = h.into();
+            }
+            body.insert("token_cap".into(), c);
+        }
         body.insert("reason".into(), a.reason.clone().into());
         let body = serde_json::Value::Object(body);
         let progress = Progress::new(ctx);
@@ -4433,11 +4481,16 @@ impl QuomeMcp {
                     .await)
             })
             .await?;
+        let later = if a.token_cap.is_some() {
+            "call models_list later"
+        } else {
+            "call credentials_routes later"
+        };
         match r {
             Ok((_, v)) => json(&serde_json::json!({
                 "id": v["request"]["id"],
                 "state": v["request"]["state"],
-                "message": "A person must approve this. You will not be notified; call credentials_routes later.",
+                "message": format!("A person must approve this. You will not be notified; {later}."),
             })),
             Err(CredError::Refused {
                 code, retry_after, ..
@@ -4445,6 +4498,11 @@ impl QuomeMcp {
                 "state": "cooldown",
                 "retry_in_minutes": cooldown_minutes(retry_after),
             })),
+            Err(CredError::Refused { code, .. })
+                if code == "capability_missing" && a.token_cap.is_some() =>
+            {
+                Err("Run `quome connect` again and allow Models access (the `models_operate` capability).".into())
+            }
             Err(e) => Err(cred_hint(e)),
         }
     }
@@ -5251,6 +5309,7 @@ mod tests {
             "credentials_git_url",
             "credentials_providers",
             "credentials_grant",
+            "models_list",
         ];
         want.sort();
         assert_eq!(names, want);
@@ -11415,6 +11474,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn models_list_returns_routes_and_caps() {
+        let (s, mut c) = start_creds().await;
+        let body = json!({
+            "routes": [{"id": "m.models.anthropic", "template": "anthropic_model",
+                        "base_url": "https://egress.example/m/models/anthropic",
+                        "key_env": "QUOME_EGRESS_KEY"}],
+            "caps": [{"name": "models.agent", "limit": 5000000, "used": 120000,
+                      "input": 90000, "output": 30000, "window": "24h",
+                      "resets_at": "2026-11-13T09:12:00Z", "raise": null}]
+        });
+        Mock::given(method("GET"))
+            .and(path("/acme/_v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body.clone()))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let (err, text) = c.call("models_list", json!({})).await;
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v, body);
+        assert!(!text.contains("CT"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn models_list_in_tool_names() {
+        assert!(crate::cloud::playbooks::TOOL_NAMES.contains(&"models_list"));
+        let t = QuomeMcp::tool_router()
+            .list_all()
+            .into_iter()
+            .find(|t| t.name == "models_list")
+            .expect("models_list is registered");
+        assert_eq!(
+            t.annotations.as_ref().and_then(|a| a.read_only_hint),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn models_list_without_egress_says_so() {
+        let (_s, mut c, _n) = start_refusing("capability_missing").await;
+        let (err, text) = c.call("models_list", json!({})).await;
+        assert!(err);
+        let (_, routes) = c.call("credentials_routes", json!({})).await;
+        assert_eq!(text, routes);
+    }
+
+    #[tokio::test]
     async fn request_needs_exactly_one_target() {
         let (s, mut c) = start_creds().await;
         for args in [
@@ -11483,6 +11589,203 @@ mod tests {
             )
             .await;
         assert!(!err, "{text}");
+    }
+
+    async fn post_request_body(args: Value) -> (bool, String, Vec<Value>) {
+        let (s, mut c) = start_creds().await;
+        Mock::given(method("POST"))
+            .and(path("/acme/_v1/requests"))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_body_json(json!({"request":{"id":"r9","state":"pending"}})),
+            )
+            .mount(&s)
+            .await;
+        let (err, text) = c.call("credentials_request", args).await;
+        let bodies = s
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() == "/acme/_v1/requests")
+            .map(|r| serde_json::from_slice::<Value>(&r.body).unwrap())
+            .collect();
+        (err, text, bodies)
+    }
+
+    #[tokio::test]
+    async fn token_cap_request_body() {
+        let (err, text, bodies) = post_request_body(
+            json!({"token_cap":{"tokens_per_day":8000000,"hours":48},"reason":"big refactor"}),
+        )
+        .await;
+        assert!(!err, "{text}");
+        assert_eq!(
+            bodies,
+            vec![
+                json!({"token_cap":{"tokens_per_day":8000000,"hours":48},"reason":"big refactor"})
+            ]
+        );
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["id"], "r9");
+    }
+
+    #[tokio::test]
+    async fn token_cap_hours_default_omitted() {
+        let (err, text, bodies) =
+            post_request_body(json!({"token_cap":{"tokens_per_day":1},"reason":"r"})).await;
+        assert!(!err, "{text}");
+        assert_eq!(
+            bodies,
+            vec![json!({"token_cap":{"tokens_per_day":1},"reason":"r"})]
+        );
+        assert!(bodies[0]["token_cap"].get("hours").is_none());
+    }
+
+    #[tokio::test]
+    async fn token_cap_with_route_is_exactly_one_target() {
+        let (s, mut c) = start_creds().await;
+        for args in [
+            json!({"route":"a","token_cap":{"tokens_per_day":5},"reason":"x"}),
+            json!({"repo":"github.com/o/n","token_cap":{"tokens_per_day":5},"reason":"x"}),
+            json!({"git_exception":{"repo":"github.com/o/n","ref":"refs/heads/x","allow":"tag"},
+                   "token_cap":{"tokens_per_day":5},"reason":"x"}),
+        ] {
+            let (err, text) = c.call("credentials_request", args.clone()).await;
+            assert!(err, "{args} {text}");
+            assert!(text.contains("exactly_one_target"), "{text}");
+            assert!(
+                text.contains("exactly one") && text.contains("token_cap"),
+                "{text}"
+            );
+        }
+        let (err, text) = c
+            .call(
+                "credentials_request",
+                json!({"push":true,"token_cap":{"tokens_per_day":5},"reason":"x"}),
+            )
+            .await;
+        assert!(err, "{text}");
+        assert!(service_calls(&s.received_requests().await.unwrap()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn token_cap_hours_out_of_range_is_invalid() {
+        let (s, mut c) = start_creds().await;
+        for tc in [
+            json!({"tokens_per_day":5,"hours":0}),
+            json!({"tokens_per_day":5,"hours":169}),
+            json!({"tokens_per_day":0}),
+        ] {
+            let (err, text) = c
+                .call(
+                    "credentials_request",
+                    json!({"token_cap":tc.clone(),"reason":"x"}),
+                )
+                .await;
+            assert!(err, "{tc} {text}");
+            assert!(text.contains("invalid_token_cap"), "{text}");
+        }
+        assert!(service_calls(&s.received_requests().await.unwrap()).is_empty());
+        // Unknown keys and a blank reason are refused too.
+        let (err, _) = c
+            .call(
+                "credentials_request",
+                json!({"token_cap":{"tokens_per_day":5,"extra":1},"reason":"x"}),
+            )
+            .await;
+        assert!(err);
+        let (err, _) = c
+            .call(
+                "credentials_request",
+                json!({"token_cap":{"tokens_per_day":5},"reason":" "}),
+            )
+            .await;
+        assert!(err);
+        // The edges, 1 and 168 hours, are accepted.
+        for h in [1, 168] {
+            let (err, text, _) =
+                post_request_body(json!({"token_cap":{"tokens_per_day":5,"hours":h},"reason":"x"}))
+                    .await;
+            assert!(!err, "{h} {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn token_cap_capability_missing_points_at_models_access() {
+        for (args, want, not) in [
+            (
+                json!({"token_cap":{"tokens_per_day":5},"reason":"x"}),
+                "models_operate",
+                "Credentials access",
+            ),
+            (
+                json!({"route":"stripe","reason":"x"}),
+                "allow Credentials access",
+                "models_operate",
+            ),
+        ] {
+            let (s, mut c) = start_creds().await;
+            Mock::given(method("POST"))
+                .and(path("/acme/_v1/requests"))
+                .respond_with(ResponseTemplate::new(403).set_body_json(
+                    json!({"error":{"code":"capability_missing","message":"missing"}}),
+                ))
+                .mount(&s)
+                .await;
+            let (err, text) = c.call("credentials_request", args).await;
+            assert!(err, "{text}");
+            assert!(text.contains(want) && !text.contains(not), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn token_cap_reply_points_at_models_list() {
+        let (err, text, _) =
+            post_request_body(json!({"token_cap":{"tokens_per_day":5},"reason":"r"})).await;
+        assert!(!err, "{text}");
+        assert!(
+            text.contains("models_list") && !text.contains("credentials_routes"),
+            "{text}"
+        );
+        let (_, text, _) = post_request_body(json!({"route":"a","reason":"r"})).await;
+        assert!(text.contains("credentials_routes"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn token_cap_cooldown_message() {
+        let (s, mut c) = start_creds().await;
+        Mock::given(method("POST"))
+            .and(path("/acme/_v1/requests"))
+            .respond_with(
+                ResponseTemplate::new(409)
+                    .insert_header("retry-after", "3600")
+                    .set_body_json(json!({"error":{"code":"request_cooldown","message":"wait"}})),
+            )
+            .mount(&s)
+            .await;
+        let (err, text) = c
+            .call(
+                "credentials_request",
+                json!({"token_cap":{"tokens_per_day":5},"reason":"x"}),
+            )
+            .await;
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v, json!({"state":"cooldown","retry_in_minutes":60}));
+    }
+
+    #[tokio::test]
+    async fn existing_request_bodies_unchanged() {
+        for args in [
+            json!({"route":"stripe","reason":"r"}),
+            json!({"repo":"github.com/o/n","push":true,"reason":"r"}),
+            json!({"git_exception":{"repo":"github.com/o/n","ref":"refs/heads/x","allow":"tag","minutes":5},"reason":"r"}),
+        ] {
+            let (err, text, bodies) = post_request_body(args.clone()).await;
+            assert!(!err, "{text}");
+            assert_eq!(bodies, vec![args]);
+        }
     }
 
     #[tokio::test]
