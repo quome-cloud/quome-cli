@@ -4408,7 +4408,10 @@ impl QuomeMcp {
             a.token_cap.is_some(),
         ];
         if targets.iter().filter(|t| **t).count() != 1 {
-            return Err("Give exactly one of route, repo, git_exception or token_cap.".into());
+            return Err(
+                "exactly_one_target: Give exactly one of route, repo, git_exception or token_cap."
+                    .into(),
+            );
         }
         if a.push.is_some() && a.repo.is_none() {
             return Err("push is only valid with repo.".into());
@@ -11640,6 +11643,7 @@ mod tests {
         ] {
             let (err, text) = c.call("credentials_request", args.clone()).await;
             assert!(err, "{args} {text}");
+            assert!(text.contains("exactly_one_target"), "{text}");
             assert!(
                 text.contains("exactly one") && text.contains("token_cap"),
                 "{text}"
