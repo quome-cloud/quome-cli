@@ -4364,6 +4364,24 @@ impl QuomeMcp {
     }
 
     #[tool(
+        description = "The model routes you may call through the org's credentials service, each with its base URL and the environment variable that holds your key, and your token budget: the cap, what you have used in the last 24 hours, when room frees up, and any approved raise. To ask for more, use credentials_request with token_cap.",
+        annotations(read_only_hint = true)
+    )]
+    async fn models_list(&self, ctx: RequestContext<RoleServer>) -> Result<String, String> {
+        let progress = Progress::new(ctx);
+        let (_, v) = progress
+            .run(self.cred_call(
+                CredAccess::Use,
+                reqwest::Method::GET,
+                "/_v1/models",
+                &serde_json::Value::Null,
+                &progress,
+            ))
+            .await?;
+        json(&v)
+    }
+
+    #[tool(
         description = "Ask a person for access you do not have: a route (route), a GitHub repo (repo, with push to push as well as fetch), or a time-boxed git exception (git_exception: repo, ref, allow force_push, delete_branch or tag, minutes 1 to 1440). Give exactly one, and a reason the person reads. A person decides; you are not notified, so call credentials_routes later to see whether it landed.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
@@ -5251,6 +5269,7 @@ mod tests {
             "credentials_git_url",
             "credentials_providers",
             "credentials_grant",
+            "models_list",
         ];
         want.sort();
         assert_eq!(names, want);
@@ -11412,6 +11431,53 @@ mod tests {
         assert_eq!(v["routes"][0]["id"], "stripe");
         assert_eq!(v["key_env"], "QUOME_EGRESS_KEY");
         assert!(!text.contains("CT"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn models_list_returns_routes_and_caps() {
+        let (s, mut c) = start_creds().await;
+        let body = json!({
+            "routes": [{"id": "m.models.anthropic", "template": "anthropic_model",
+                        "base_url": "https://egress.example/m/models/anthropic",
+                        "key_env": "QUOME_EGRESS_KEY"}],
+            "caps": [{"name": "models.agent", "limit": 5000000, "used": 120000,
+                      "input": 90000, "output": 30000, "window": "24h",
+                      "resets_at": "2026-11-13T09:12:00Z", "raise": null}]
+        });
+        Mock::given(method("GET"))
+            .and(path("/acme/_v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body.clone()))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let (err, text) = c.call("models_list", json!({})).await;
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v, body);
+        assert!(!text.contains("CT"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn models_list_in_tool_names() {
+        assert!(crate::cloud::playbooks::TOOL_NAMES.contains(&"models_list"));
+        let t = QuomeMcp::tool_router()
+            .list_all()
+            .into_iter()
+            .find(|t| t.name == "models_list")
+            .expect("models_list is registered");
+        assert_eq!(
+            t.annotations.as_ref().and_then(|a| a.read_only_hint),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn models_list_without_egress_says_so() {
+        let (_s, mut c, _n) = start_refusing("capability_missing").await;
+        let (err, text) = c.call("models_list", json!({})).await;
+        assert!(err);
+        let (_, routes) = c.call("credentials_routes", json!({})).await;
+        assert_eq!(text, routes);
     }
 
     #[tokio::test]

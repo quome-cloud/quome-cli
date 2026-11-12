@@ -67,6 +67,7 @@ pub const TOOL_NAMES: &[&str] = &[
     "credentials_git_url",
     "credentials_providers",
     "credentials_grant",
+    "models_list",
     "email_create_address",
     "email_list_addresses",
     "email_disable",
