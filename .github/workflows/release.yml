@@ -104,7 +104,10 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Cargo.toml
-          git commit -m "chore: bump version to ${{ steps.increment.outputs.new_tag }}"
+          # A PR may already have set the version; tag the merge commit as it is then.
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: bump version to ${{ steps.increment.outputs.new_tag }}"
+          fi
           git tag ${{ steps.increment.outputs.new_tag }}
           git push origin main --tags
 
