@@ -4481,11 +4481,16 @@ impl QuomeMcp {
                     .await)
             })
             .await?;
+        let later = if a.token_cap.is_some() {
+            "call models_list later"
+        } else {
+            "call credentials_routes later"
+        };
         match r {
             Ok((_, v)) => json(&serde_json::json!({
                 "id": v["request"]["id"],
                 "state": v["request"]["state"],
-                "message": "A person must approve this. You will not be notified; call credentials_routes later.",
+                "message": format!("A person must approve this. You will not be notified; {later}."),
             })),
             Err(CredError::Refused {
                 code, retry_after, ..
@@ -4493,6 +4498,11 @@ impl QuomeMcp {
                 "state": "cooldown",
                 "retry_in_minutes": cooldown_minutes(retry_after),
             })),
+            Err(CredError::Refused { code, .. })
+                if code == "capability_missing" && a.token_cap.is_some() =>
+            {
+                Err("Run `quome connect` again and allow Models access (the `models_operate` capability).".into())
+            }
             Err(e) => Err(cred_hint(e)),
         }
     }
@@ -11699,6 +11709,47 @@ mod tests {
                     .await;
             assert!(!err, "{h} {text}");
         }
+    }
+
+    #[tokio::test]
+    async fn token_cap_capability_missing_points_at_models_access() {
+        for (args, want, not) in [
+            (
+                json!({"token_cap":{"tokens_per_day":5},"reason":"x"}),
+                "models_operate",
+                "Credentials access",
+            ),
+            (
+                json!({"route":"stripe","reason":"x"}),
+                "allow Credentials access",
+                "models_operate",
+            ),
+        ] {
+            let (s, mut c) = start_creds().await;
+            Mock::given(method("POST"))
+                .and(path("/acme/_v1/requests"))
+                .respond_with(ResponseTemplate::new(403).set_body_json(
+                    json!({"error":{"code":"capability_missing","message":"missing"}}),
+                ))
+                .mount(&s)
+                .await;
+            let (err, text) = c.call("credentials_request", args).await;
+            assert!(err, "{text}");
+            assert!(text.contains(want) && !text.contains(not), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn token_cap_reply_points_at_models_list() {
+        let (err, text, _) =
+            post_request_body(json!({"token_cap":{"tokens_per_day":5},"reason":"r"})).await;
+        assert!(!err, "{text}");
+        assert!(
+            text.contains("models_list") && !text.contains("credentials_routes"),
+            "{text}"
+        );
+        let (_, text, _) = post_request_body(json!({"route":"a","reason":"r"})).await;
+        assert!(text.contains("credentials_routes"), "{text}");
     }
 
     #[tokio::test]
