@@ -26,6 +26,13 @@ use super::protocol::{path_allowed, RequestTokenVerifier};
 pub const MAX_BODY_BYTES: u64 = 16 * 1024 * 1024;
 pub const TOKEN_HEADER: &str = "x-quome-request-token";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+/// Logged when the caller goes away before the local server answers.
+const CALLER_HUNG_UP: StatusCode = match StatusCode::from_u16(499) {
+    Ok(s) => s,
+    Err(_) => StatusCode::BAD_GATEWAY,
+};
+/// A stream that has not sent its whole request head by then is closed.
+pub const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const RESPONSES_UNSUPPORTED: &str =
     "This machine's Ollama is older than 0.13.3; upgrade Ollama to serve /v1/responses.";
 
@@ -67,6 +74,8 @@ pub async fn serve_stream<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     });
     let _ = hyper::server::conn::http1::Builder::new()
         .keep_alive(false)
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(HEADER_READ_TIMEOUT)
         .serve_connection(TokioIo::new(io), svc)
         .await;
 }
@@ -81,13 +90,12 @@ struct Line {
 
 impl Line {
     fn log(&self, status: StatusCode) {
-        eprintln!(
-            "models: rid={} {} {} {} {}ms",
-            self.rid,
-            self.method,
-            self.path,
+        super::log::request(
+            &self.rid,
+            self.method.as_str(),
+            &self.path,
             status.as_u16(),
-            self.started.elapsed().as_millis()
+            self.started.elapsed().as_millis(),
         );
     }
 
@@ -180,10 +188,11 @@ async fn handle(req: Request<Incoming>, st: Arc<ProxyState>) -> Response<ProxyBo
     };
     permit.forget();
     // From here every return path drops `slot`, which gives the permit back.
+    // Until the local server answers, a drop means the caller hung up (499).
     let mut slot = InFlight {
         st: st.clone(),
         line,
-        status: StatusCode::OK,
+        status: CALLER_HUNG_UP,
     };
 
     let declared = match req.headers().get(header::CONTENT_LENGTH) {
@@ -338,7 +347,7 @@ fn capped(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::machine::protocol::GatewayKey;
     use ed25519_dalek::{Signer, SigningKey};
@@ -355,11 +364,11 @@ mod tests {
     const VECTORS: &str = include_str!("../../tests/vectors/models-tunnel-v1.json");
     const NOW: i64 = 1_767_225_600;
 
-    fn fixed_now() -> i64 {
+    pub(crate) fn fixed_now() -> i64 {
         NOW
     }
 
-    fn vec_str(k: &str) -> String {
+    pub(crate) fn vec_str(k: &str) -> String {
         let v: Value = serde_json::from_str(VECTORS).unwrap();
         v["request_token"][k].as_str().unwrap().to_owned()
     }
@@ -388,7 +397,7 @@ mod tests {
         format!("{h}.{p}.{}", b64(&sig.to_bytes()))
     }
 
-    fn good(rid: &str) -> String {
+    pub(crate) fn good(rid: &str) -> String {
         token(rid, NOW + 60)
     }
 
@@ -470,7 +479,8 @@ mod tests {
             .await;
     }
 
-    const CHAT: &[u8] = br#"{"model":"qwen3:32b","messages":[{"role":"user","content":"hi"}]}"#;
+    pub(crate) const CHAT: &[u8] =
+        br#"{"model":"qwen3:32b","messages":[{"role":"user","content":"hi"}]}"#;
 
     #[tokio::test]
     async fn forwards_chat_unchanged() {
@@ -775,6 +785,23 @@ mod tests {
             .unwrap()
             .to_bytes();
         assert_eq!(rest, &b"data: [DONE]\n\n"[..]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_without_a_request_head_is_closed() {
+        // Nothing at all, then half a head.
+        for sent in [&b""[..], b"POST /v1/chat"] {
+            let st = state("http://127.0.0.1:9", None, 4, true);
+            let (mut a, b) = tokio::io::duplex(64 * 1024);
+            let t0 = tokio::time::Instant::now();
+            let served = tokio::spawn(serve_stream(b, st));
+            a.write_all(sent).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(120), served)
+                .await
+                .expect("an idle stream is closed, not kept forever")
+                .unwrap();
+            assert!(t0.elapsed() >= HEADER_READ_TIMEOUT);
+        }
     }
 
     #[tokio::test]

@@ -2,16 +2,19 @@
 //! organization so it can serve its local models to the org.
 use clap::{Args, Subcommand};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::cloud::api::CloudApi;
 use crate::cloud::auth::TokenSource;
+use crate::cloud::clients::runner::CommandRunner;
 use crate::cloud::keys::{AgentKey, KeyStore};
 use crate::cloud::state::CloudState;
 use crate::commands::connect::{self, Deps, Options};
 use crate::errors::{QuomeError, Result};
 use crate::machine::config::{self, MachineConfig, ServerKind, MAX_CONCURRENCY, PROFILE};
 use crate::machine::service;
+use crate::machine::tunnel::{self, AdvertFn, Stop, Timing, TokenFn, TunnelDeps};
 
 /// Warn this many days before the delegation ends.
 const EXPIRY_WARN_DAYS: i64 = 7;
@@ -442,6 +445,194 @@ pub async fn disconnect(
     Ok(report)
 }
 
+/// How `quome models serve` ended.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Served {
+    NotConnected,
+    Stopped(Stop),
+}
+
+/// 0 = stop for good (not connected, revoked, a stop signal); 3 = the binary
+/// was upgraded, so the service manager starts the new one.
+pub fn serve_exit_code(s: &Served) -> i32 {
+    match s {
+        Served::Stopped(Stop::Upgraded) => 3,
+        _ => 0,
+    }
+}
+
+const DISCONNECTED: &str = "This machine was disconnected — run `quome models connect` again";
+
+fn unix_now() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+/// `"Bearer …"` from the config's `api_key_file`, read once at start.
+fn local_auth(c: &MachineConfig) -> Result<Option<String>> {
+    let Some(f) = &c.api_key_file else {
+        return Ok(None);
+    };
+    let k = std::fs::read_to_string(f)
+        .map_err(|e| QuomeError::Usage(format!("cannot read api_key_file {}: {e}", f.display())))?;
+    let k = k.trim();
+    if k.is_empty() {
+        return Err(QuomeError::Usage(format!(
+            "api_key_file {} is empty",
+            f.display()
+        )));
+    }
+    Ok(Some(format!("Bearer {k}")))
+}
+
+/// Serve this machine's models over the tunnel until a permanent stop.
+/// `runner` reads the machine's memory and accelerator for adverts.
+pub async fn serve(
+    home: &Path,
+    env: &dyn Fn(&str) -> Option<String>,
+    store: &dyn KeyStore,
+    runner: Arc<dyn CommandRunner + Send + Sync>,
+    timing: Timing,
+    program: Option<std::path::PathBuf>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<Served> {
+    use crate::machine::{advert, log, probe, proxy};
+
+    let st = CloudState::load_from(home)?;
+    let Some(p) = st.profiles.get(PROFILE).cloned() else {
+        return Ok(Served::NotConnected);
+    };
+    let cfg = config::load(&config::config_path(home, env))?;
+    let Some(api) = api_for(home, store)? else {
+        return Ok(Served::NotConnected);
+    };
+    let api = Arc::new(api);
+    let state = Arc::new(proxy::ProxyState {
+        verifier: tokio::sync::Mutex::new(None),
+        local: config::validate_local_url(&cfg.url)?,
+        local_auth: local_auth(&cfg)?,
+        client: proxy::local_client(),
+        slots: tokio::sync::Semaphore::new(cfg.max_concurrency as usize),
+        responses_supported: std::sync::atomic::AtomicBool::new(false),
+        clock: unix_now,
+    });
+
+    let token: TokenFn = Arc::new(move || {
+        let api = api.clone();
+        Box::pin(async move { api.models_token().await })
+    });
+    let advert_fn: AdvertFn = {
+        let cfg = cfg.clone();
+        let state = state.clone();
+        let client = probe::client();
+        Arc::new(move || {
+            let (cfg, state, client) = (cfg.clone(), state.clone(), client.clone());
+            let runner = runner.clone();
+            Box::pin(async move {
+                let facts = tokio::task::spawn_blocking(move || advert::collect(&*runner))
+                    .await
+                    .unwrap_or_else(|_| advert::SystemFacts {
+                        accelerator: "cpu".into(),
+                        ..Default::default()
+                    });
+                let pr = probe::probe(&client, &cfg).await;
+                state
+                    .responses_supported
+                    .store(pr.responses_supported, std::sync::atomic::Ordering::SeqCst);
+                probe::advert(&facts, &pr, &cfg)
+            })
+        })
+    };
+
+    log::event(
+        "serving",
+        &[
+            ("org", p.org_slug.clone()),
+            ("server", cfg.server.name().to_string()),
+            ("url", cfg.url.clone()),
+        ],
+    );
+    let deps = TunnelDeps {
+        token,
+        advert: advert_fn,
+        audience: p.agent_principal.clone(),
+        fallback_url: format!("wss://models.{}/{}/machine", p.apps_domain, p.org_slug),
+        timing,
+        program,
+        shutdown,
+    };
+    Ok(Served::Stopped(tunnel::run(deps, state).await))
+}
+
+/// The path this process was started from (as typed or found on PATH), so a
+/// package upgrade that repoints it is noticed.
+fn program_path() -> Option<std::path::PathBuf> {
+    let argv0 = std::path::PathBuf::from(std::env::args_os().next()?);
+    if argv0.components().count() > 1 {
+        return std::path::absolute(&argv0).ok();
+    }
+    std::env::var_os("PATH")
+        .and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|d| d.join(&argv0))
+                .find(|c| c.is_file())
+        })
+        .or_else(|| std::env::current_exe().ok())
+}
+
+/// SIGTERM or SIGINT.
+async fn stop_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut term) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = term.recv() => {}
+                _ = tokio::signal::ctrl_c() => {}
+            }
+            return;
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+async fn execute_serve(install: bool, uninstall: bool, json_logs: bool) -> Result<()> {
+    if install || uninstall {
+        return Err(QuomeError::Usage(
+            "quome models serve is not available in this build".into(),
+        ));
+    }
+    crate::machine::log::set_json(json_logs);
+    let home = home()?;
+    let store = config::key_store(&home);
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        stop_signal().await;
+        crate::machine::log::event("stopping", &[]);
+        let _ = stop_tx.send(true);
+    });
+    let out = serve(
+        &home,
+        &crate::cloud::clients::real_env,
+        &store,
+        Arc::new(crate::cloud::clients::runner::RealRunner),
+        Timing::default(),
+        program_path(),
+        stop_rx,
+    )
+    .await?;
+    match &out {
+        Served::NotConnected => println!("Not connected. Run `quome models connect`."),
+        Served::Stopped(Stop::Revoked | Stop::MissingCapability) => println!("{DISCONNECTED}"),
+        Served::Stopped(Stop::Upgraded) => crate::machine::log::event("upgraded", &[]),
+        Served::Stopped(Stop::Shutdown) => crate::machine::log::event("stopped", &[]),
+    }
+    let code = serve_exit_code(&out);
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(())
+}
+
 fn home() -> Result<std::path::PathBuf> {
     dirs::home_dir().ok_or_else(|| QuomeError::CloudState("cannot find home directory".into()))
 }
@@ -488,9 +679,11 @@ pub async fn execute(command: ModelsCommands) -> Result<()> {
             }
             Ok(())
         }
-        ModelsCommands::Serve { .. } => Err(QuomeError::Usage(
-            "quome models serve is not available in this build".into(),
-        )),
+        ModelsCommands::Serve {
+            install,
+            uninstall,
+            json_logs,
+        } => execute_serve(install, uninstall, json_logs).await,
     }
 }
 
@@ -821,6 +1014,163 @@ mod tests {
             },
         );
         st.save_to(home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_without_a_connection_says_so_and_exits_0() {
+        let h = tempfile::tempdir().unwrap();
+        let store = config::key_store(h.path());
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let out = serve(
+            h.path(),
+            &|_| None,
+            &store,
+            no_commands(),
+            Timing::default(),
+            None,
+            rx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, Served::NotConnected);
+        assert_eq!(serve_exit_code(&out), 0);
+    }
+
+    #[test]
+    fn serve_exit_codes() {
+        for (stop, code) in [
+            (Stop::Revoked, 0),
+            (Stop::MissingCapability, 0),
+            (Stop::Shutdown, 0),
+            (Stop::Upgraded, 3),
+        ] {
+            assert_eq!(serve_exit_code(&Served::Stopped(stop)), code, "{stop:?}");
+        }
+    }
+
+    /// Runs nothing on this computer.
+    struct NoCommands;
+    impl CommandRunner for NoCommands {
+        fn run(&self, _: &str, _: &[String]) -> crate::cloud::clients::runner::RunResult {
+            crate::cloud::clients::runner::RunResult::NotFound
+        }
+    }
+
+    fn no_commands() -> Arc<dyn CommandRunner + Send + Sync> {
+        Arc::new(NoCommands)
+    }
+
+    /// Nothing listens on a port that was bound and released.
+    fn closed_port() -> String {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}", l.local_addr().unwrap())
+    }
+
+    fn serve_timing() -> Timing {
+        Timing {
+            backoff_min: Duration::from_millis(10),
+            backoff_max: Duration::from_millis(20),
+            ..Timing::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_stops_for_good_without_the_capability() {
+        let s = MockServer::start().await;
+        mount_platform(&s).await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/orgs/org-1/models/token"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(
+                serde_json::json!({"detail": "forbidden", "reason": "capability_missing"}),
+            ))
+            .mount(&s)
+            .await;
+        let h = Harness::new();
+        let local = closed_port();
+        h.connect(&s, |o| o.url = Some(local.clone()))
+            .await
+            .unwrap();
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let out = tokio::time::timeout(
+            Duration::from_secs(10),
+            serve(
+                h.home.path(),
+                &|_| None,
+                &h.store(),
+                no_commands(),
+                serve_timing(),
+                None,
+                rx,
+            ),
+        )
+        .await
+        .expect("serve ends")
+        .unwrap();
+        assert_eq!(out, Served::Stopped(Stop::MissingCapability));
+        assert_eq!(serve_exit_code(&out), 0);
+    }
+
+    #[tokio::test]
+    async fn serve_dials_the_tunnel_with_the_models_token() {
+        let gw = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gw_url = format!("ws://{}/acme/machine", gw.local_addr().unwrap());
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<Option<String>>();
+        tokio::spawn(async move {
+            let (tcp, _) = gw.accept().await.unwrap();
+            let mut seen = None;
+            #[allow(clippy::result_large_err)]
+            let cb = |req: &tokio_tungstenite::tungstenite::handshake::server::Request, resp| {
+                seen = req
+                    .headers()
+                    .get("authorization")
+                    .map(|v| v.to_str().unwrap().to_string());
+                Ok(resp)
+            };
+            let ws = tokio_tungstenite::accept_hdr_async(tcp, cb).await.unwrap();
+            let _ = seen_tx.send(seen);
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(ws);
+        });
+        let s = MockServer::start().await;
+        mount_platform(&s).await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/orgs/org-1/models/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "MT-1", "expires_in": 300, "url": gw_url,
+            })))
+            .mount(&s)
+            .await;
+        let h = Harness::new();
+        let local = closed_port();
+        h.connect(&s, |o| o.url = Some(local.clone()))
+            .await
+            .unwrap();
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let store = h.store();
+        let stopper = async {
+            let bearer = seen_rx.await.unwrap();
+            tx.send(true).unwrap();
+            bearer
+        };
+        let (out, bearer) = tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::join!(
+                serve(
+                    h.home.path(),
+                    &|_| None,
+                    &store,
+                    no_commands(),
+                    serve_timing(),
+                    None,
+                    rx
+                ),
+                stopper
+            )
+        })
+        .await
+        .expect("the tunnel is dialed and a stop signal ends serve");
+        assert_eq!(bearer.as_deref(), Some("Bearer MT-1"));
+        let out = out.unwrap();
+        assert_eq!(out, Served::Stopped(Stop::Shutdown));
     }
 
     #[tokio::test]

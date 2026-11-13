@@ -54,7 +54,8 @@ pub fn is_loopback_http(raw: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn is_loopback(url: &Url) -> bool {
+/// True when the URL's host is this computer (localhost or a loopback address).
+pub fn is_loopback(url: &Url) -> bool {
     match url.host() {
         Some(Host::Domain(d)) => {
             let d = d.trim_end_matches('.').to_ascii_lowercase();
