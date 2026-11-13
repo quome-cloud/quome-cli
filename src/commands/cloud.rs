@@ -50,7 +50,7 @@ pub async fn status(
     store: &dyn KeyStore,
 ) -> Result<(String, i32)> {
     let state = CloudState::load_from(home)?;
-    if state.profiles.is_empty() {
+    if !state.has_user_profiles() {
         let out = if json {
             serde_json::to_string_pretty(&serde_json::json!({"connected": false}))?
         } else {
@@ -107,7 +107,7 @@ pub async fn status(
 /// Delete the profile (and its key from `store`); returns the text to print.
 pub fn disconnect(home: &Path, profile: Option<&str>, store: &dyn KeyStore) -> Result<String> {
     let mut state = CloudState::load_from(home)?;
-    if state.profiles.is_empty() {
+    if !state.has_user_profiles() {
         return Ok(NOT_CONNECTED.to_string());
     }
     let name = profile.unwrap_or(&state.default).to_string();
@@ -115,7 +115,7 @@ pub fn disconnect(home: &Path, profile: Option<&str>, store: &dyn KeyStore) -> R
     store.delete(&name)?;
     state.profiles.remove(&name);
     if state.default == name {
-        state.default = state.profiles.keys().next().cloned().unwrap_or_default();
+        state.default = state.first_user_profile().unwrap_or_default();
     }
     state.save_to(home)?;
     Ok(format!(
@@ -277,5 +277,66 @@ mod tests {
         let st = CloudState::load_from(home.path()).unwrap();
         assert!(st.profiles.is_empty());
         assert!(st.default.is_empty());
+    }
+
+    /// Adds the model machine's profile (and key) beside whatever is saved.
+    fn add_machine(home: &Path, store: &FileStore) {
+        let mut st = CloudState::load_from(home).unwrap();
+        let mut p = st.profiles.values().next().cloned().unwrap_or_else(|| {
+            let d = tempfile::tempdir().unwrap();
+            let other = FileStore {
+                dir: d.path().to_path_buf(),
+            };
+            save(d.path(), "http://127.0.0.1:9", &other);
+            let loaded = CloudState::load_from(d.path()).unwrap();
+            loaded.profiles.values().next().cloned().unwrap()
+        });
+        p.agent_name = "machine".into();
+        st.profiles.insert("models".into(), p);
+        st.save_to(home).unwrap();
+        store.put("models", "machine-key").unwrap();
+    }
+
+    #[test]
+    fn disconnecting_the_default_never_falls_back_to_the_machine() {
+        let home = tempfile::tempdir().unwrap();
+        let store = FileStore {
+            dir: home.path().to_path_buf(),
+        };
+        save(home.path(), "http://127.0.0.1:9", &store);
+        add_machine(home.path(), &store);
+        disconnect(home.path(), None, &store).unwrap();
+        let st = CloudState::load_from(home.path()).unwrap();
+        assert!(st.profiles.contains_key("models"));
+        assert!(st.default.is_empty(), "{:?}", st.default);
+        assert!(store.get("models").is_ok());
+    }
+
+    #[tokio::test]
+    async fn only_the_machine_present_reads_as_not_connected() {
+        let home = tempfile::tempdir().unwrap();
+        let store = FileStore {
+            dir: home.path().to_path_buf(),
+        };
+        save(home.path(), "http://127.0.0.1:9", &store);
+        add_machine(home.path(), &store);
+        let mut st = CloudState::load_from(home.path()).unwrap();
+        st.profiles.remove("cloud");
+        st.default = String::new();
+        st.save_to(home.path()).unwrap();
+        let (out, code) = status(home.path(), None, true, &store).await.unwrap();
+        assert_eq!(code, 1);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&out).unwrap(),
+            serde_json::json!({"connected": false})
+        );
+        assert_eq!(
+            disconnect(home.path(), None, &store).unwrap(),
+            NOT_CONNECTED
+        );
+        assert!(CloudState::load_from(home.path())
+            .unwrap()
+            .profiles
+            .contains_key("models"));
     }
 }

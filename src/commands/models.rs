@@ -151,8 +151,6 @@ pub async fn connect(o: ConnectOpts, deps: &Deps<'_>) -> Result<Connected> {
         disconnect(&deps.home, deps.store, deps.say).await?;
     }
 
-    // `connect::run` makes the first profile the default; a machine never is.
-    let default_before = CloudState::load_from(&deps.home)?.default;
     let opts = Options {
         api_url: o.api_url,
         name: Some(o.name.unwrap_or_else(|| short_hostname(&deps.hostname))),
@@ -173,11 +171,6 @@ pub async fn connect(o: ConnectOpts, deps: &Deps<'_>) -> Result<Connected> {
         ),
         e => e,
     })?;
-    let mut st = CloudState::load_from(&deps.home)?;
-    if st.default != default_before {
-        st.default = default_before;
-        st.save_to(&deps.home)?;
-    }
     config::save(&cfg_path, &cfg)?;
     Ok(Connected {
         org_slug: out.profile.org_slug,
@@ -228,13 +221,14 @@ fn expiry_warning(expires_at: &str) -> Option<String> {
     if d > EXPIRY_WARN_DAYS {
         return None;
     }
-    let when = if d == 0 {
-        "has expired".to_string()
-    } else {
-        format!("expires in {d} day{}", if d == 1 { "" } else { "s" })
-    };
+    if d == 0 {
+        return Some(
+            "This machine's approval has expired — run `quome models connect --replace`.".into(),
+        );
+    }
     Some(format!(
-        "This machine's approval {when} — run `quome models connect --replace` before then"
+        "This machine's approval expires in {d} day{} — run `quome models connect --replace` before then",
+        if d == 1 { "" } else { "s" }
     ))
 }
 
@@ -245,7 +239,19 @@ pub async fn status(
     store: &dyn KeyStore,
     json: bool,
 ) -> Result<(String, i32)> {
-    let st = CloudState::load_from(home)?;
+    let st = match CloudState::load_from(home) {
+        Ok(st) => st,
+        Err(e) if json => {
+            return Ok((
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "connected": false, "api": null, "org": null, "server": null,
+                    "error": e.to_string(),
+                }))?,
+                0,
+            ))
+        }
+        Err(e) => return Err(e),
+    };
     let Some(p) = st.profiles.get(PROFILE).cloned() else {
         return Ok(if json {
             (
@@ -402,7 +408,7 @@ pub async fn disconnect(
     if report.was_connected {
         st.profiles.remove(PROFILE);
         if st.default == PROFILE {
-            st.default = st.profiles.keys().next().cloned().unwrap_or_default();
+            st.default = st.first_user_profile().unwrap_or_default();
         }
         st.save_to(home)?;
     }
@@ -920,5 +926,30 @@ mod tests {
             .await
             .unwrap();
         assert!(!r.was_connected);
+    }
+
+    #[tokio::test]
+    async fn status_json_survives_an_unreadable_state_file() {
+        let h = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(h.path().join(".quome")).unwrap();
+        std::fs::write(h.path().join(".quome/cloud.json"), "{not json").unwrap();
+        let store = config::key_store(h.path());
+        let (out, code) = status(h.path(), &|_| None, &store, true).await.unwrap();
+        assert_eq!(code, 0);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["connected"], false);
+        assert!(v["error"].as_str().is_some_and(|e| !e.is_empty()));
+        assert!(status(h.path(), &|_| None, &store, false).await.is_err());
+    }
+
+    #[test]
+    fn an_expired_approval_reads_plainly() {
+        let past = (chrono::Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+        let w = expiry_warning(&past).unwrap();
+        assert_eq!(
+            w,
+            "This machine's approval has expired — run `quome models connect --replace`."
+        );
+        assert!(!w.contains("before then"));
     }
 }

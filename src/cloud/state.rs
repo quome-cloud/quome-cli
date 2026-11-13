@@ -105,6 +105,20 @@ impl CloudState {
         write_private(&quome_dir(home).join("cloud.json"), &json)
     }
 
+    /// True when a profile other than the model machine's is saved.
+    pub fn has_user_profiles(&self) -> bool {
+        self.first_user_profile().is_some()
+    }
+
+    /// The first profile that is not the model machine's, which never serves as a
+    /// default or fallback for the commands that act as the user's agent.
+    pub fn first_user_profile(&self) -> Option<String> {
+        self.profiles
+            .keys()
+            .find(|k| k.as_str() != crate::machine::config::PROFILE)
+            .cloned()
+    }
+
     /// The named profile, or the default one when `name` is `None`.
     pub fn profile(&self, name: Option<&str>) -> Result<&Profile, QuomeError> {
         let name = match name {

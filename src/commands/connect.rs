@@ -462,7 +462,9 @@ pub async fn run(opts: Options, deps: &Deps<'_>) -> Result<Outcome> {
     key.store_in(deps.store, &profile_name, &cb.vrc)?;
     let mut st = CloudState::load_from(&deps.home)?;
     st.profiles.insert(profile_name.clone(), profile.clone());
-    if st.default.is_empty() || !opts.profile_given {
+    if opts.profile != crate::machine::config::PROFILE
+        && (st.default.is_empty() || !opts.profile_given)
+    {
         st.default = profile_name.clone();
     }
     st.save_to(&deps.home)?;
