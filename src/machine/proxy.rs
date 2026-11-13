@@ -59,8 +59,9 @@ pub fn local_client() -> reqwest::Client {
     reqwest::Client::builder()
         .no_proxy()
         .connect_timeout(CONNECT_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
-        .unwrap_or_default()
+        .expect("the local client builds")
 }
 
 /// Serve exactly one HTTP/1.1 request on `io` (keep-alive off), then return.
@@ -134,6 +135,18 @@ fn hop_by_hop(name: &HeaderName) -> bool {
         name.as_str(),
         "connection" | "keep-alive" | "te" | "trailer" | "transfer-encoding" | "upgrade"
     ) || name.as_str().starts_with("proxy-")
+}
+
+/// Header names the `Connection` header(s) list: they are hop-by-hop too
+/// (RFC 9110 section 7.6.1).
+fn connection_listed(headers: &HeaderMap) -> Vec<HeaderName> {
+    headers
+        .get_all(header::CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .filter_map(|t| HeaderName::from_bytes(t.trim().as_bytes()).ok())
+        .collect()
 }
 
 fn forwarded_request_header(name: &HeaderName) -> bool {
@@ -223,8 +236,9 @@ async fn handle(req: Request<Incoming>, st: Arc<ProxyState>) -> Response<ProxyBo
     );
 
     let mut headers = HeaderMap::new();
+    let listed = connection_listed(&parts.headers);
     for (name, value) in parts.headers.iter() {
-        if forwarded_request_header(name) {
+        if forwarded_request_header(name) && !listed.contains(name) {
             headers.append(name.clone(), value.clone());
         }
     }
@@ -280,8 +294,9 @@ async fn handle(req: Request<Incoming>, st: Arc<ProxyState>) -> Response<ProxyBo
     slot.status = status;
     let mut answer = Response::builder().status(status);
     if let Some(h) = answer.headers_mut() {
+        let listed = connection_listed(resp.headers());
         for (name, value) in resp.headers().iter() {
-            if !hop_by_hop(name) {
+            if !hop_by_hop(name) && !listed.contains(name) {
                 h.append(name.clone(), value.clone());
             }
         }
@@ -500,6 +515,53 @@ pub(crate) mod tests {
         assert_eq!(seen[0].url.query(), Some("x=1"));
         assert!(seen[0].headers.get("x-quome-request-token").is_none());
         assert!(seen[0].headers.get("authorization").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_local_redirect_is_passed_back_not_followed() {
+        let local = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", "/elsewhere"))
+            .mount(&local)
+            .await;
+        let st = state(&local.uri(), None, 4, true);
+        let (resp, _conn) = open(
+            st,
+            req("POST", "/v1/chat/completions", Some(&good("r-1")), CHAT),
+        )
+        .await;
+        assert_eq!(resp.status().as_u16(), 302);
+        assert_eq!(resp.headers()["location"], "/elsewhere");
+        assert_eq!(local.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn headers_named_in_connection_are_dropped_both_ways() {
+        let local = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("connection", "x-hop-out")
+                    .insert_header("x-hop-out", "1")
+                    .insert_header("x-keep-out", "1"),
+            )
+            .mount(&local)
+            .await;
+        let st = state(&local.uri(), None, 4, true);
+        let mut r = req("POST", "/v1/chat/completions", Some(&good("r-1")), CHAT);
+        r.headers_mut()
+            .insert("connection", "x-hop-in, close".parse().unwrap());
+        r.headers_mut().insert("x-hop-in", "1".parse().unwrap());
+        r.headers_mut().insert("x-keep-in", "1".parse().unwrap());
+        let (resp, _conn) = open(st, r).await;
+        assert_eq!(resp.status().as_u16(), 200);
+        assert!(resp.headers().get("x-hop-out").is_none());
+        assert_eq!(resp.headers()["x-keep-out"], "1");
+        let seen = local.received_requests().await.unwrap();
+        assert!(seen[0].headers.get("x-hop-in").is_none());
+        assert!(seen[0].headers.get("x-keep-in").is_some());
     }
 
     #[tokio::test]

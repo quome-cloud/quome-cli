@@ -21,8 +21,9 @@ pub struct Probe {
 pub fn client() -> reqwest::Client {
     reqwest::Client::builder()
         .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .build()
-        .unwrap_or_default()
+        .expect("the probe client builds")
 }
 
 /// "0.13.3" and "1.0.0-rc1" parse; a pre-release or build suffix is ignored.
@@ -135,6 +136,19 @@ mod tests {
             max_concurrency: 4,
             api_key_file: None,
         }
+    }
+
+    #[tokio::test]
+    async fn the_probe_client_does_not_follow_redirects() {
+        let s = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/a"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", "/b"))
+            .mount(&s)
+            .await;
+        let r = client().get(format!("{}/a", s.uri())).send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 302);
+        assert_eq!(s.received_requests().await.unwrap().len(), 1);
     }
 
     async fn ollama(s: &MockServer, version: &str, tags_status: u16) {
