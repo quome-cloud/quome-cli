@@ -990,7 +990,16 @@ mod tests {
             .unwrap();
         assert!(text.contains("healthy, 2 models"), "{text}");
 
-        drop(local);
+        // Nothing listens on a port that was bound and released. (Dropping the mock
+        // server does not stop it synchronously, so it cannot stand in for "down".)
+        let closed = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", l.local_addr().unwrap())
+        };
+        let cfg_path = config::config_path(h.home.path(), &|_| None);
+        let mut c = config::load(&cfg_path).unwrap();
+        c.url = closed;
+        config::save(&cfg_path, &c).unwrap();
         let (out, code) = status(h.home.path(), &|_| None, &h.store(), true)
             .await
             .unwrap();
