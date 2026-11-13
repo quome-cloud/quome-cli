@@ -28,7 +28,7 @@ pub async fn execute(args: Args) -> Result<()> {
     let state = CloudState::load()?;
     let profile = match state.profile(args.profile.as_deref()) {
         Ok(p) => p.clone(),
-        Err(_) if state.profiles.is_empty() => {
+        Err(_) if !state.has_user_profiles() => {
             return Err(QuomeError::CloudState(
                 crate::commands::cloud::NOT_CONNECTED.into(),
             ))

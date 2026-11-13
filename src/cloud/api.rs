@@ -131,6 +131,44 @@ impl std::fmt::Debug for McpToken {
     }
 }
 
+/// A short-lived token for the org's model gateway, with the gateway's
+/// tunnel endpoint when the platform sends one.
+#[derive(Clone, Deserialize, PartialEq)]
+pub struct ModelsToken {
+    pub access_token: String,
+    /// Seconds; a missing or null value means "do not cache".
+    #[serde(default, deserialize_with = "seconds_or_zero")]
+    pub expires_in: u64,
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+/// Never prints the token itself.
+impl std::fmt::Debug for ModelsToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelsToken")
+            .field("access_token", &"<redacted>")
+            .field("expires_in", &self.expires_in)
+            .field("url", &self.url)
+            .finish()
+    }
+}
+
+/// What the platform knows about this machine.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct MachineSelf {
+    pub id: String,
+    pub name: String,
+    pub state: String,
+    pub connected: bool,
+    #[serde(default)]
+    pub since: Option<String>,
+    #[serde(default)]
+    pub delegation_expires_at: Option<String>,
+    #[serde(default)]
+    pub approved_by: Option<String>,
+}
+
 /// Which way an agent reaches the org's tools.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrontDoor {
@@ -957,6 +995,17 @@ impl CloudApi {
         path: &str,
         build: impl Fn(RequestBuilder) -> RequestBuilder,
     ) -> Result<T, QuomeError> {
+        self.send_git_mapping(m, path, build, map_error).await
+    }
+
+    /// `send_git` with a custom mapping of the other error answers.
+    async fn send_git_mapping<T: serde::de::DeserializeOwned>(
+        &self,
+        m: Method,
+        path: &str,
+        build: impl Fn(RequestBuilder) -> RequestBuilder,
+        map: fn(u16, &str) -> QuomeError,
+    ) -> Result<T, QuomeError> {
         let resp = self
             .send_raw(m, path, |b| build(b.timeout(GIT_REQUEST_TIMEOUT)))
             .await?;
@@ -975,7 +1024,7 @@ impl CloudApi {
                 e => e,
             });
         }
-        Ok(check(resp, map_error).await?.json().await?)
+        Ok(check(resp, map).await?.json().await?)
     }
 
     /// The platform's API base URL.
@@ -1494,6 +1543,38 @@ impl CloudApi {
             b.json(&body)
         })
         .await
+    }
+
+    /// A token for the org's model gateway. Like `mcp_token` it takes the long
+    /// timeout and keeps a 503's `Retry-After`; other refusals keep their
+    /// status and `reason`.
+    pub async fn models_token(&self) -> Result<ModelsToken, QuomeError> {
+        let body = serde_json::json!({});
+        self.send_git_mapping(
+            Method::POST,
+            &self.org_path("/models/token"),
+            |b| b.json(&body),
+            map_error_with_reason,
+        )
+        .await
+    }
+
+    /// This machine's record on the platform.
+    pub async fn models_machine_self(&self) -> Result<MachineSelf, QuomeError> {
+        let p = self.org_path("/models/machines/me");
+        Ok(self
+            .send_mapping(Method::GET, &p, |b| b, map_error_with_reason)
+            .await?
+            .json()
+            .await?)
+    }
+
+    /// Revoke this machine on the platform.
+    pub async fn models_machine_revoke(&self) -> Result<(), QuomeError> {
+        let p = self.org_path("/models/machines/me");
+        self.send_mapping(Method::DELETE, &p, |b| b, map_error_with_reason)
+            .await?;
+        Ok(())
     }
 
     /// How this org's agents reach its tools.
@@ -3246,6 +3327,69 @@ mod tests {
         api.create_credential_request(&serde_json::json!({"provider_id": "p"}))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn models_token_shapes() {
+        let (s, api) = setup().await;
+        let route = format!("/api/v1/orgs/{ORG}/models/token");
+        Mock::given(method("POST"))
+            .and(path(route.clone()))
+            .and(body_json(serde_json::json!({})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "MODELSECRET", "expires_in": 300, "url": "wss://gw.test/tunnel"
+            })))
+            .up_to_n_times(1)
+            .mount(&s)
+            .await;
+        let t = api.models_token().await.unwrap();
+        assert_eq!(
+            (t.access_token.as_str(), t.expires_in, t.url.as_deref()),
+            ("MODELSECRET", 300, Some("wss://gw.test/tunnel"))
+        );
+        assert!(!format!("{t:?}").contains("MODELSECRET"));
+
+        Mock::given(method("POST"))
+            .and(path(route.clone()))
+            .respond_with(ResponseTemplate::new(403).set_body_json(
+                serde_json::json!({"detail":"forbidden","reason":"capability_missing"}),
+            ))
+            .up_to_n_times(1)
+            .mount(&s)
+            .await;
+        match api.models_token().await.unwrap_err() {
+            QuomeError::ApiRefused { status, reason, .. } => {
+                assert_eq!((status, reason.as_str()), (403, "capability_missing"))
+            }
+            e => panic!("{e:?}"),
+        }
+
+        Mock::given(method("POST"))
+            .and(path(route.clone()))
+            .respond_with(ResponseTemplate::new(401).set_body_json(
+                serde_json::json!({"detail":"unauthorized","reason":"delegation_revoked"}),
+            ))
+            .up_to_n_times(1)
+            .mount(&s)
+            .await;
+        assert!(matches!(
+            api.models_token().await.unwrap_err(),
+            QuomeError::CloudDisconnected
+        ));
+
+        Mock::given(method("POST"))
+            .and(path(route))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .insert_header("Retry-After", "7")
+                    .set_body_json(serde_json::json!({"detail":"unavailable"})),
+            )
+            .mount(&s)
+            .await;
+        match api.models_token().await.unwrap_err() {
+            QuomeError::RetryLater { retry_after, .. } => assert_eq!(retry_after, Some(7)),
+            e => panic!("{e:?}"),
+        }
     }
 
     #[tokio::test]

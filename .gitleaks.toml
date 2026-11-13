@@ -1,0 +1,10 @@
+# gitleaks configuration: the default rules, plus false positives, one entry each with its reason.
+[extend]
+useDefault = true
+
+# Protocol test vectors for the machine tunnel. The JWS tokens in this file are signed with the
+# public RFC 8032 test key and grant nothing; the file is byte-pinned by its
+# sha256 in the tests, so it cannot be edited to dodge the scanner.
+[[allowlists]]
+description = "machine tunnel test vectors (RFC 8032 test-key signatures)"
+paths = ['''^tests/vectors/models-tunnel-v1\.json$''']

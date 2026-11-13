@@ -95,9 +95,11 @@ pub fn pick_profile<'a>(
             None
         }
     };
+    // The model machine's profile is never a candidate unless named with `only`.
     let found: Vec<(&String, &Profile, CredTarget)> = state
         .profiles
         .iter()
+        .filter(|(n, _)| only.is_some() || n.as_str() != crate::machine::config::PROFILE)
         .filter(|(n, _)| only.is_none_or(|(name, _)| n.as_str() == name))
         .filter_map(|(n, p)| target_of(p).map(|t| (n, p, t)))
         .filter(|(_, p, _)| org.is_none_or(|o| p.org_slug == o))
@@ -293,6 +295,31 @@ mod tests {
         .unwrap();
         assert_eq!(name, "work");
         assert!(pick_profile(&st, &req("https", "git.apps.example", None), Some("nope")).is_err());
+    }
+
+    #[test]
+    fn the_machine_profile_is_never_a_candidate() {
+        let mut st = CloudState {
+            default: "cloud".into(),
+            ..Default::default()
+        };
+        st.profiles
+            .insert("cloud".into(), profile("http://127.0.0.1:9"));
+        let alone = pick_profile(&st, &req("https", "git.apps.example", None), None)
+            .unwrap()
+            .unwrap()
+            .0;
+        st.profiles
+            .insert("models".into(), profile("http://127.0.0.1:9"));
+        // No default set: the machine must not make the host ambiguous.
+        st.default = String::new();
+        let with = pick_profile(&st, &req("https", "git.apps.example", None), None)
+            .unwrap()
+            .unwrap()
+            .0;
+        assert_eq!((alone.as_str(), with.as_str()), ("cloud", "cloud"));
+        let egress = pick_profile(&st, &req("https", "git.apps.example", Some("o/x")), None);
+        assert!(egress.is_ok());
     }
 
     #[test]

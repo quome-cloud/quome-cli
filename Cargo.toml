@@ -18,7 +18,7 @@ tokio = { version = "1", features = ["full"] }
 
 # HTTP client
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
-futures-util = { version = "0.3", default-features = false }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -43,19 +43,31 @@ uuid = { version = "1.0", features = ["serde", "v4"] }
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 base64 = "0.22"
+http = "1"
 bytes = "1.11.1"
 percent-encoding = "2"
 url = "2"
+toml = "1"
 tiny_http = "0.12"
 gethostname = "0.5"
 tar = { version = "0.4", default-features = false }
 tempfile = "3"
 rmcp = { version = "3.8", default-features = false, features = ["server", "macros", "transport-io"] }
 schemars = "1"
+# Machine agent (quome models serve): WebSocket tunnel, yamux, one HTTP/1.1 request per stream
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1"
+yamux = "0.14"
+tokio-util = { version = "0.7", features = ["compat"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 
 [dev-dependencies]
 wiremock = "0.6"
 tokio = { version = "1", features = ["test-util"] }
+hyper = { version = "1", features = ["client"] }
 
 [profile.release]
 lto = "fat"
