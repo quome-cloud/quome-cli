@@ -107,6 +107,10 @@ pub struct Options {
     pub no_mcp: bool,
     /// Clients to set up; empty means every installed client.
     pub clients: Vec<ClientId>,
+    /// Capabilities to ask for; empty means the console's default set.
+    pub scopes: Vec<String>,
+    /// Organization the approval must be for; `None` accepts whichever is approved.
+    pub org: Option<String>,
 }
 
 #[derive(Debug)]
@@ -214,10 +218,22 @@ fn new_state() -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-pub fn connect_url(console: &str, name: &str, key: &AgentKey, port: u16, state: &str) -> String {
+/// Like `NON_ALPHANUMERIC`, but keeps `_`, `-` and `.` readable (scope names, org slugs).
+const READABLE: &percent_encoding::AsciiSet =
+    &NON_ALPHANUMERIC.remove(b'_').remove(b'-').remove(b'.');
+
+pub fn connect_url(
+    console: &str,
+    name: &str,
+    key: &AgentKey,
+    port: u16,
+    state: &str,
+    scopes: &[String],
+    org: Option<&str>,
+) -> String {
     let e = |s: &str| utf8_percent_encode(s, NON_ALPHANUMERIC).to_string();
     let jkt = key.jkt();
-    format!(
+    let mut url = format!(
         "{console}/connect?name={}&x={}&kid={}&jkt={}&port={}&state={}",
         e(name),
         e(&key.x_b64()),
@@ -225,7 +241,17 @@ pub fn connect_url(console: &str, name: &str, key: &AgentKey, port: u16, state: 
         e(&jkt),
         port,
         e(state)
-    )
+    );
+    if !scopes.is_empty() {
+        url.push_str(&format!(
+            "&scope={}",
+            utf8_percent_encode(&scopes.join(" "), READABLE)
+        ));
+    }
+    if let Some(org) = org {
+        url.push_str(&format!("&org={}", utf8_percent_encode(org, READABLE)));
+    }
+    url
 }
 
 #[cfg(test)]
@@ -371,7 +397,15 @@ pub async fn run(opts: Options, deps: &Deps<'_>) -> Result<Outcome> {
     let jkt = key.jkt();
     let state = new_state();
     let listener = Listener::bind()?;
-    let url = connect_url(&console, &name, &key, listener.port(), &state);
+    let url = connect_url(
+        &console,
+        &name,
+        &key,
+        listener.port(),
+        &state,
+        &opts.scopes,
+        opts.org.as_deref(),
+    );
 
     (deps.say)(&format!("Key fingerprint: {}", fingerprint(&jkt)));
     (deps.say)(&format!("Opening {url}"));
@@ -412,6 +446,15 @@ pub async fn run(opts: Options, deps: &Deps<'_>) -> Result<Outcome> {
         .orgs
         .first()
         .ok_or_else(|| QuomeError::Usage("This agent has no Quome Cloud organization.".into()))?;
+    if let Some(want) = opts.org.as_deref() {
+        if org.slug != want {
+            return Err(QuomeError::Usage(format!(
+                "This approval is for organization \"{}\", not \"{want}\". \
+                 Run the command again and choose \"{want}\" on the approval page.",
+                org.slug
+            )));
+        }
+    }
     profile.org_id = org.id.clone();
     profile.org_slug = org.slug.clone();
     profile.apps_domain = me.apps_domain;
@@ -699,6 +742,8 @@ pub async fn execute(args: Args) -> Result<()> {
         issuer: args.issuer,
         no_mcp: args.no_mcp,
         clients: args.client,
+        scopes: vec![],
+        org: None,
     };
     let out = run(opts, &deps).await?;
     let p = &out.profile;
@@ -792,7 +837,7 @@ mod tests {
     #[test]
     fn connect_url_encodes_every_value() {
         let k = AgentKey::generate();
-        let u = connect_url("https://console.x", "A&B c=d/é", &k, 4242, "st");
+        let u = connect_url("https://console.x", "A&B c=d/é", &k, 4242, "st", &[], None);
         assert!(u.starts_with("https://console.x/connect?name=A%26B%20c%3Dd%2F%C3%A9&x="));
         let parsed = reqwest::Url::parse(&u).unwrap();
         let q: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
@@ -802,6 +847,47 @@ mod tests {
         assert_eq!(q["jkt"], k.jkt());
         assert_eq!(q["port"], "4242");
         assert_eq!(q["state"], "st");
+    }
+
+    #[test]
+    fn connect_url_unchanged_without_scopes() {
+        let k = AgentKey::generate();
+        let jkt = k.jkt();
+        let want = format!(
+            "https://console.x/connect?name=mac&x={}&kid={}&jkt={}&port=4242&state=st",
+            utf8_percent_encode(&k.x_b64(), NON_ALPHANUMERIC),
+            utf8_percent_encode(&jkt, NON_ALPHANUMERIC),
+            utf8_percent_encode(&jkt, NON_ALPHANUMERIC),
+        );
+        assert_eq!(
+            connect_url("https://console.x", "mac", &k, 4242, "st", &[], None),
+            want
+        );
+    }
+
+    #[test]
+    fn connect_url_carries_requested_scopes_and_org() {
+        let k = AgentKey::generate();
+        let u = connect_url(
+            "https://console.x",
+            "mac",
+            &k,
+            4242,
+            "st",
+            &["models_serve".to_string()],
+            Some("acme"),
+        );
+        assert!(u.ends_with("&scope=models_serve&org=acme"), "{u}");
+        let two = connect_url(
+            "https://console.x",
+            "mac",
+            &k,
+            4242,
+            "st",
+            &["a_b".to_string(), "c".to_string()],
+            None,
+        );
+        assert!(two.ends_with("&scope=a_b%20c"), "{two}");
     }
 
     #[test]
@@ -915,6 +1001,8 @@ mod tests {
             issuer: Some(server.uri()),
             no_mcp: false,
             clients: vec![],
+            scopes: vec![],
+            org: None,
         }
     }
 
@@ -1130,6 +1218,29 @@ mod tests {
             .profiles
             .is_empty());
         assert!(h.claude.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_refuses_an_approval_for_another_org() {
+        let s = MockServer::start().await;
+        mount_auth(&s).await;
+        mount_me(&s, 0).await;
+        let h = Harness::new(ran(true));
+        let mut o = opts(&s, "models");
+        o.org = Some("other".into());
+        let err = h
+            .connect(o, "del-1", "mac", Duration::from_millis(10))
+            .await
+            .unwrap_err();
+        match err {
+            QuomeError::Usage(m) => {
+                assert!(m.contains("\"acme\""), "{m}");
+                assert!(m.contains("\"other\""), "{m}");
+            }
+            e => panic!("expected Usage, got {e:?}"),
+        }
+        assert!(!h.home.path().join(".quome/cloud.json").exists());
+        assert!(!h.home.path().join(".quome/cloud-models.key").exists());
     }
 
     #[tokio::test]
