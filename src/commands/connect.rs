@@ -380,6 +380,20 @@ async fn me_with_retry(
     }
 }
 
+/// Best effort: delete the machine record the just-issued delegation made in
+/// organization `org_id`. True only when the platform confirmed.
+async fn withdraw_machine(profile: &Profile, mem: &MemStore, name: &str, org_id: &str) -> bool {
+    let Ok((key, vrc)) = AgentKey::load_from(mem, name) else {
+        return false;
+    };
+    let mut p = profile.clone();
+    p.org_id = org_id.to_string();
+    CloudApi::new(&p, TokenSource::new(&p, key, vrc))
+        .models_machine_revoke()
+        .await
+        .is_ok()
+}
+
 pub async fn run(opts: Options, deps: &Deps<'_>) -> Result<Outcome> {
     let api_url = crate::url_policy::validate_api_url(&opts.api_url, "API URL")?;
     let console = console_url(&api_url, opts.console.as_deref());
@@ -448,10 +462,19 @@ pub async fn run(opts: Options, deps: &Deps<'_>) -> Result<Outcome> {
         .ok_or_else(|| QuomeError::Usage("This agent has no Quome Cloud organization.".into()))?;
     if let Some(want) = opts.org.as_deref() {
         if org.slug != want {
+            // The approval is live in the other org: for a machine, withdraw
+            // it (best effort; the token is only used, never shown).
+            let withdrawn = opts.scopes == ["models_serve"]
+                && withdraw_machine(&profile, &mem, &profile_name, &org.id).await;
             return Err(QuomeError::Usage(format!(
                 "This approval is for organization \"{}\", not \"{want}\". \
-                 Run the command again and choose \"{want}\" on the approval page.",
-                org.slug
+                 {}Run the command again and choose \"{want}\" on the approval page.",
+                org.slug,
+                if withdrawn {
+                    "The approval was withdrawn. "
+                } else {
+                    ""
+                }
             )));
         }
     }
@@ -1243,6 +1266,59 @@ mod tests {
         }
         assert!(!h.home.path().join(".quome/cloud.json").exists());
         assert!(!h.home.path().join(".quome/cloud-models.key").exists());
+    }
+
+    #[tokio::test]
+    async fn a_machine_approval_for_another_org_is_withdrawn() {
+        let s = MockServer::start().await;
+        mount_auth(&s).await;
+        mount_me(&s, 0).await;
+        Mock::given(method("DELETE"))
+            .and(path("/api/v1/orgs/org-1/models/machines/me"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let h = Harness::new(ran(true));
+        let mut o = opts(&s, "models");
+        o.org = Some("other".into());
+        o.scopes = vec!["models_serve".into()];
+        let err = h
+            .connect(o, "del-1", "mac", Duration::from_millis(10))
+            .await
+            .unwrap_err();
+        match err {
+            QuomeError::Usage(m) => {
+                assert!(m.contains("The approval was withdrawn."), "{m}");
+                assert!(!m.contains("AT"), "{m}");
+            }
+            e => panic!("expected Usage, got {e:?}"),
+        }
+        assert!(!h.home.path().join(".quome/cloud.json").exists());
+        assert!(!h.home.path().join(".quome/cloud-models.key").exists());
+    }
+
+    #[tokio::test]
+    async fn a_failed_withdrawal_still_refuses_and_stays_quiet() {
+        let s = MockServer::start().await;
+        mount_auth(&s).await;
+        mount_me(&s, 0).await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&s)
+            .await;
+        let h = Harness::new(ran(true));
+        let mut o = opts(&s, "models");
+        o.org = Some("other".into());
+        o.scopes = vec!["models_serve".into()];
+        match h
+            .connect(o, "del-1", "mac", Duration::from_millis(10))
+            .await
+            .unwrap_err()
+        {
+            QuomeError::Usage(m) => assert!(!m.contains("withdrawn"), "{m}"),
+            e => panic!("expected Usage, got {e:?}"),
+        }
     }
 
     #[tokio::test]
