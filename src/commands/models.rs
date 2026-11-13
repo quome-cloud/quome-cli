@@ -288,6 +288,19 @@ pub async fn status(
         Err(e) => serde_json::json!({ "error": e.to_string() }),
     };
 
+    // The local server's view; a failure is a fact, never an error.
+    let local: serde_json::Value = match &cfg {
+        Ok(c) => {
+            let pr = crate::machine::probe::probe(&crate::machine::probe::client(), c).await;
+            serde_json::json!({
+                "server": c.server.name(), "url": c.url, "healthy": pr.healthy,
+                "models": pr.models.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+                "responses_supported": pr.responses_supported,
+            })
+        }
+        Err(_) => serde_json::Value::Null,
+    };
+
     if json {
         let (server, conf) = match &cfg {
             Ok(c) => (
@@ -315,6 +328,7 @@ pub async fn status(
             "key_file_mode": mode,
             "service_installed": installed,
             "remote": remote,
+            "local": local,
         });
         return Ok((serde_json::to_string_pretty(&v)?, 0));
     }
@@ -334,6 +348,19 @@ pub async fn status(
             c.max_concurrency
         )),
         Err(e) => out.push_str(&format!("\n  Config:  {e}")),
+    }
+    if let Some(l) = local.as_object() {
+        let n = l["models"].as_array().map_or(0, Vec::len);
+        out.push_str(&format!(
+            "\n  Local server: {} at {} — {}",
+            l["server"].as_str().unwrap_or(""),
+            l["url"].as_str().unwrap_or(""),
+            if l["healthy"].as_bool() == Some(true) {
+                format!("healthy, {n} model{}", if n == 1 { "" } else { "s" })
+            } else {
+                "not answering".to_string()
+            }
+        ));
     }
     out.push_str(&format!(
         "\n  Key:     {}\n  Service: {}",
@@ -926,6 +953,50 @@ mod tests {
             .await
             .unwrap();
         assert!(!r.was_connected);
+    }
+
+    #[tokio::test]
+    async fn status_reports_the_local_server() {
+        let s = MockServer::start().await;
+        mount_platform(&s).await;
+        let local = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"data": [{"id": "m1"}, {"id": "m2"}]})),
+            )
+            .mount(&local)
+            .await;
+        let h = Harness::new();
+        h.connect(&s, |o| {
+            o.server = Some(ServerKind::Vllm);
+            o.url = Some(local.uri());
+        })
+        .await
+        .unwrap();
+        let (out, code) = status(h.home.path(), &|_| None, &h.store(), true)
+            .await
+            .unwrap();
+        assert_eq!(code, 0);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v["local"],
+            serde_json::json!({"server": "vllm", "url": local.uri(), "healthy": true,
+                "models": ["m1", "m2"], "responses_supported": true})
+        );
+        let (text, _) = status(h.home.path(), &|_| None, &h.store(), false)
+            .await
+            .unwrap();
+        assert!(text.contains("healthy, 2 models"), "{text}");
+
+        drop(local);
+        let (out, code) = status(h.home.path(), &|_| None, &h.store(), true)
+            .await
+            .unwrap();
+        assert_eq!(code, 0);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["local"]["healthy"], false);
     }
 
     #[tokio::test]
