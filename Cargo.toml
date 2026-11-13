@@ -54,10 +54,15 @@ tar = { version = "0.4", default-features = false }
 tempfile = "3"
 rmcp = { version = "3.8", default-features = false, features = ["server", "macros", "transport-io"] }
 schemars = "1"
+# Machine agent (quome models serve): one HTTP/1.1 request per tunnel stream
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 
 [dev-dependencies]
 wiremock = "0.6"
 tokio = { version = "1", features = ["test-util"] }
+hyper = { version = "1", features = ["client"] }
 
 [profile.release]
 lto = "fat"
