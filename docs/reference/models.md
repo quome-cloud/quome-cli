@@ -1,6 +1,6 @@
 # Models: `models`
 
-> **Quome Cloud only.** `quome models` lets this computer serve its local models (Ollama, vLLM, llama.cpp, MLX or Quexo) to your organization through the platform's gateway. macOS only in packaged releases; Linux via `cargo install`.
+> **Quome Cloud only.** `quome models` lets this computer serve its local models (Ollama, vLLM, llama.cpp or MLX) to your organization through the platform's gateway. macOS only in packaged releases; Linux via `cargo install`.
 
 **Trust boundary.** Whoever controls this machine can read the prompts sent to it.
 
@@ -123,7 +123,8 @@ Options:
 
 | Code | Meaning |
 |------|---------|
-| 0 | Stopped for good: not connected, revoked or disconnected, or a stop signal |
+| 0 | Stopped for good: not connected, revoked or disconnected, or a stop signal (a profile whose key file is missing counts as not connected) |
+| 1 | Configuration error (the service retries every 10 s; fix `models.toml` or run `quome models connect --replace`) |
 | 3 | The binary was upgraded; the service manager starts the new one |
 
 The service restarts only after a failure (launchd `KeepAlive` with `SuccessfulExit` false; systemd `Restart=on-failure`), so exit 0 stays stopped and exit 3 restarts into the upgraded binary.

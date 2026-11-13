@@ -522,15 +522,31 @@ pub async fn serve(
     let Some(p) = st.profiles.get(PROFILE).cloned() else {
         return Ok(Served::NotConnected);
     };
-    let cfg = config::load(&config::config_path(home, env))?;
+    // A profile without its key file is as good as not connected: nothing a
+    // restart could fix, so stop for good rather than loop under the service.
+    if !crate::cloud::state::quome_dir(home)
+        .join(format!("cloud-{PROFILE}.key"))
+        .exists()
+    {
+        return Ok(Served::NotConnected);
+    }
+    let local_config = |e: QuomeError| {
+        QuomeError::Usage(format!(
+            "{e}. Fix models.toml or run `quome models connect --replace` \
+             (the service retries every 10 s)."
+        ))
+    };
+    let cfg = config::load(&config::config_path(home, env)).map_err(local_config)?;
+    let local = config::validate_local_url(&cfg.url).map_err(local_config)?;
+    let local_auth = local_auth(&cfg).map_err(local_config)?;
     let Some(api) = api_for(home, store)? else {
         return Ok(Served::NotConnected);
     };
     let api = Arc::new(api);
     let state = Arc::new(proxy::ProxyState {
         verifier: tokio::sync::Mutex::new(None),
-        local: config::validate_local_url(&cfg.url)?,
-        local_auth: local_auth(&cfg)?,
+        local,
+        local_auth,
         client: proxy::local_client(),
         slots: tokio::sync::Semaphore::new(cfg.max_concurrency as usize),
         responses_supported: std::sync::atomic::AtomicBool::new(false),
@@ -1101,6 +1117,27 @@ mod tests {
             },
         );
         st.save_to(home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_with_a_profile_but_no_key_file_is_not_connected() {
+        let h = tempfile::tempdir().unwrap();
+        write_profile(h.path(), "2099-01-01T00:00:00Z");
+        let store = config::key_store(h.path());
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let out = serve(
+            h.path(),
+            &|_| None,
+            &store,
+            no_commands(),
+            Timing::default(),
+            None,
+            rx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, Served::NotConnected);
+        assert_eq!(serve_exit_code(&out), 0);
     }
 
     #[tokio::test]
