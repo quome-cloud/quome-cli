@@ -19,8 +19,8 @@ pub const DEFAULT_API_URL: &str = "https://api.quome.cloud";
 pub const DEFAULT_PROFILE: &str = "cloud";
 /// The identity service's limit on an agent's display name.
 pub const MAX_NAME: usize = 64;
-const RETRY_INTERVAL: Duration = Duration::from_secs(2);
-const RETRY_TOTAL: Duration = Duration::from_secs(60);
+pub(crate) const RETRY_INTERVAL: Duration = Duration::from_secs(2);
+pub(crate) const RETRY_TOTAL: Duration = Duration::from_secs(60);
 
 #[derive(Parser)]
 pub struct Args {
@@ -64,8 +64,8 @@ pub trait ClaudeRunner {
     fn run(&self, args: &[String]) -> ClaudeResult;
 }
 
-struct RealClaude {
-    program: String,
+pub(crate) struct RealClaude {
+    pub(crate) program: String,
 }
 
 impl ClaudeRunner for RealClaude {
@@ -326,7 +326,7 @@ pub fn mcp_config_json_for(program: &str, profile: &str) -> String {
     .to_string()
 }
 
-fn open_browser(url: &str) -> std::io::Result<()> {
+pub(crate) fn open_browser(url: &str) -> std::io::Result<()> {
     let program = if cfg!(target_os = "macos") {
         "open"
     } else {

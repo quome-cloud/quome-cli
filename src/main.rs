@@ -106,6 +106,11 @@ enum Commands {
         #[command(subcommand)]
         command: commands::skills::SkillsCommands,
     },
+    /// Serve this computer's local models to your organization
+    Models {
+        #[command(subcommand)]
+        command: commands::models::ModelsCommands,
+    },
     /// Inspect or drop this computer's Quome Cloud connection
     Cloud {
         #[command(subcommand)]
@@ -126,7 +131,12 @@ impl Commands {
     fn starts_update_check(&self) -> bool {
         !matches!(
             self,
-            Commands::GitCredential(_) | Commands::Upgrade | Commands::AutoUpdate
+            Commands::GitCredential(_)
+                | Commands::Upgrade
+                | Commands::AutoUpdate
+                | Commands::Models {
+                    command: commands::models::ModelsCommands::Serve { .. }
+                }
         )
     }
 
@@ -134,7 +144,12 @@ impl Commands {
     fn shows_update_notice(&self) -> bool {
         !matches!(
             self,
-            Commands::Mcp(_) | Commands::GitCredential(_) | Commands::AutoUpdate
+            Commands::Mcp(_)
+                | Commands::GitCredential(_)
+                | Commands::AutoUpdate
+                | Commands::Models {
+                    command: commands::models::ModelsCommands::Serve { .. }
+                }
         )
     }
 }
@@ -168,6 +183,7 @@ async fn main() {
         Commands::Connect(args) => commands::connect::execute(args).await,
         Commands::Mcp(args) => commands::mcp::execute(args).await,
         Commands::Skills { command } => commands::skills::execute(command).await,
+        Commands::Models { command } => commands::models::execute(command).await,
         Commands::Cloud { command } => commands::cloud::execute(command).await,
         Commands::GitCredential(args) => commands::git_credential::execute(args).await,
         Commands::Upgrade => commands::upgrade::execute().await,
@@ -223,5 +239,34 @@ mod tests {
         let whoami = command(&["whoami"]);
         assert!(whoami.starts_update_check());
         assert!(whoami.shows_update_notice());
+    }
+
+    #[test]
+    fn serve_has_no_update_check() {
+        let serve = command(&["models", "serve"]);
+        assert!(!serve.starts_update_check());
+        assert!(!serve.shows_update_notice());
+        // The other machine commands are ordinary.
+        for args in [&["models", "status"][..], &["models", "disconnect"]] {
+            let c = command(args);
+            assert!(c.starts_update_check() && c.shows_update_notice());
+        }
+        // Every pre-existing predicate is unchanged.
+        let table: [(&[&str], bool, bool); 6] = [
+            (&["mcp"], true, false),
+            (&["git-credential", "get"], false, false),
+            (&["__auto-update"], false, false),
+            (&["whoami"], true, true),
+            (&["upgrade"], false, true),
+            (&["connect"], true, true),
+        ];
+        for (args, starts, shows) in table {
+            let c = command(args);
+            assert_eq!(
+                (c.starts_update_check(), c.shows_update_notice()),
+                (starts, shows),
+                "{args:?}"
+            );
+        }
     }
 }

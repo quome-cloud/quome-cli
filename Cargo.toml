@@ -47,6 +47,7 @@ http = "1"
 bytes = "1.11.1"
 percent-encoding = "2"
 url = "2"
+toml = "1"
 tiny_http = "0.12"
 gethostname = "0.5"
 tar = { version = "0.4", default-features = false }
