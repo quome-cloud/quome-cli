@@ -5,6 +5,9 @@ mod cloud;
 mod commands;
 mod config;
 mod errors;
+// Later commits wire the machine agent into the CLI; until then nothing calls it.
+#[allow(dead_code)]
+mod machine;
 mod manifest;
 mod settings;
 mod ui;

@@ -1542,6 +1542,7 @@ dependencies = [
  "ed25519-dalek",
  "futures-util",
  "gethostname",
+ "http",
  "indicatif",
  "inquire",
  "keyring",

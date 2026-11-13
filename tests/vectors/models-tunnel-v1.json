@@ -1,0 +1,167 @@
+{
+  "version": 1,
+  "description": "Test vectors for the models tunnel: control-stream lines, adverts and the per-request token. Both ends commit this file byte-for-byte.",
+  "control_frames": [
+    {
+      "name": "hello",
+      "from": "machine",
+      "line": "{\"type\":\"hello\",\"agent_version\":\"0.3.0\",\"advert\":{\"server\":\"ollama\",\"models\":[{\"id\":\"qwen3:32b\",\"context_length\":40960},{\"id\":\"llama3.2:3b\"}],\"memory_total_bytes\":274877906944,\"memory_free_bytes\":206158430208,\"accelerator\":\"apple-m3-ultra\",\"max_concurrency\":4,\"healthy\":true,\"pool\":null}}"
+    },
+    {
+      "name": "advert",
+      "from": "machine",
+      "line": "{\"type\":\"advert\",\"advert\":{\"server\":\"ollama\",\"models\":[{\"id\":\"qwen3:32b\",\"context_length\":40960},{\"id\":\"llama3.2:3b\"}],\"memory_total_bytes\":274877906944,\"memory_free_bytes\":206158430208,\"accelerator\":\"apple-m3-ultra\",\"max_concurrency\":4,\"healthy\":true,\"pool\":null}}"
+    },
+    {
+      "name": "advert_pool",
+      "from": "machine",
+      "line": "{\"type\":\"advert\",\"advert\":{\"server\":\"quexo\",\"models\":[{\"id\":\"mlx-community/Qwen3-235B-A22B-4bit\"}],\"memory_total_bytes\":549755813888,\"memory_free_bytes\":412316860416,\"accelerator\":\"apple-m3-ultra\",\"max_concurrency\":2,\"healthy\":true,\"pool\":{\"members\":[{\"name\":\"studio-a\",\"memory_total_bytes\":274877906944},{\"name\":\"studio-b\",\"memory_total_bytes\":274877906944}],\"backend\":\"jaccl\",\"mode\":\"tensor\"}}}"
+    },
+    {
+      "name": "token",
+      "from": "machine",
+      "line": "{\"type\":\"token\",\"access_token\":\"header.payload.signature\"}"
+    },
+    {
+      "name": "welcome",
+      "from": "gateway",
+      "line": "{\"type\":\"welcome\",\"gateway_key\":\"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo\",\"machine_id\":\"5d1f0a7e-3c2b-4e8a-9f61-0c7d2b4a8e19\"}"
+    },
+    {
+      "name": "unknown_type_is_ignored",
+      "from": "either",
+      "line": "{\"type\":\"later_feature\",\"x\":1}",
+      "parse": "unknown"
+    }
+  ],
+  "request_token": {
+    "gateway_seed_hex": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+    "gateway_key": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+    "other_seed_hex": "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+    "audience": "agent:acme/0b6f2c1e-7d3a-4c55-9a1e-2f6b8c9d0e11",
+    "now": 1767225600,
+    "max_lifetime_secs": 60,
+    "skew_secs": 30,
+    "header": "{\"alg\":\"EdDSA\",\"typ\":\"JWT\"}",
+    "claims_order": [
+      "aud",
+      "rid",
+      "model",
+      "exp"
+    ],
+    "cases": [
+      {
+        "name": "valid",
+        "token": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJhZ2VudDphY21lLzBiNmYyYzFlLTdkM2EtNGM1NS05YTFlLTJmNmI4YzlkMGUxMSIsInJpZCI6InItMDAwMSIsIm1vZGVsIjoicXdlbjM6MzJiIiwiZXhwIjoxNzY3MjI1NjYwfQ.zZkPnfq_ebq1m3HZCa1fWMwBoPI_eLeS0U-EztwSm9kqv9OoWJgV38CcqKYEIJwyX-Y-m2alm1m46sdvqnbUAw",
+        "result": {
+          "ok": {
+            "rid": "r-0001",
+            "model": "qwen3:32b"
+          }
+        }
+      },
+      {
+        "name": "valid_at_skew_edge",
+        "token": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJhZ2VudDphY21lLzBiNmYyYzFlLTdkM2EtNGM1NS05YTFlLTJmNmI4YzlkMGUxMSIsInJpZCI6InItMDAwMiIsIm1vZGVsIjoicXdlbjM6MzJiIiwiZXhwIjoxNzY3MjI1NTcxfQ.ogpiDzbRCx-nFORrOEPLI683F6FbQ5lVAjbm4SQGkR_KFEojsvJ84N57bMISAUXtGVZYULUC1_-u8Lm3ryT0Bw",
+        "result": {
+          "ok": {
+            "rid": "r-0002",
+            "model": "qwen3:32b"
+          }
+        }
+      },
+      {
+        "name": "signed_by_another_key",
+        "token": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJhZ2VudDphY21lLzBiNmYyYzFlLTdkM2EtNGM1NS05YTFlLTJmNmI4YzlkMGUxMSIsInJpZCI6InItMDAwMyIsIm1vZGVsIjoicXdlbjM6MzJiIiwiZXhwIjoxNzY3MjI1NjYwfQ.1GvskFVptszJgp-xZzfYd5h4A1bbA2Cowjtkx9A1D2Gr6s3Hp_ZDo-3KVZE28_BZ1TJ3vG0YkBb_ZqN1wxjWCg",
+        "result": {
+          "error": "bad_signature"
+        }
+      },
+      {
+        "name": "wrong_audience",
+        "token": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJhZ2VudDphY21lLzExMTExMTExLTIyMjItNDMzMy04NDQ0LTU1NTU1NTU1NTU1NSIsInJpZCI6InItMDAwNCIsIm1vZGVsIjoicXdlbjM6MzJiIiwiZXhwIjoxNzY3MjI1NjYwfQ.oWvd3f56GMo8tJuuwTjF72ByzG400TI7sMsiKZqf1RdGda7RBpNpNB2_bbTJN_bHAblCmzxWRp_OoGGhXRZaDA",
+        "result": {
+          "error": "wrong_audience"
+        }
+      },
+      {
+        "name": "expired",
+        "token": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJhZ2VudDphY21lLzBiNmYyYzFlLTdkM2EtNGM1NS05YTFlLTJmNmI4YzlkMGUxMSIsInJpZCI6InItMDAwNSIsIm1vZGVsIjoicXdlbjM6MzJiIiwiZXhwIjoxNzY3MjI1NTY5fQ.EWStMH34v6TwWGlEX2QQIdnyK44SOuRkG3nBbzzIOJAtfRUoEFIsUoqpA5jwyi4XZSetyKzh4U66-ztFB8rbBA",
+        "result": {
+          "error": "expired"
+        }
+      },
+      {
+        "name": "lifetime_too_long",
+        "token": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJhZ2VudDphY21lLzBiNmYyYzFlLTdkM2EtNGM1NS05YTFlLTJmNmI4YzlkMGUxMSIsInJpZCI6InItMDAwNiIsIm1vZGVsIjoicXdlbjM6MzJiIiwiZXhwIjoxNzY3MjI1NjkxfQ.z807EMyu2MUiBgIe88uXfMzuBzjSkWdxpEJzqCJ0taCSf2xXXPBKyjHPRT0ZSrAkN54eGJblIJV8uWFLqRWRCg",
+        "result": {
+          "error": "lifetime_too_long"
+        }
+      },
+      {
+        "name": "alg_hs256",
+        "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJhZ2VudDphY21lLzBiNmYyYzFlLTdkM2EtNGM1NS05YTFlLTJmNmI4YzlkMGUxMSIsInJpZCI6InItMDAwMSIsIm1vZGVsIjoicXdlbjM6MzJiIiwiZXhwIjoxNzY3MjI1NjYwfQ.eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHg",
+        "result": {
+          "error": "bad_alg"
+        }
+      },
+      {
+        "name": "alg_none",
+        "token": "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJhdWQiOiJhZ2VudDphY21lLzBiNmYyYzFlLTdkM2EtNGM1NS05YTFlLTJmNmI4YzlkMGUxMSIsInJpZCI6InItMDAwMSIsIm1vZGVsIjoicXdlbjM6MzJiIiwiZXhwIjoxNzY3MjI1NjYwfQ.",
+        "result": {
+          "error": "bad_alg"
+        }
+      },
+      {
+        "name": "two_segments",
+        "token": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJhZ2VudDphY21lLzBiNmYyYzFlLTdkM2EtNGM1NS05YTFlLTJmNmI4YzlkMGUxMSIsInJpZCI6InItMDAwMSIsIm1vZGVsIjoicXdlbjM6MzJiIiwiZXhwIjoxNzY3MjI1NjYwfQ",
+        "result": {
+          "error": "malformed"
+        }
+      },
+      {
+        "name": "missing_rid",
+        "token": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJhZ2VudDphY21lLzBiNmYyYzFlLTdkM2EtNGM1NS05YTFlLTJmNmI4YzlkMGUxMSIsIm1vZGVsIjoicXdlbjM6MzJiIiwiZXhwIjoxNzY3MjI1NjYwfQ.uOBi4asUJUFGlVrXxWskzNUhLJFGlEIezrsYNYZRXVuAl9SVsEU9ffRhoVqIaeQQBH3_rWcuxDQw1LhOFAOsBQ",
+        "result": {
+          "error": "malformed"
+        }
+      }
+    ]
+  },
+  "allowed_paths": [
+    [
+      "POST",
+      "/v1/chat/completions"
+    ],
+    [
+      "POST",
+      "/v1/responses"
+    ],
+    [
+      "GET",
+      "/v1/models"
+    ]
+  ],
+  "refused_paths": [
+    [
+      "GET",
+      "/api/tags"
+    ],
+    [
+      "POST",
+      "/api/generate"
+    ],
+    [
+      "POST",
+      "/v1/embeddings"
+    ],
+    [
+      "GET",
+      "/v1/models/../api/tags"
+    ],
+    [
+      "DELETE",
+      "/v1/models"
+    ]
+  ]
+}
