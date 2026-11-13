@@ -367,6 +367,33 @@ async fn send_line(w: &mut WriteHalf<TStream>, m: &ControlMsg) -> std::io::Resul
     w.flush().await
 }
 
+enum Unsent {
+    /// The stream is gone: the tunnel is ending, the pump knows why.
+    Closed,
+    /// The gateway stopped reading the control stream.
+    Stalled,
+}
+
+/// A control line, bounded by `within`.
+async fn send_control(
+    w: &mut WriteHalf<TStream>,
+    m: &ControlMsg,
+    within: Duration,
+) -> Result<(), Unsent> {
+    match tokio::time::timeout(within, send_line(w, m)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(Unsent::Closed),
+        Err(_) => Err(Unsent::Stalled),
+    }
+}
+
+async fn unsent(why: Unsent, pump: &mut Task<PumpEnd>) -> Outcome {
+    match why {
+        Unsent::Closed => wait_pump(pump, "control_stream_closed").await,
+        Unsent::Stalled => Outcome::closed(None, "control_stream_stalled"),
+    }
+}
+
 fn pump_end(end: PumpEnd) -> Outcome {
     match end {
         PumpEnd::PeerClosed(code) => Outcome::closed(code, "closed"),
@@ -437,8 +464,8 @@ async fn connection(
         agent_version: env!("CARGO_PKG_VERSION").to_string(),
         advert: first,
     };
-    if send_line(&mut wr, &hello).await.is_err() {
-        return wait_pump(&mut pump_task, "control_stream_closed").await;
+    if let Err(why) = send_control(&mut wr, &hello, t.dead_after).await {
+        return unsent(why, &mut pump_task).await;
     }
 
     let mut tasks: JoinSet<()> = JoinSet::new();
@@ -495,8 +522,9 @@ async fn connection(
             Some(ev) = events.recv() => match ev {
                 Ev::Advert(advert) => {
                     advert_busy = false;
-                    if send_line(&mut wr, &ControlMsg::Advert { advert }).await.is_err() {
-                        break wait_pump(&mut pump_task, "control_stream_closed").await;
+                    let msg = ControlMsg::Advert { advert };
+                    if let Err(why) = send_control(&mut wr, &msg, t.dead_after).await {
+                        break unsent(why, &mut pump_task).await;
                     }
                 }
                 Ev::Token(Ok(fresh)) => {
@@ -504,8 +532,8 @@ async fn connection(
                     let now = Instant::now();
                     let life = lifetime(&fresh);
                     let msg = ControlMsg::Token { access_token: fresh.access_token };
-                    if send_line(&mut wr, &msg).await.is_err() {
-                        break wait_pump(&mut pump_task, "control_stream_closed").await;
+                    if let Err(why) = send_control(&mut wr, &msg, t.dead_after).await {
+                        break unsent(why, &mut pump_task).await;
                     }
                     lapse_at = now + life;
                     refresh_at = now + refresh_after(life, t.refresh_before);
@@ -720,7 +748,8 @@ enum PumpEnd {
 }
 
 /// Binary WebSocket messages ⇄ one end of a duplex. Sends a Ping every
-/// `ping_every` and ends `Dead` once no Pong arrived for `dead_after`.
+/// `ping_every` and ends `Dead` exactly `dead_after` after the last Pong
+/// (or the start), not at the next ping tick.
 /// Incoming Pings are answered by tungstenite itself.
 async fn pump<S>(
     ws: WebSocketStream<S>,
@@ -771,12 +800,8 @@ where
                 }
                 Ok(n) => send!(Message::Binary(buf[..n].to_vec().into())),
             },
-            _ = tick.tick() => {
-                if last_pong.elapsed() >= dead_after {
-                    return PumpEnd::Dead;
-                }
-                send!(Message::Ping(Vec::new().into()));
-            }
+            _ = sleep_until(last_pong + dead_after) => return PumpEnd::Dead,
+            _ = tick.tick() => send!(Message::Ping(Vec::new().into())),
         }
     }
 }
@@ -1198,13 +1223,86 @@ mod tests {
         assert_eq!(first.bearer.as_deref(), Some("Bearer t1"));
         let mut second = gw.next().await;
         assert_eq!(second.bearer.as_deref(), Some("Bearer t2"));
-        assert!(second.at.duration_since(first.at) >= Duration::from_millis(200));
+        let gap = second.at.duration_since(first.at);
+        assert!(gap >= Duration::from_millis(200), "{gap:?}");
+        // dead_after, at most one backoff (50 ms) and a redial.
+        assert!(gap < Duration::from_millis(600), "{gap:?}");
         assert_eq!(f.token_calls.load(Ordering::SeqCst), 2);
         let (mut lines, _w) = second.control().await;
         assert!(matches!(
             bounded("hello", next_msg(&mut lines)).await.1,
             ControlMsg::Hello { .. }
         ));
+    }
+
+    /// The peer answers three Pings, then stops reading: the pump must call
+    /// the tunnel dead `dead_after` after that last Pong, not a ping tick later.
+    #[tokio::test]
+    async fn a_silent_peer_is_dead_within_the_window_of_its_last_pong() {
+        let ping_every = Duration::from_millis(400);
+        let dead_after = Duration::from_millis(600);
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let (last_tx, last_rx) = oneshot::channel::<Instant>();
+        tokio::spawn(async move {
+            let (tcp, _) = l.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let mut pings = 0;
+            while let Some(Ok(m)) = ws.next().await {
+                if let Message::Ping(_) = m {
+                    pings += 1;
+                    if pings == 3 {
+                        ws.flush().await.unwrap(); // sends the queued Pong
+                        let _ = last_tx.send(Instant::now());
+                        break;
+                    }
+                }
+            }
+            sleep(Duration::from_secs(30)).await; // never reads again
+            drop(ws);
+        });
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let (ws, _) = tokio_tungstenite::client_async(format!("ws://{addr}/m"), tcp)
+            .await
+            .unwrap();
+        let (a, _b) = tokio::io::duplex(1024);
+        let end = bounded("dead", pump(ws, a, ping_every, dead_after)).await;
+        let dead_at = Instant::now();
+        assert_eq!(end, PumpEnd::Dead);
+        let last = last_rx.await.unwrap();
+        let took = dead_at.duration_since(last);
+        assert!(took >= dead_after - Duration::from_millis(50), "{took:?}");
+        assert!(took < dead_after + Duration::from_millis(150), "{took:?}");
+    }
+
+    /// A gateway that answers Pings but stops reading the control stream:
+    /// a stuck control write ends the tunnel within `dead_after`.
+    #[tokio::test]
+    async fn a_stalled_control_stream_ends_the_tunnel() {
+        let mut gw = Gw::start(vec![]).await;
+        let mut timing = quiet();
+        timing.advert_every = Duration::from_millis(10);
+        // Pings keep being answered, so only the stalled write can end it.
+        timing.ping_every = Duration::from_millis(50);
+        timing.dead_after = Duration::from_millis(300);
+        let mut f = fake(&gw.url(), 300, timing, None);
+        // ~100 KiB per advert: the 256 KiB stream window fills in a few.
+        let mut big = fake_advert();
+        big.models = (0..4000)
+            .map(|i| AdvertModel {
+                id: format!("model-{i:08}"),
+                context_length: Some(8192),
+            })
+            .collect();
+        f.deps.advert = Arc::new(move || {
+            let a = big.clone();
+            Box::pin(async move { a })
+        });
+        let _running = Task(tokio::spawn(run(f.deps, proxy("http://127.0.0.1:9"))));
+        let first = gw.next().await; // keep it open, never read its streams
+        let second = gw.next().await;
+        assert_eq!(second.bearer.as_deref(), Some("Bearer t2"));
+        drop(first);
     }
 
     async fn stops_without_dialing(err: fn() -> QuomeError, want: Stop) {

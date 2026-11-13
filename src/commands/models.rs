@@ -484,6 +484,20 @@ fn local_auth(c: &MachineConfig) -> Result<Option<String>> {
     Ok(Some(format!("Bearer {k}")))
 }
 
+/// The local server's URL without credentials, query or fragment, for logs.
+fn loggable_url(raw: &str) -> String {
+    match url::Url::parse(raw.trim()) {
+        Ok(mut u) => {
+            let _ = u.set_username("");
+            let _ = u.set_password(None);
+            u.set_query(None);
+            u.set_fragment(None);
+            u.to_string()
+        }
+        Err(_) => "<invalid>".into(),
+    }
+}
+
 /// Serve this machine's models over the tunnel until a permanent stop.
 /// `runner` reads the machine's memory and accelerator for adverts.
 pub async fn serve(
@@ -548,7 +562,7 @@ pub async fn serve(
         &[
             ("org", p.org_slug.clone()),
             ("server", cfg.server.name().to_string()),
-            ("url", cfg.url.clone()),
+            ("url", loggable_url(&cfg.url)),
         ],
     );
     let deps = TunnelDeps {
@@ -1034,6 +1048,19 @@ mod tests {
         .unwrap();
         assert_eq!(out, Served::NotConnected);
         assert_eq!(serve_exit_code(&out), 0);
+    }
+
+    #[test]
+    fn the_serving_log_line_drops_credentials() {
+        assert_eq!(
+            loggable_url("http://user:pass@127.0.0.1:11434/base?key=s3cret#x"),
+            "http://127.0.0.1:11434/base"
+        );
+        assert_eq!(
+            loggable_url("http://127.0.0.1:11434"),
+            "http://127.0.0.1:11434/"
+        );
+        assert_eq!(loggable_url("::"), "<invalid>");
     }
 
     #[test]
