@@ -130,28 +130,66 @@ fn must(
     }
 }
 
+/// How long to wait for launchd to finish removing a job.
+pub struct Waits {
+    /// Between `launchctl print` polls after a `bootout`.
+    pub poll: std::time::Duration,
+    pub max_polls: u32,
+    /// Before the one `bootstrap` retry.
+    pub retry: std::time::Duration,
+}
+
+impl Waits {
+    pub const REAL: Waits = Waits {
+        poll: std::time::Duration::from_millis(100),
+        max_polls: 50,
+        retry: std::time::Duration::from_secs(1),
+    };
+}
+
 pub fn install_macos(
     home: &Path,
     run: &dyn CommandRunner,
     program: &Path,
     uid: u32,
 ) -> Result<(), QuomeError> {
+    install_macos_waiting(home, run, program, uid, &Waits::REAL)
+}
+
+pub fn install_macos_waiting(
+    home: &Path,
+    run: &dyn CommandRunner,
+    program: &Path,
+    uid: u32,
+    waits: &Waits,
+) -> Result<(), QuomeError> {
     let plist = launchd_plist_path(home);
     let log_dir = home.join("Library/Logs/quome");
     let domain = format!("gui/{uid}");
     let target = format!("gui/{uid}/{LAUNCHD_LABEL}");
-    // A previous copy may or may not be loaded.
-    let _ = call(run, "launchctl", &["bootout", &target]);
+    // A previous copy may or may not be loaded. `bootout` can return before
+    // launchd has removed the job, so wait for `print` to stop finding it.
+    if let RunResult::Ran { ok: true, .. } = call(run, "launchctl", &["bootout", &target]) {
+        for _ in 0..waits.max_polls {
+            if !matches!(
+                call(run, "launchctl", &["print", &target]),
+                RunResult::Ran { ok: false, .. }
+            ) {
+                std::thread::sleep(waits.poll);
+            } else {
+                break;
+            }
+        }
+    }
     std::fs::create_dir_all(&log_dir)?;
     std::fs::create_dir_all(plist.parent().expect("plist has a parent"))?;
     std::fs::write(&plist, launchd_plist(program, &log_dir))?;
     let plist_s = plist.to_string_lossy();
-    must(
-        run,
-        "launchctl bootstrap",
-        "launchctl",
-        &["bootstrap", &domain, &plist_s],
-    )?;
+    let bootstrap = ["bootstrap", &domain, &plist_s];
+    if must(run, "launchctl bootstrap", "launchctl", &bootstrap).is_err() {
+        std::thread::sleep(waits.retry);
+        must(run, "launchctl bootstrap", "launchctl", &bootstrap)?;
+    }
     must(
         run,
         "launchctl kickstart",
@@ -374,6 +412,45 @@ mod tests {
         );
     }
 
+    const ZERO: Waits = Waits {
+        poll: std::time::Duration::ZERO,
+        max_polls: 5,
+        retry: std::time::Duration::ZERO,
+    };
+
+    #[test]
+    fn install_waits_for_bootout_then_retries_bootstrap_once() {
+        let h = tempfile::tempdir().unwrap();
+        let prints = std::cell::Cell::new(0);
+        let boots = std::cell::Cell::new(0);
+        let run = Fake::new(move |_, a| match a[0].as_str() {
+            "print" => {
+                prints.set(prints.get() + 1);
+                if prints.get() < 3 {
+                    ok("still loaded")
+                } else {
+                    fail("not found")
+                }
+            }
+            "bootstrap" => {
+                boots.set(boots.get() + 1);
+                if boots.get() == 1 {
+                    fail("Bootstrap failed: 5: Input/output error")
+                } else {
+                    ok("")
+                }
+            }
+            _ => ok(""),
+        });
+        install_macos_waiting(h.path(), &run, Path::new("/x/quome"), 501, &ZERO).unwrap();
+        let calls = run.calls();
+        let t = "gui/501/cloud.quome.models";
+        assert_eq!(calls[0], format!("launchctl bootout {t}"));
+        assert_eq!(calls[1..4], vec![format!("launchctl print {t}"); 3][..]);
+        assert_eq!(calls.iter().filter(|c| c.contains("bootstrap")).count(), 2);
+        assert!(calls.last().unwrap().contains("kickstart"));
+    }
+
     #[test]
     fn a_failed_bootstrap_is_an_error() {
         let h = tempfile::tempdir().unwrap();
@@ -384,7 +461,8 @@ mod tests {
                 ok("")
             }
         });
-        let e = install_macos(h.path(), &run, Path::new("/x/quome"), 501).unwrap_err();
+        let e =
+            install_macos_waiting(h.path(), &run, Path::new("/x/quome"), 501, &ZERO).unwrap_err();
         assert!(
             e.to_string().contains("launchctl bootstrap failed: denied"),
             "{e}"
