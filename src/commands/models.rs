@@ -151,7 +151,7 @@ pub async fn connect(o: ConnectOpts, deps: &Deps<'_>) -> Result<Connected> {
                 "This machine is already connected. Run `quome models disconnect` first.".into(),
             ));
         }
-        disconnect(&deps.home, deps.store, deps.say).await?;
+        disconnect(&deps.home, deps.store, deps.say, deps.runner).await?;
     }
 
     let opts = Options {
@@ -409,6 +409,7 @@ pub async fn disconnect(
     home: &Path,
     store: &dyn KeyStore,
     say: &dyn Fn(&str),
+    run: &dyn CommandRunner,
 ) -> Result<Disconnected> {
     let mut report = Disconnected::default();
     let mut st = CloudState::load_from(home)?;
@@ -433,7 +434,13 @@ pub async fn disconnect(
             }
         }
     }
-    // The background service is uninstalled here once `serve --install` exists.
+    // The background service goes with the connection; a failure is reported, not fatal.
+    if service::installed(home) {
+        let gone = service::current_uid(run).and_then(|uid| service::uninstall(home, run, uid));
+        if let Err(e) = gone {
+            say(&format!("Could not remove the background service: {e}"));
+        }
+    }
     store.delete(PROFILE)?;
     if report.was_connected {
         st.profiles.remove(PROFILE);
@@ -609,11 +616,71 @@ async fn stop_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
-async fn execute_serve(install: bool, uninstall: bool, json_logs: bool) -> Result<()> {
-    if install || uninstall {
+/// `serve --install`: refuses unless connected; never starts a foreground serve.
+pub fn install_service(
+    home: &Path,
+    run: &dyn CommandRunner,
+    program: &Path,
+    say: &dyn Fn(&str),
+) -> Result<()> {
+    if !has_machine_profile(home)? {
         return Err(QuomeError::Usage(
-            "quome models serve is not available in this build".into(),
+            "This machine is not connected. Run `quome models connect` first.".into(),
         ));
+    }
+    let uid = service::current_uid(run)?;
+    service::install(home, run, program, uid)?;
+    say(&format!(
+        "Installed the background service ({}).",
+        program.display()
+    ));
+    if !cfg!(target_os = "macos") {
+        let user = service::current_user(run);
+        say(&format!(
+            "To keep it running after you log out: `loginctl enable-linger {user}`"
+        ));
+    }
+    Ok(())
+}
+
+/// `serve --uninstall`.
+pub fn uninstall_service(home: &Path, run: &dyn CommandRunner, say: &dyn Fn(&str)) -> Result<()> {
+    if !service::installed(home) {
+        say("The background service is not installed.");
+        return Ok(());
+    }
+    let uid = service::current_uid(run)?;
+    service::uninstall(home, run, uid)?;
+    say("Removed the background service.");
+    Ok(())
+}
+
+/// This binary as the unit should start it.
+fn unit_program() -> Result<std::path::PathBuf> {
+    let exe = std::env::current_exe()?;
+    let on_path = std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|d| d.join("quome"))
+            .find(|c| c.is_file())
+    });
+    Ok(service::service_program(&exe, on_path.as_deref()))
+}
+
+async fn execute_serve(install: bool, uninstall: bool, json_logs: bool) -> Result<()> {
+    if install && uninstall {
+        return Err(QuomeError::Usage(
+            "Use --install or --uninstall, not both.".into(),
+        ));
+    }
+    if install || uninstall {
+        let home = home()?;
+        let say = |m: &str| println!("{m}");
+        let run = crate::cloud::clients::runner::RealRunner;
+        return if install {
+            install_service(&home, &run, &unit_program()?, &say)
+        } else {
+            uninstall_service(&home, &run, &say)
+        };
     }
     crate::machine::log::set_json(json_logs);
     let home = home()?;
@@ -676,7 +743,13 @@ pub async fn execute(command: ModelsCommands) -> Result<()> {
                     println!("{s}");
                 }
             };
-            let r = disconnect(&home, &store, &say).await?;
+            let r = disconnect(
+                &home,
+                &store,
+                &say,
+                &crate::cloud::clients::runner::RealRunner,
+            )
+            .await?;
             if json {
                 println!(
                     "{}",
@@ -1283,7 +1356,7 @@ mod tests {
         let h = Harness::new();
         seed_default(h.home.path(), &h.store());
         h.connect(&s, |_| {}).await.unwrap();
-        let r = disconnect(h.home.path(), &h.store(), &|_| {})
+        let r = disconnect(h.home.path(), &h.store(), &|_| {}, &NoCommands)
             .await
             .unwrap();
         assert!(r.was_connected && r.revoked);
@@ -1292,6 +1365,109 @@ mod tests {
         assert_eq!(st.default, "cloud");
         assert_eq!(h.store().get("cloud").unwrap(), "default-key");
         assert!(!h.home.path().join(".quome/cloud-models.key").exists());
+    }
+
+    fn plant_service(home: &Path) {
+        let p = if cfg!(target_os = "macos") {
+            service::launchd_plist_path(home)
+        } else {
+            service::systemd_unit_path(home)
+        };
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, "x").unwrap();
+    }
+
+    #[tokio::test]
+    async fn disconnect_uninstalls_the_service() {
+        let s = MockServer::start().await;
+        mount_platform(&s).await;
+        Mock::given(method("DELETE"))
+            .and(path("/api/v1/orgs/org-1/models/machines/me"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&s)
+            .await;
+        let h = Harness::new();
+        h.connect(&s, |_| {}).await.unwrap();
+        plant_service(h.home.path());
+        let run = crate::cloud::clients::runner::fake::Fake::new(|_, _| {
+            crate::cloud::clients::runner::fake::ok("501\n")
+        });
+        disconnect(h.home.path(), &h.store(), &|_| {}, &run)
+            .await
+            .unwrap();
+        assert!(!service::installed(h.home.path()));
+        let calls = run.calls();
+        assert_eq!(calls[0], "id -u");
+        assert!(
+            calls[1].contains("cloud.quome.models") || calls[1].contains("quome-models.service")
+        );
+    }
+
+    #[tokio::test]
+    async fn disconnect_reports_a_failed_service_removal_and_continues() {
+        let h = Harness::new();
+        plant_service(h.home.path());
+        let said = RefCell::new(vec![]);
+        let r = disconnect(
+            h.home.path(),
+            &h.store(),
+            &|m| said.borrow_mut().push(m.to_string()),
+            &NoCommands,
+        )
+        .await
+        .unwrap();
+        assert!(!r.was_connected);
+        assert!(said
+            .borrow()
+            .join("\n")
+            .contains("Could not remove the background service"));
+    }
+
+    #[test]
+    fn serve_install_refuses_when_not_connected() {
+        let h = tempfile::tempdir().unwrap();
+        let run = crate::cloud::clients::runner::fake::Fake::new(|_, _| {
+            crate::cloud::clients::runner::fake::ok("501\n")
+        });
+        let e = install_service(h.path(), &run, Path::new("/x/quome"), &|_| {}).unwrap_err();
+        assert!(e.to_string().contains("not connected"), "{e}");
+        assert!(run.calls().is_empty());
+        assert!(!service::installed(h.path()));
+    }
+
+    #[test]
+    fn serve_install_when_connected_installs_the_unit() {
+        let h = tempfile::tempdir().unwrap();
+        write_profile(h.path(), "2099-01-01T00:00:00Z");
+        let run = crate::cloud::clients::runner::fake::Fake::new(|_, _| {
+            crate::cloud::clients::runner::fake::ok("501\n")
+        });
+        let said = RefCell::new(vec![]);
+        install_service(h.path(), &run, Path::new("/x/quome"), &|m| {
+            said.borrow_mut().push(m.to_string())
+        })
+        .unwrap();
+        assert_eq!(run.calls()[0], "id -u");
+        let plat = if cfg!(target_os = "macos") {
+            service::launchd_plist_path(h.path())
+        } else {
+            service::systemd_unit_path(h.path())
+        };
+        assert!(plat.exists());
+        if !cfg!(target_os = "macos") {
+            assert!(said.borrow().join("\n").contains("loginctl enable-linger"));
+        }
+    }
+
+    #[test]
+    fn serve_uninstall_without_a_service_is_a_note() {
+        let h = tempfile::tempdir().unwrap();
+        let said = RefCell::new(vec![]);
+        uninstall_service(h.path(), &NoCommands, &|m| {
+            said.borrow_mut().push(m.to_string())
+        })
+        .unwrap();
+        assert_eq!(said.borrow()[0], "The background service is not installed.");
     }
 
     #[tokio::test]
@@ -1308,9 +1484,12 @@ mod tests {
         let h = Harness::new();
         h.connect(&s, |_| {}).await.unwrap();
         let said = RefCell::new(vec![]);
-        let r = disconnect(h.home.path(), &h.store(), &|m| {
-            said.borrow_mut().push(m.to_string())
-        })
+        let r = disconnect(
+            h.home.path(),
+            &h.store(),
+            &|m| said.borrow_mut().push(m.to_string()),
+            &NoCommands,
+        )
         .await
         .unwrap();
         assert!(r.was_connected && !r.revoked);
@@ -1326,7 +1505,7 @@ mod tests {
             .contains_key("models"));
         assert!(!h.home.path().join(".quome/cloud-models.key").exists());
         // Nothing connected: a no-op, not an error.
-        let r = disconnect(h.home.path(), &h.store(), &|_| {})
+        let r = disconnect(h.home.path(), &h.store(), &|_| {}, &NoCommands)
             .await
             .unwrap();
         assert!(!r.was_connected);

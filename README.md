@@ -96,6 +96,7 @@ Full walkthrough with expected output: **[Getting started](docs/getting-started.
 | `quome mcp` | **Quome Cloud:** MCP server (sandboxes, previews, app deploys, one-click apps, email inboxes, auth, Git, cache pods, database branches) for Claude Code | [MCP](docs/reference/mcp.md) |
 | `quome cloud status` / `disconnect` | **Quome Cloud:** check or drop the connection | [Cloud](docs/reference/cloud.md) |
 | `quome git-credential` | **Quome Cloud:** lets plain git sign in to the org's repos | [Git credential](docs/reference/git-credential.md) |
+| `quome models …` | **Quome Cloud:** serve this computer's local models (Ollama, vLLM, llama.cpp, MLX) to your organization | [Models](docs/reference/models.md) |
 
 All commands above these four rows, including `quome login`, are Quome Enterprise and unchanged.
 

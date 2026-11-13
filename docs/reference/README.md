@@ -32,5 +32,6 @@ Every command, every flag. All examples assume you've [logged in](../getting-sta
 | [Upgrade](upgrade.md) | `upgrade` |
 | [Connect](connect.md) (Quome Cloud) | `connect` |
 | [MCP](mcp.md) (Quome Cloud) | `mcp` |
+| [Models](models.md) (Quome Cloud) | `models connect`, `models status`, `models disconnect`, `models serve` |
 | [Cloud](cloud.md) (Quome Cloud) | `cloud status`, `cloud disconnect` |
 | [Git credential](git-credential.md) (Quome Cloud) | `git-credential` |
