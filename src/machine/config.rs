@@ -133,6 +133,12 @@ pub fn key_store(home: &Path) -> FileStore {
 pub fn validate_local_url(u: &str) -> Result<url::Url, QuomeError> {
     let parsed = url::Url::parse(u.trim())
         .map_err(|e| QuomeError::Usage(format!("the server URL {u:?} is not a valid URL ({e})")))?;
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(QuomeError::Usage(format!(
+            "the server URL {u:?} has a query or fragment; give only the address, \
+             for example http://127.0.0.1:11434"
+        )));
+    }
     match parsed.scheme() {
         "https" => Ok(parsed),
         "http" if crate::url_policy::is_loopback_http(parsed.as_str()) => Ok(parsed),
@@ -209,7 +215,12 @@ mod tests {
         ] {
             validate_local_url(ok).unwrap_or_else(|e| panic!("{ok}: {e}"));
         }
-        for bad in ["http://192.168.1.5:8000", "ftp://127.0.0.1/x"] {
+        for bad in [
+            "http://192.168.1.5:8000",
+            "ftp://127.0.0.1/x",
+            "http://127.0.0.1:8000/?a=1",
+            "http://127.0.0.1:8000/#frag",
+        ] {
             assert!(validate_local_url(bad).is_err(), "{bad}");
         }
     }
