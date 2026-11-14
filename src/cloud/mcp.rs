@@ -1064,6 +1064,18 @@ fn code_hint(code: &str) -> Option<&'static str> {
             "Too many calls are waiting for approval; wait for decisions (get_result) before sending more."
         }
         "email_cursor_unavailable" => "Try again shortly.",
+        "purchase_policy_missing" => {
+            "An org Owner or Admin must set a purchase policy for this agent first."
+        }
+        "vendor_not_allowed" => {
+            "This vendor is not on this agent's allowed list; ask an Owner or Admin."
+        }
+        "purchase_over_limit" => {
+            "The price is over this agent's limit; ask for a smaller plan or a higher limit."
+        }
+        "paused_for_payment" => {
+            "The person is paying in the window; wait, then call again after they finish."
+        }
         _ => return None,
     })
 }
@@ -1086,10 +1098,20 @@ fn hint_for(r: &CallToolResult) -> Option<String> {
             )
         })
     } else if r.is_error == Some(true) {
-        body["error"]["code"]
-            .as_str()
-            .and_then(code_hint)
-            .map(str::to_string)
+        let code = body["error"]["code"].as_str()?;
+        if code == "capability_missing" {
+            // A capability the platform names gets its own words.
+            let named = body["error"].to_string();
+            for (cap, words) in [
+                ("purchases_request", "allow purchases"),
+                ("secrets_rotate", "allow key rotation"),
+            ] {
+                if named.contains(cap) {
+                    return Some(format!("Run `quome connect` again and {words}."));
+                }
+            }
+        }
+        code_hint(code).map(str::to_string)
     } else {
         None
     }
@@ -14607,6 +14629,88 @@ mod tests {
             .rpc("tools/call", json!({"name":"exec","arguments":{}}))
             .await;
         assert_eq!(r["result"]["content"].as_array().unwrap().len(), 1);
+    }
+
+    async fn refusal_hint_text(error: Value) -> String {
+        let (s, mut c) = start_live().await;
+        mount_config(&s, "gateway").await;
+        mount_gw(&s, move |m, _| match m {
+            "tools/call" => Ok(json!({"content":[{"type":"text","text":"refused"}],
+                "isError":true,
+                "structuredContent":{"error":error.clone()}})),
+            _ => Ok(gw_tools()),
+        })
+        .await;
+        let r = c
+            .rpc("tools/call", json!({"name":"call_tool","arguments":{}}))
+            .await;
+        let blocks = r["result"]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["text"], "refused");
+        blocks[1..]
+            .iter()
+            .filter_map(|b| b["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tokio::test]
+    async fn capability_missing_purchases_request_hint() {
+        let h = refusal_hint_text(
+            json!({"code":"capability_missing","capability":"purchases_request"}),
+        )
+        .await;
+        assert_eq!(h, "Run `quome connect` again and allow purchases.");
+    }
+
+    #[tokio::test]
+    async fn capability_missing_secrets_rotate_hint() {
+        let h =
+            refusal_hint_text(json!({"code":"capability_missing","capability":"secrets_rotate"}))
+                .await;
+        assert_eq!(h, "Run `quome connect` again and allow key rotation.");
+        // any other capability keeps the generic hint
+        let h = refusal_hint_text(json!({"code":"capability_missing","capability":"apps_operate"}))
+            .await;
+        assert_eq!(h, "Run `quome connect` again.");
+    }
+
+    #[tokio::test]
+    async fn purchase_codes_have_hints() {
+        for (code, want) in [
+            ("purchase_policy_missing", "purchase policy"),
+            ("vendor_not_allowed", "allowed list"),
+            ("purchase_over_limit", "smaller plan"),
+        ] {
+            let h = refusal_hint_text(json!({"code":code})).await;
+            assert!(h.contains(want), "{code}: {h}");
+        }
+    }
+
+    #[tokio::test]
+    async fn paused_for_payment_hint_says_wait() {
+        let h = refusal_hint_text(json!({"code":"paused_for_payment"})).await;
+        assert!(h.to_lowercase().contains("wait"), "{h}");
+    }
+
+    #[tokio::test]
+    async fn gateway_tools_list_has_no_on_demand_tools() {
+        let (s, mut c) = start_live().await;
+        mount_config(&s, "gateway").await;
+        mount_gw(&s, |_, _| Ok(gw_tools())).await;
+        let names = tool_names(&mut c).await;
+        assert!(!names.iter().any(|n| n == "web_session_pay"), "{names:?}");
+        // every tool is one the gateway lists or one the CLI already served
+        // before; no purchase or rotation tool is added by the CLI
+        for n in &names {
+            assert!(
+                !n.contains("purchase") && !n.contains("rotate") && !n.contains("pay"),
+                "{n}"
+            );
+        }
+        let fixed = gw_tools();
+        for t in fixed["tools"].as_array().unwrap() {
+            assert!(names.contains(&t["name"].as_str().unwrap().to_string()));
+        }
     }
 
     #[tokio::test]
