@@ -432,6 +432,17 @@ pub struct Deploy {
     pub repo: Option<String>,
 }
 
+/// The answer to a platform release deploy: nothing is built.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ImageDeploy {
+    pub deploy_id: String,
+    /// `<name>@sha256:<digest>`.
+    #[serde(default)]
+    pub image: Option<String>,
+    #[serde(default)]
+    pub platform_image: Option<String>,
+}
+
 /// What Quome Cloud observed of a container that did not stay up.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct DeployFailure {
@@ -877,8 +888,42 @@ async fn check(resp: Response, map: fn(u16, &str) -> QuomeError) -> Result<Respo
 /// Like `map_error`, but a 409 or 502 keeps the body's extra fields (such as
 /// `lockout_risks` or `client_ids`) as pretty JSON after the message.
 fn map_error_keeping_body(status: u16, text: &str) -> QuomeError {
+    keep_body(status, text, &[409, 502])
+}
+
+/// `map_error` for the role scopes routes: a 409 or 422 keeps the body's
+/// extra fields (a 422 `unknown_scope` names the scopes in `unknown`).
+fn map_role_scopes_error(status: u16, text: &str) -> QuomeError {
+    keep_body(status, text, &[409, 422])
+}
+
+/// `map_error_with_reason` for an app tool call: a call held for a person's
+/// approval (403 `approval_required`) keeps the body's extra fields, among
+/// them the approval's id, as pretty JSON after the message.
+fn map_call_error(status: u16, text: &str) -> QuomeError {
+    match map_error_with_reason(status, text) {
+        QuomeError::ApiRefused { status, reason, .. }
+            if status == 403 && reason == "approval_required" =>
+        {
+            let message = match keep_body(status, text, &[403]) {
+                QuomeError::ApiError(m) => m,
+                e => e.to_string(),
+            };
+            QuomeError::ApiRefused {
+                message,
+                status,
+                reason,
+            }
+        }
+        e => e,
+    }
+}
+
+/// `map_error`, and for the `statuses` given, the body's fields other than
+/// `detail`, `reason` and `message` as pretty JSON after the message.
+fn keep_body(status: u16, text: &str, statuses: &[u16]) -> QuomeError {
     let e = map_error(status, text);
-    if !matches!(status, 409 | 502) {
+    if !statuses.contains(&status) {
         return e;
     }
     let mut v: serde_json::Value = serde_json::from_str(text).unwrap_or_default();
@@ -1330,20 +1375,30 @@ impl CloudApi {
             .await?)
     }
 
+    /// Call an app tool. `approval_id` repeats a call a person approved;
+    /// `source` (`deployed` or `install`) picks which app of that name answers.
     pub async fn call_app_tool(
         &self,
         slug: &str,
         tool: &str,
         arguments: &serde_json::Value,
+        approval_id: Option<&str>,
+        source: Option<&str>,
     ) -> Result<serde_json::Value, QuomeError> {
-        let p = self.org_path(&format!(
+        let mut p = self.org_path(&format!(
             "/app-installs/{}/tools/{}/call",
             enc(slug),
             enc(tool)
         ));
-        let body = serde_json::json!({"arguments": arguments});
+        if let Some(s) = source {
+            p.push_str(&format!("?source={}", enc(s)));
+        }
+        let mut body = serde_json::json!({"arguments": arguments});
+        if let Some(id) = approval_id {
+            body["approval_id"] = id.into();
+        }
         Ok(self
-            .send_mapping(Method::POST, &p, |b| b.json(&body), map_error_with_reason)
+            .send_mapping(Method::POST, &p, |b| b.json(&body), map_call_error)
             .await?
             .json()
             .await?)
@@ -1696,6 +1751,36 @@ impl CloudApi {
             .await?)
     }
 
+    /// The org's apps with the scopes each registers, and each role's scopes
+    /// by app, on `env`'s auth.
+    pub async fn role_scopes(&self, env: &str) -> Result<serde_json::Value, QuomeError> {
+        let p = self.org_path(&format!("/auth/{}/role-scopes", enc(env)));
+        self.json(Method::GET, &p, |b| b).await
+    }
+
+    /// Replace the scopes of `app` that role `role` carries on `env`'s auth
+    /// (`[]` clears them). Answers `{role, app, env, before, after}`.
+    pub async fn set_role_scopes(
+        &self,
+        env: &str,
+        role: &str,
+        app: &str,
+        scopes: &[String],
+    ) -> Result<serde_json::Value, QuomeError> {
+        let p = self.org_path(&format!(
+            "/auth/{}/roles/{}/scopes/{}",
+            enc(env),
+            enc(role),
+            enc(app)
+        ));
+        let body = serde_json::json!({ "scopes": scopes });
+        Ok(self
+            .send_mapping(Method::PUT, &p, |b| b.json(&body), map_role_scopes_error)
+            .await?
+            .json()
+            .await?)
+    }
+
     fn pod_path(&self, cache: &str, rest: &str) -> String {
         self.org_path(&format!("/caches/{}/my-pod{}", enc(cache), rest))
     }
@@ -1931,6 +2016,18 @@ impl CloudApi {
         if let Some(r) = git_ref {
             body["ref"] = r.into();
         }
+        self.json(Method::POST, &p, |b| b.json(&body)).await
+    }
+
+    /// Deploy the platform release `name` (its pinned image; the platform
+    /// supplies the documents and keys). The body names only the release.
+    pub async fn deploy_platform_image(
+        &self,
+        app_id: &str,
+        name: &str,
+    ) -> Result<ImageDeploy, QuomeError> {
+        let p = self.org_path(&format!("/apps/{}/deploy", enc(app_id)));
+        let body = serde_json::json!({"platform_image": name});
         self.json(Method::POST, &p, |b| b.json(&body)).await
     }
 
@@ -2973,13 +3070,53 @@ mod tests {
             .mount(&s)
             .await;
         let e = api
-            .call_app_tool("sales", "t", &serde_json::json!({}))
+            .call_app_tool("sales", "t", &serde_json::json!({}), None, None)
             .await
             .unwrap_err();
         assert_eq!(
             e.to_string(),
             "API error: 502 bad_gateway: app_error: key missing"
         );
+    }
+
+    #[test]
+    fn a_held_call_keeps_its_approval_and_other_refusals_do_not_grow() {
+        let held = map_call_error(
+            403,
+            r#"{"detail":"forbidden","reason":"approval_required","approval":"apa_1","notified":true}"#,
+        );
+        let QuomeError::ApiRefused {
+            message, reason, ..
+        } = held
+        else {
+            panic!("{held:?}")
+        };
+        assert_eq!(reason, "approval_required");
+        let (first, rest) = message.split_once('\n').unwrap();
+        assert_eq!(first, "403 forbidden: approval_required");
+        let extra: serde_json::Value = serde_json::from_str(rest).unwrap();
+        assert_eq!(extra["approval"], "apa_1");
+        let other = map_call_error(
+            403,
+            r#"{"detail":"forbidden","reason":"capability_missing","hint":"h"}"#,
+        );
+        assert_eq!(
+            other.to_string(),
+            "API error: 403 forbidden: capability_missing"
+        );
+    }
+
+    #[test]
+    fn an_unknown_scope_keeps_the_unknown_list() {
+        let e = map_role_scopes_error(
+            422,
+            r#"{"detail":"invalid","reason":"unknown_scope","unknown":["a","b"]}"#,
+        );
+        let m = e.to_string();
+        let (first, rest) = m.split_once('\n').unwrap();
+        assert_eq!(first, "API error: 422 invalid: unknown_scope");
+        let extra: serde_json::Value = serde_json::from_str(rest).unwrap();
+        assert_eq!(extra["unknown"], serde_json::json!(["a", "b"]));
     }
 
     #[test]
