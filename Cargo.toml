@@ -1,6 +1,6 @@
 [package]
 name = "quome-cli"
-version = "0.2.43"
+version = "0.2.44"
 edition = "2021"
 description = "CLI for the Quome platform"
 license = "MIT"
