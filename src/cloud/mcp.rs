@@ -1064,6 +1064,18 @@ fn code_hint(code: &str) -> Option<&'static str> {
             "Too many calls are waiting for approval; wait for decisions (get_result) before sending more."
         }
         "email_cursor_unavailable" => "Try again shortly.",
+        "purchase_policy_missing" => {
+            "An org Owner or Admin must set a purchase policy for this agent first."
+        }
+        "vendor_not_allowed" => {
+            "This vendor is not on this agent's allowed list; ask an Owner or Admin."
+        }
+        "purchase_over_limit" => {
+            "The price is over this agent's limit; ask for a smaller plan or a higher limit."
+        }
+        "paused_for_payment" => {
+            "The person is paying in the window; wait, then call again after they finish."
+        }
         _ => return None,
     })
 }
@@ -1077,7 +1089,7 @@ fn plain_id(v: &serde_json::Value) -> Option<&str> {
 
 /// Advice for a result: it is a refusal with a known code, or a call parked
 /// for a person's approval.
-fn hint_for(r: &CallToolResult) -> Option<String> {
+fn hint_for(r: &CallToolResult, tool: Option<&str>) -> Option<String> {
     let body = gateway_body(r)?;
     if body["status"] == "pending" {
         plain_id(&body["approval_id"]).map(|id| {
@@ -1086,18 +1098,49 @@ fn hint_for(r: &CallToolResult) -> Option<String> {
             )
         })
     } else if r.is_error == Some(true) {
-        body["error"]["code"]
+        let code = body["error"]["code"]
             .as_str()
-            .and_then(code_hint)
-            .map(str::to_string)
+            .or_else(|| body["reason"].as_str())
+            .or_else(|| body["error"].as_str())?;
+        if code == "capability_missing" {
+            // A capability the platform names gets its own words.
+            let named = body["error"].to_string();
+            for (cap, words) in [
+                ("purchases_request", "allow purchases"),
+                ("secrets_rotate", "allow key rotation"),
+            ] {
+                if named.contains(cap) {
+                    return Some(format!("Run `quome connect` again and {words}."));
+                }
+            }
+        }
+        if code == "capability_missing" {
+            // The platform's refusal names no capability: the tool says it.
+            let bare = tool
+                .map(|t| t.rsplit("__").next().unwrap_or(t))
+                .unwrap_or("");
+            if bare == "web_session_pay" || bare.starts_with("purchase_") {
+                return Some("Run `quome connect` again and allow purchases.".to_string());
+            }
+            if bare.starts_with("rotate_") || bare.starts_with("secret_rotate") {
+                return Some("Run `quome connect` again and allow key rotation.".to_string());
+            }
+        }
+        code_hint(code).map(str::to_string)
     } else {
         None
     }
 }
 
 /// The result as the gateway sent it, with advice after it when there is some.
-fn with_hints(mut r: CallToolResult) -> CallToolResult {
-    if let Some(h) = hint_for(&r) {
+fn with_hints(r: CallToolResult) -> CallToolResult {
+    with_hints_for(r, None)
+}
+
+/// `with_hints`, knowing which tool was called (the `tool` or `name` argument
+/// of a `call_tool`, else the gateway tool itself).
+fn with_hints_for(mut r: CallToolResult, tool: Option<&str>) -> CallToolResult {
+    if let Some(h) = hint_for(&r, tool) {
         r.content.push(ContentBlock::text(h));
     }
     r
@@ -2518,10 +2561,19 @@ impl QuomeMcp {
         ctx: &RequestContext<RoleServer>,
     ) -> CallToolResult {
         let sink = forward_progress(ctx);
+        let called = if name == "call_tool" {
+            args["tool"]
+                .as_str()
+                .or_else(|| args["name"].as_str())
+                .unwrap_or(name)
+                .to_string()
+        } else {
+            name.to_string()
+        };
         let call = g.call_tool(name, args, sink);
         tokio::select! {
             r = call => match r {
-                Ok(r) => with_hints(r),
+                Ok(r) => with_hints_for(r, Some(&called)),
                 Err(e) => error_result(e.to_string()),
             },
             _ = ctx.ct.cancelled() => error_result("Cancelled."),
@@ -2624,7 +2676,7 @@ impl QuomeMcp {
                     .await;
                 Ok(match r {
                     Ok(r) => {
-                        let hint = hint_for(&r);
+                        let hint = hint_for(&r, Some(&a.tool));
                         let mut out = match json(&r) {
                             Ok(t) => CallToolResult::success(vec![ContentBlock::text(t)]),
                             Err(e) => error_result(e),
@@ -14607,6 +14659,145 @@ mod tests {
             .rpc("tools/call", json!({"name":"exec","arguments":{}}))
             .await;
         assert_eq!(r["result"]["content"].as_array().unwrap().len(), 1);
+    }
+
+    async fn refusal_hint_text(error: Value) -> String {
+        let (s, mut c) = start_live().await;
+        mount_config(&s, "gateway").await;
+        mount_gw(&s, move |m, _| match m {
+            "tools/call" => Ok(json!({"content":[{"type":"text","text":"refused"}],
+                "isError":true,
+                "structuredContent":{"error":error.clone()}})),
+            _ => Ok(gw_tools()),
+        })
+        .await;
+        let r = c
+            .rpc("tools/call", json!({"name":"call_tool","arguments":{}}))
+            .await;
+        let blocks = r["result"]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["text"], "refused");
+        blocks[1..]
+            .iter()
+            .filter_map(|b| b["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tokio::test]
+    async fn capability_missing_purchases_request_hint() {
+        let h = refusal_hint_text(
+            json!({"code":"capability_missing","capability":"purchases_request"}),
+        )
+        .await;
+        assert_eq!(h, "Run `quome connect` again and allow purchases.");
+    }
+
+    #[tokio::test]
+    async fn capability_missing_secrets_rotate_hint() {
+        let h =
+            refusal_hint_text(json!({"code":"capability_missing","capability":"secrets_rotate"}))
+                .await;
+        assert_eq!(h, "Run `quome connect` again and allow key rotation.");
+        // any other capability keeps the generic hint
+        let h = refusal_hint_text(json!({"code":"capability_missing","capability":"apps_operate"}))
+            .await;
+        assert_eq!(h, "Run `quome connect` again.");
+    }
+
+    #[tokio::test]
+    async fn purchase_codes_have_hints() {
+        for (code, want) in [
+            ("purchase_policy_missing", "purchase policy"),
+            ("vendor_not_allowed", "allowed list"),
+            ("purchase_over_limit", "smaller plan"),
+        ] {
+            let h = refusal_hint_text(json!({"code":code})).await;
+            assert!(h.contains(want), "{code}: {h}");
+        }
+    }
+
+    #[tokio::test]
+    async fn paused_for_payment_hint_says_wait() {
+        let h = refusal_hint_text(json!({"code":"paused_for_payment"})).await;
+        assert!(h.to_lowercase().contains("wait"), "{h}");
+    }
+
+    #[tokio::test]
+    async fn gateway_tools_list_has_no_on_demand_tools() {
+        let (s, mut c) = start_live().await;
+        mount_config(&s, "gateway").await;
+        mount_gw(&s, |_, _| Ok(gw_tools())).await;
+        let names = tool_names(&mut c).await;
+        assert!(!names.iter().any(|n| n == "web_session_pay"), "{names:?}");
+        // every tool is one the gateway lists or one the CLI already served
+        // before; no purchase or rotation tool is added by the CLI
+        for n in &names {
+            assert!(
+                !n.contains("purchase") && !n.contains("rotate") && !n.contains("pay"),
+                "{n}"
+            );
+        }
+        let fixed = gw_tools();
+        for t in fixed["tools"].as_array().unwrap() {
+            assert!(names.contains(&t["name"].as_str().unwrap().to_string()));
+        }
+    }
+
+    async fn bare_refusal_hint(tool: &str, args: Value) -> String {
+        let (s, mut c) = start_live().await;
+        mount_config(&s, "gateway").await;
+        mount_gw(&s, move |m, _| match m {
+            "tools/call" => Ok(json!({"content":[{"type":"text","text":"refused"}],
+                "isError":true,
+                "structuredContent":{"error":"forbidden","reason":"capability_missing"}})),
+            _ => Ok(gw_tools()),
+        })
+        .await;
+        let r = c
+            .rpc("tools/call", json!({"name":tool,"arguments":args}))
+            .await;
+        let blocks = r["result"]["content"].as_array().unwrap();
+        blocks[1..]
+            .iter()
+            .filter_map(|b| b["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tokio::test]
+    async fn capability_missing_on_web_session_pay_call_hints_purchases() {
+        let h = bare_refusal_hint("web_session_pay", json!({})).await;
+        assert_eq!(h, "Run `quome connect` again and allow purchases.");
+    }
+
+    #[tokio::test]
+    async fn capability_missing_via_call_tool_purchase_hints_purchases() {
+        let h = bare_refusal_hint(
+            "call_tool",
+            json!({"server":"vendor","tool":"vendor__purchase_plan","args":{}}),
+        )
+        .await;
+        assert_eq!(h, "Run `quome connect` again and allow purchases.");
+        let h = bare_refusal_hint("call_tool", json!({"name":"purchase_plan"})).await;
+        assert_eq!(h, "Run `quome connect` again and allow purchases.");
+    }
+
+    #[tokio::test]
+    async fn capability_missing_on_rotate_call_hints_rotation() {
+        let h = bare_refusal_hint(
+            "call_tool",
+            json!({"server":"vendor","tool":"rotate_key","args":{}}),
+        )
+        .await;
+        assert_eq!(h, "Run `quome connect` again and allow key rotation.");
+        let h = bare_refusal_hint("call_tool", json!({"tool":"vendor__secret_rotate"})).await;
+        assert_eq!(h, "Run `quome connect` again and allow key rotation.");
+    }
+
+    #[tokio::test]
+    async fn capability_missing_on_an_unrelated_tool_keeps_the_generic_hint() {
+        let h = bare_refusal_hint("call_tool", json!({"tool":"list_things"})).await;
+        assert_eq!(h, "Run `quome connect` again.");
     }
 
     #[tokio::test]
