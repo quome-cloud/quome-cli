@@ -154,6 +154,9 @@ Options:
       --force
           Replace the file even while the pool server is running from it
 
+      --profile <PROFILE>
+          Use this saved connection (its API, organization and token)
+
       --json
           Output as JSON
 
@@ -161,7 +164,7 @@ Options:
           Print help (see a summary with '-h')
 ```
 
-It uses this machine's `models` connection when there is one, otherwise your default `quome connect` connection; either way it acts in that connection's organization. The platform sends the file with its SHA-256 checksum. A download larger than 512 MiB is refused. The download is hashed as it is written to a private temporary file in the install directory; if the hash does not match, the temporary file is deleted and nothing is installed. The archive must hold exactly one regular file named `quexo`; anything else (extra files, directories, links, absolute or `..` paths) is refused. The file is then unpacked with mode 0755 beside the target and renamed over `<dir>/quexo`.
+With `--profile <name>` it uses that saved connection (its API, organization and token) and fails with a clear message if there is none by that name. Without it, it uses this machine's `models` connection when there is one, otherwise your default `quome connect` connection; either way it acts in that connection's organization. The platform sends the file with its SHA-256 checksum. A download larger than 512 MiB is refused. The download is hashed as it is written to a private temporary file in the install directory; if the hash does not match, the temporary file is deleted and nothing is installed. The archive must hold exactly one regular file named `quexo`; anything else (extra files, directories, links, absolute or `..` paths) is refused. The file is then unpacked with mode 0755 beside the target and renamed over `<dir>/quexo`.
 
 If the pool server is running from `<dir>/quexo`, the command refuses with "The pool server is running from `<dir>/quexo`. Stop it first, or pass --force." With `--force` the file is replaced (the running process keeps the old one) and the output adds "Restart the pool server to use the new version." The check runs before the download and again just before the file is replaced. It covers your own processes; a process of another user is not visible to it.
 
