@@ -190,6 +190,8 @@ pub enum ConfigError {
 /// Per-request timeout for Git routes; the platform may hold a request up to
 /// 60 s while the org's git server starts.
 pub const GIT_REQUEST_TIMEOUT: Duration = Duration::from_secs(75);
+/// Total time allowed for one pool server download.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(900);
 
 /// A short-lived token for the org's git server, brokered by the platform.
 #[derive(Clone, Deserialize, PartialEq)]
@@ -862,6 +864,39 @@ fn map_error_with_reason(status: u16, text: &str) -> QuomeError {
             }
         }
         e => e,
+    }
+}
+
+/// The stable code of an error answer: `reason`, else `error.code` or `error.type`.
+fn error_code(text: &str) -> String {
+    let v: serde_json::Value = serde_json::from_str(text).unwrap_or_default();
+    [
+        &v["reason"],
+        &v["error"]["code"],
+        &v["error"]["type"],
+        &v["code"],
+    ]
+    .iter()
+    .find_map(|c| c.as_str().filter(|s| !s.is_empty()))
+    .unwrap_or("")
+    .to_string()
+}
+
+/// `map_error` for the pool server download, with a plain message for each refusal
+/// a person can act on.
+fn map_download_error(status: u16, text: &str) -> QuomeError {
+    let code = error_code(text);
+    match (status, code.as_str()) {
+        (404, _) => QuomeError::Usage("Machines are not enabled for this org.".into()),
+        (403, "capability_missing") => {
+            QuomeError::Usage("Run `quome models connect` again.".into())
+        }
+        (502, "download_integrity") => QuomeError::Usage(
+            "The pool server download failed its integrity check on the server; try again later."
+                .into(),
+        ),
+        (503, _) => QuomeError::Usage("The pool server download is not available yet.".into()),
+        _ => map_error(status, text),
     }
 }
 
@@ -1622,6 +1657,19 @@ impl CloudApi {
             .await?
             .json()
             .await?)
+    }
+
+    /// The pool server's release for `platform`, as the platform's streamed answer. The
+    /// caller reads the body; it takes the long timeout because the file is large.
+    pub async fn models_download_quexo(&self, platform: &str) -> Result<Response, QuomeError> {
+        let p = self.org_path("/models/downloads/quexo");
+        self.send_mapping(
+            Method::GET,
+            &p,
+            |b| b.query(&[("platform", platform)]).timeout(DOWNLOAD_TIMEOUT),
+            map_download_error,
+        )
+        .await
     }
 
     /// Revoke this machine on the platform.

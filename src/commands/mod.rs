@@ -17,6 +17,7 @@ pub mod logs;
 pub mod mcp;
 pub mod members;
 pub mod models;
+pub mod models_download;
 pub mod orgs;
 pub mod secrets;
 pub mod skills;

@@ -9,6 +9,7 @@ quome models connect   # pair this computer, approve in the browser
 quome models serve --install   # keep serving in the background, starting at login
 quome models status
 quome models disconnect
+quome models download quexo   # Apple silicon Macs: fetch the pool server
 ```
 
 ## `quome models`
@@ -23,6 +24,7 @@ Commands:
   status      Show this machine's connection, settings and what the platform sees
   disconnect  Revoke this machine and forget its connection
   serve       Serve this machine's models to the organization
+  download    Download the pool server through the platform
   help        Print this message or the help of the given subcommand(s)
 
 Options:
@@ -128,6 +130,59 @@ Options:
 | 3 | The binary was upgraded; the service manager starts the new one |
 
 The service restarts only after a failure (launchd `KeepAlive` with `SuccessfulExit` false; systemd `Restart=on-failure`), so exit 0 stays stopped and exit 3 restarts into the upgraded binary.
+
+## `quome models download`
+
+Downloads the pool server, the program that pools several Macs behind one connection, through the platform and installs it as `~/.quome/bin/quexo`. The argument is always `quexo`. It runs on Apple silicon Macs only; anywhere else the command exits 69 with "The pool server runs on Apple silicon Macs only."
+
+```
+Download the pool server through the platform
+
+Usage: quome models download [OPTIONS] <WHAT>
+
+Arguments:
+  <WHAT>
+          What to download
+
+          Possible values:
+          - quexo: The pool server that pools several Macs behind one connection
+
+Options:
+      --dir <DIR>
+          Install into this directory (default: ~/.quome/bin)
+
+      --force
+          Replace the file even while the pool server is running from it
+
+      --json
+          Output as JSON
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+It uses this machine's `models` connection when there is one, otherwise your default `quome connect` connection; either way it acts in that connection's organization. The platform sends the file with its SHA-256 checksum. The download is hashed as it is written to a private temporary file in the install directory; if the hash does not match, the temporary file is deleted and nothing is installed. The archive must hold exactly one regular file named `quexo`; anything else (extra files, directories, links, absolute or `..` paths) is refused. The file is then unpacked with mode 0755 beside the target and renamed over `<dir>/quexo`.
+
+If the pool server is running from `<dir>/quexo`, the command refuses with "Stop it first, or pass `--force`." With `--force` the file is replaced (the running process keeps the old one) and the output adds "Restart the pool server to use the new version."
+
+It prints the installed path. With `--json` it prints `{"path", "version", "sha256"}`. No token or response body is ever printed.
+
+| Answer | Message |
+|--------|---------|
+| 404 | Machines are not enabled for this org. |
+| 403 `capability_missing` | Run `quome models connect` again. |
+| 502 `download_integrity` | The pool server download failed its integrity check on the server; try again later. |
+| 503 | The pool server download is not available yet. |
+
+### Serving a pool of Macs
+
+```
+quome models download quexo
+quome models connect --server quexo
+quome models serve --install
+```
+
+`--server quexo` makes this machine front the pool server at its default local address (see `models.toml` below); the pool server itself is started from `~/.quome/bin/quexo`.
 
 ## Files
 

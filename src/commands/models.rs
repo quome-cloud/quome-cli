@@ -40,6 +40,8 @@ pub enum ModelsCommands {
         #[arg(long)]
         json_logs: bool,
     },
+    /// Download the pool server through the platform
+    Download(super::models_download::DownloadArgs),
 }
 
 #[derive(Args)]
@@ -787,6 +789,7 @@ pub async fn execute(command: ModelsCommands) -> Result<()> {
             uninstall,
             json_logs,
         } => execute_serve(install, uninstall, json_logs).await,
+        ModelsCommands::Download(a) => super::models_download::execute(a).await,
     }
 }
 
