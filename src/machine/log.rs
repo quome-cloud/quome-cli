@@ -20,6 +20,12 @@ pub fn event(name: &str, fields: &[(&str, String)]) {
     eprintln!("{}", format_event(json(), name, fields));
 }
 
+/// The text form of an event line (what `event` prints without `--json-logs`).
+#[cfg(test)]
+pub fn event_line(name: &str, fields: &[(&str, String)]) -> String {
+    format_event(false, name, fields)
+}
+
 /// A sentence for a person reading the log.
 pub fn notice(message: &str) {
     eprintln!("{}", format_notice(json(), message));

@@ -73,6 +73,12 @@ pub struct Timing {
     pub upgrade_every: Duration,
     /// How long a stop waits for requests in flight.
     pub drain: Duration,
+    /// How often a pool's set-up is checked between periodic adverts; an advert is sent
+    /// when it (or the pool's health) changed. Only for `server: "quexo"`.
+    /// Each check runs the whole advert closure. That is one dependency, and for a pool the
+    /// extra work is a few loopback requests every couple of seconds, only while serving
+    /// through quexo.
+    pub setup_watch_every: Duration,
 }
 
 impl Default for Timing {
@@ -87,6 +93,7 @@ impl Default for Timing {
             healthy_after: Duration::from_secs(60),
             upgrade_every: Duration::from_secs(600),
             drain: Duration::from_secs(10),
+            setup_watch_every: Duration::from_secs(2),
         }
     }
 }
@@ -343,6 +350,8 @@ impl<T> Drop for Task<T> {
 /// Messages from the session's background work.
 enum Ev {
     Advert(Advert),
+    /// A set-up check: sent only when it differs from what was last sent.
+    Watched(Advert),
     Token(Result<ModelsToken, QuomeError>),
 }
 
@@ -464,6 +473,10 @@ async fn connection(
         agent_version: env!("CARGO_PKG_VERSION").to_string(),
         advert: first,
     };
+    let hello_advert = match &hello {
+        ControlMsg::Hello { advert, .. } => advert.clone(),
+        _ => unreachable!("built just above"),
+    };
     if let Err(why) = send_control(&mut wr, &hello, t.dead_after).await {
         return unsent(why, &mut pump_task).await;
     }
@@ -478,6 +491,8 @@ async fn connection(
     let mut refresh_at = fetched_at + refresh_after(life, t.refresh_before);
     let mut advert_busy = false;
     let mut refresh_busy = false;
+    let mut watch = tokio::time::interval_at(up + t.setup_watch_every, t.setup_watch_every);
+    let mut last_sent = hello_advert.clone();
 
     let end = loop {
         tokio::select! {
@@ -511,6 +526,14 @@ async fn connection(
                     let _ = tx.send(Ev::Advert(f.await));
                 });
             }
+            _ = watch.tick(), if !advert_busy && last_sent.server == "quexo" => {
+                advert_busy = true;
+                let f = (deps.advert)();
+                let tx = ev_tx.clone();
+                background.spawn(async move {
+                    let _ = tx.send(Ev::Watched(f.await));
+                });
+            }
             _ = sleep_until(refresh_at), if !refresh_busy => {
                 refresh_busy = true;
                 let f = (deps.token)();
@@ -519,12 +542,25 @@ async fn connection(
                     let _ = tx.send(Ev::Token(f.await));
                 });
             }
-            Some(ev) = events.recv() => match ev {
-                Ev::Advert(advert) => {
+            Some(ev) = events.recv() => {
+                if matches!(ev, Ev::Advert(_) | Ev::Watched(_)) {
                     advert_busy = false;
+                }
+                match ev {
+                Ev::Advert(advert) => {
+                    last_sent = advert.clone();
                     let msg = ControlMsg::Advert { advert };
                     if let Err(why) = send_control(&mut wr, &msg, t.dead_after).await {
                         break unsent(why, &mut pump_task).await;
+                    }
+                }
+                Ev::Watched(advert) => {
+                    if (advert.healthy, &advert.pool) != (last_sent.healthy, &last_sent.pool) {
+                        last_sent = advert.clone();
+                        let msg = ControlMsg::Advert { advert };
+                        if let Err(why) = send_control(&mut wr, &msg, t.dead_after).await {
+                            break unsent(why, &mut pump_task).await;
+                        }
                     }
                 }
                 Ev::Token(Ok(fresh)) => {
@@ -544,7 +580,8 @@ async fn connection(
                     refresh_at = Instant::now() + REFRESH_RETRY;
                     log::event("token_refresh_failed", &[("error", e.to_string())]);
                 }
-            },
+                }
+            }
             _ = sleep_until(lapse_at) => break Outcome::closed(None, "token_lapsed"),
             r = &mut pump_task.0 => {
                 break r.map(pump_end).unwrap_or_else(|_| Outcome::closed(None, "websocket_error"));
@@ -1043,6 +1080,7 @@ mod tests {
             healthy_after: Duration::from_secs(60),
             upgrade_every: Duration::from_secs(3600),
             drain: Duration::from_secs(10),
+            setup_watch_every: Duration::from_secs(3600),
         }
     }
 
@@ -1208,6 +1246,78 @@ mod tests {
         assert!(t0.elapsed() >= Duration::from_secs(30));
         // The paused clock may run on to the next tick while the line is in flight.
         assert!(f.advert_calls.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[tokio::test]
+    async fn setup_change_sends_an_advert() {
+        use crate::machine::protocol::{Pool, PoolMember, PoolSetup};
+        let mut gw = Gw::start(vec![]).await;
+        let mut timing = quiet();
+        timing.setup_watch_every = Duration::from_secs(2);
+        let mut f = fake(&gw.url(), 300, timing, None);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        f.deps.advert = Arc::new(move || {
+            let n = c.fetch_add(1, Ordering::SeqCst);
+            // Calls 0 (hello), 1 and 2 say "pairing"; from call 3 on, "installing".
+            let state = if n < 3 { "pairing" } else { "installing" };
+            let mut a = fake_advert();
+            a.server = "quexo".into();
+            a.pool = Some(Pool {
+                members: vec![PoolMember {
+                    name: "macA".into(),
+                    memory_total_bytes: 1,
+                }],
+                backend: "ring".into(),
+                mode: "pipeline".into(),
+                setup: Some(PoolSetup {
+                    state: state.into(),
+                    members: vec![],
+                }),
+                fast_mode: None,
+            });
+            Box::pin(async move { a })
+        });
+        let _running = Task(tokio::spawn(run(f.deps, proxy("http://127.0.0.1:9"))));
+        let mut c = gw.next().await;
+        let (mut lines, _w) = c.control().await;
+        bounded("hello", next_msg(&mut lines)).await;
+
+        tokio::time::pause();
+        // Two unchanged checks send nothing; the third sees "installing" and sends.
+        let (_, m) = tokio::time::timeout(Duration::from_secs(30), next_msg(&mut lines))
+            .await
+            .expect("an advert once the set-up changed");
+        let ControlMsg::Advert { advert } = m else {
+            panic!("not an advert")
+        };
+        assert_eq!(advert.pool.unwrap().setup.unwrap().state, "installing");
+        assert!(calls.load(Ordering::SeqCst) >= 4);
+        // Unchanged afterwards: nothing more is sent.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(20), next_msg(&mut lines))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_that_is_not_a_pool_is_never_watched() {
+        let mut gw = Gw::start(vec![]).await;
+        let mut timing = quiet();
+        timing.setup_watch_every = Duration::from_secs(2);
+        let f = fake(&gw.url(), 300, timing, None);
+        let _running = Task(tokio::spawn(run(f.deps, proxy("http://127.0.0.1:9"))));
+        let mut c = gw.next().await;
+        let (mut lines, _w) = c.control().await;
+        bounded("hello", next_msg(&mut lines)).await;
+        tokio::time::pause();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(60), next_msg(&mut lines))
+                .await
+                .is_err()
+        );
+        assert_eq!(f.advert_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

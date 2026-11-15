@@ -40,6 +40,8 @@ pub enum ModelsCommands {
         #[arg(long)]
         json_logs: bool,
     },
+    /// Download the pool server through the platform
+    Download(super::models_download::DownloadArgs),
 }
 
 #[derive(Args)]
@@ -516,7 +518,7 @@ pub async fn serve(
     program: Option<std::path::PathBuf>,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<Served> {
-    use crate::machine::{advert, log, probe, proxy};
+    use crate::machine::{advert, log, pool_server, probe, proxy};
 
     let st = CloudState::load_from(home)?;
     let Some(p) = st.profiles.get(PROFILE).cloned() else {
@@ -575,7 +577,14 @@ pub async fn serve(
                 state
                     .responses_supported
                     .store(pr.responses_supported, std::sync::atomic::Ordering::SeqCst);
-                probe::advert(&facts, &pr, &cfg)
+                let advert = probe::advert(&facts, &pr, &cfg);
+                if cfg.server == ServerKind::Quexo {
+                    if let Ok(base) = url::Url::parse(&cfg.url) {
+                        let pool = pool_server::pool_advert(&client, &base).await;
+                        return pool_server::apply(advert, pool);
+                    }
+                }
+                advert
             })
         })
     };
@@ -787,6 +796,7 @@ pub async fn execute(command: ModelsCommands) -> Result<()> {
             uninstall,
             json_logs,
         } => execute_serve(install, uninstall, json_logs).await,
+        ModelsCommands::Download(a) => super::models_download::execute(a).await,
     }
 }
 
