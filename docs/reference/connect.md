@@ -74,7 +74,7 @@ An existing user-scope `quome` server is replaced, so reconnecting updates it. I
 
 Pass `--no-mcp` to skip registration entirely.
 
-`--scope <capability>` (repeatable, or comma-separated) asks the approval page for only those capabilities, for example `--scope models_join`. `--org <slug>` names the organization the approval must be for. If the approval lands in another organization, nothing is saved, the approval is withdrawn when it can be, and the command says to run it again and choose the right organization.
+`--scope <capability>` (repeatable, or comma-separated) asks the approval page for only those capabilities, for example `--scope models_join`. `--org <slug>` names the organization the approval must be for. If the approval lands in another organization, nothing is saved and the command says so. A `models_serve` approval is withdrawn automatically; for any other scope, revoke it under Agents in that organization, then run the command again with the right `--org`.
 
 ### macOS Keychain prompt after an upgrade
 
