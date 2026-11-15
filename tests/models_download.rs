@@ -131,9 +131,34 @@ mod apple_silicon {
         assert!(o.status.success(), "{}", text(&o.stderr));
         assert_eq!(
             text(&o.stdout).trim(),
-            e.dir().join("quexo").to_string_lossy()
+            e.dir()
+                .canonicalize()
+                .unwrap()
+                .join("quexo")
+                .to_string_lossy()
         );
         let _ = &e.server;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relative_dir_prints_the_absolute_installed_path() {
+        let e = Env::new().await;
+        let o = Command::new(env!("CARGO_BIN_EXE_quome"))
+            .args(["models", "download", "quexo", "--dir", "rel/bin"])
+            .current_dir(e.home.path())
+            .env("HOME", e.home.path())
+            .env("QUOME_NO_AUTO_UPDATE", "1")
+            .env_remove("XDG_CONFIG_HOME")
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", text(&o.stderr));
+        let printed = PathBuf::from(text(&o.stdout).trim());
+        assert!(printed.is_absolute(), "{printed:?}");
+        assert_eq!(
+            printed,
+            e.home.path().canonicalize().unwrap().join("rel/bin/quexo")
+        );
+        assert!(printed.is_file());
     }
 
     /// A copy of a system binary installed as `<dir>/quexo` and left running.

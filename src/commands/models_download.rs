@@ -296,6 +296,18 @@ pub async fn install(
     private_dir: bool,
     running: &dyn Fn(&Path) -> bool,
 ) -> Result<Installed> {
+    install_capped(api, dir, force, private_dir, running, MAX_DOWNLOAD).await
+}
+
+/// `install` with the download cap given, so a test can use a small one.
+async fn install_capped(
+    api: &CloudApi,
+    dir: &Path,
+    force: bool,
+    private_dir: bool,
+    running: &dyn Fn(&Path) -> bool,
+    max_download: u64,
+) -> Result<Installed> {
     let target = dir.join(BINARY);
     let running_error = || {
         QuomeError::Usage(format!(
@@ -324,7 +336,7 @@ pub async fn install(
         .and_then(|v| v.to_str().ok())
         .and_then(clean_version);
 
-    if resp.content_length().is_some_and(|n| n > MAX_DOWNLOAD) {
+    if resp.content_length().is_some_and(|n| n > max_download) {
         return Err(too_big());
     }
     make_dir(dir, private_dir)?;
@@ -337,7 +349,7 @@ pub async fn install(
         let mut total = 0u64;
         while let Some(chunk) = resp.chunk().await? {
             total += chunk.len() as u64;
-            if total > MAX_DOWNLOAD {
+            if total > max_download {
                 return Err(too_big());
             }
             hasher.update(&chunk);
@@ -392,7 +404,11 @@ pub async fn execute(a: DownloadArgs) -> Result<()> {
     };
     let machine_store = config::key_store(&home);
     let api = resolve_api(&home, &machine_store, &platform_store)?;
-    let done = install(&api, &dir, a.force, private_dir, &is_running).await?;
+    let mut done = install(&api, &dir, a.force, private_dir, &is_running).await?;
+    // Show where it really is, whatever relative or linked `--dir` was given.
+    if let Ok(abs) = done.path.canonicalize() {
+        done.path = abs;
+    }
     if a.json {
         println!(
             "{}",
@@ -662,8 +678,15 @@ mod tests {
         let e = Env::new().await;
         std::fs::create_dir_all(e.bin_dir()).unwrap();
         std::fs::write(e.bin_dir().join("quexo"), b"old").unwrap();
-        e.serve(tarball(&[("quexo", BIN), ("x", b"y")]), None).await;
-        assert!(e.install(false, false).await.is_err());
+        // A valid checksum, so the refusal comes from the archive itself.
+        let t = tarball(&[("quexo", BIN), ("x", b"y")]);
+        let c = sha(&t);
+        e.serve(t, Some(c)).await;
+        let err = e.install(false, false).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "The download is not a single pool server file; nothing was installed."
+        );
         assert_eq!(std::fs::read(e.bin_dir().join("quexo")).unwrap(), b"old");
         assert_eq!(e.leftovers(), vec!["quexo".to_string()]);
     }
@@ -718,6 +741,66 @@ mod tests {
         assert_eq!(e.leftovers(), vec!["quexo".to_string()]);
     }
 
+    #[tokio::test]
+    async fn a_download_over_the_cap_is_refused_by_its_content_length() {
+        let e = Env::new().await;
+        let t = tarball(&[("quexo", BIN)]);
+        let c = sha(&t);
+        assert!(t.len() > 16);
+        e.serve(t, Some(c)).await;
+        let r = install_capped(&e.api, &e.bin_dir(), false, true, &|_| false, 16).await;
+        assert_eq!(r.unwrap_err().to_string(), too_big().to_string());
+        assert!(e.leftovers().is_empty(), "{:?}", e.leftovers());
+    }
+
+    /// A server that answers the download with a chunked body (no Content-Length), so only
+    /// the count of bytes received can stop it. Auth is the mock server's.
+    async fn chunked_server(body: Vec<u8>, checksum: String) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                let (body, checksum) = (body.clone(), checksum.clone());
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = s.read(&mut buf).await;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nx-checksum-sha256: {checksum}\r\nconnection: close\r\n\r\n"
+                    );
+                    let _ = s.write_all(head.as_bytes()).await;
+                    for c in body.chunks(8) {
+                        let _ = s.write_all(format!("{:x}\r\n", c.len()).as_bytes()).await;
+                        let _ = s.write_all(c).await;
+                        let _ = s.write_all(b"\r\n").await;
+                    }
+                    let _ = s.write_all(b"0\r\n\r\n").await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn a_streamed_download_over_the_cap_is_refused_and_leaves_nothing() {
+        let e = Env::new().await;
+        let t = tarball(&[("quexo", BIN)]);
+        let base = chunked_server(t.clone(), sha(&t)).await;
+        let mut p = profile(&e.server.uri(), "org-1");
+        p.api_url = base;
+        let key = AgentKey::from_seed([7u8; 32]);
+        let api = CloudApi::new(&p, TokenSource::new(&p, key, "vrc".into()));
+        // Cap below the body: only the streamed count can refuse it.
+        let r = install_capped(&api, &e.bin_dir(), false, true, &|_| false, 16).await;
+        assert_eq!(r.unwrap_err().to_string(), too_big().to_string());
+        assert!(e.leftovers().is_empty(), "{:?}", e.leftovers());
+        // And the same body under a generous cap installs, so the server is sound.
+        let done = install_capped(&api, &e.bin_dir(), false, true, &|_| false, 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(done.path).unwrap(), BIN);
+    }
+
     #[test]
     fn a_missing_file_is_not_running() {
         assert!(!is_running(Path::new("/nonexistent/quexo")));
@@ -729,10 +812,18 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let target = d.path().join("quexo");
         std::fs::copy("/bin/sleep", &target).unwrap();
-        let mut child = std::process::Command::new(&target)
-            .arg("30")
-            .spawn()
-            .unwrap();
+        // A just-copied file can still be open for writing: retry on "Text file busy".
+        let mut tries = 0;
+        let mut child = loop {
+            match std::process::Command::new(&target).arg("30").spawn() {
+                Ok(c) => break c,
+                Err(e) if e.raw_os_error() == Some(26) && tries < 10 => {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Err(e) => panic!("{e}"),
+            }
+        };
         std::thread::sleep(std::time::Duration::from_millis(200));
         let seen = is_running(&target);
         let _ = child.kill();

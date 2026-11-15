@@ -179,10 +179,25 @@ pub async fn pool_advert(client: &reqwest::Client, base: &Url) -> PoolProbe {
         return PoolProbe::default();
     };
     let (probe, refused) = interpret(status, &body);
-    if let Some(why) = refused {
-        super::log::event("pool_health_refused", &[("reason", why.to_string())]);
+    if note_refusal(&LAST_REFUSAL, refused) {
+        if let Some(why) = refused {
+            super::log::event("pool_health_refused", &[("reason", why.to_string())]);
+        }
     }
     probe
+}
+
+/// The reason the last advert was refused, or `None` while the pool is accepted.
+static LAST_REFUSAL: std::sync::Mutex<Option<&'static str>> = std::sync::Mutex::new(None);
+
+/// Records the latest outcome and says whether to log it: only when the pool goes from
+/// accepted to refused or the reason changes, so a pool server that keeps sending a state
+/// this program does not know is logged once, not at every check.
+fn note_refusal(last: &std::sync::Mutex<Option<&'static str>>, now: Option<&'static str>) -> bool {
+    let mut last = last.lock().unwrap_or_else(|e| e.into_inner());
+    let changed = *last != now;
+    *last = now;
+    changed && now.is_some()
 }
 
 /// Fold a pool probe into the advert built from the local facts and `/v1/models`:
@@ -411,8 +426,9 @@ mod tests {
 
     #[test]
     fn a_refusal_reason_is_a_fixed_string_so_no_body_text_reaches_the_log() {
-        // The log is stderr, so this checks the guarantee by construction: a refusal carries only a fixed reason: the type is `&'static str`, so no body
-        // text can reach the log line.
+        // The log is stderr, so this checks the guarantee by construction. A refusal carries
+        // only a fixed reason, and its type is `&'static str`, so no body text can reach the
+        // log line.
         let mut h = health("ok", "serving");
         h["pool"]["backend"] = json!("SECRET-MARKER");
         h["pool"]["members"][0]["name"] = json!("SECRET-MARKER");
@@ -422,6 +438,19 @@ mod tests {
             crate::machine::log::event_line("pool_health_refused", &[("reason", why.to_string())]);
         assert!(!line.contains("SECRET-MARKER"), "{line}");
         assert_eq!(line, "models: pool_health_refused reason=backend_invalid");
+    }
+
+    #[test]
+    fn a_refusal_is_logged_once_per_reason() {
+        let last = std::sync::Mutex::new(None);
+        assert!(note_refusal(&last, Some("state_unknown")));
+        assert!(!note_refusal(&last, Some("state_unknown")));
+        assert!(!note_refusal(&last, Some("state_unknown")));
+        // A different reason is news.
+        assert!(note_refusal(&last, Some("backend_invalid")));
+        // Accepted, then refused again for the first reason: logged again.
+        assert!(!note_refusal(&last, None));
+        assert!(note_refusal(&last, Some("backend_invalid")));
     }
 
     #[test]
@@ -454,12 +483,12 @@ mod tests {
             },
             &cfg,
         );
-        // Byte-identical to what P2's advert serialised before pools had set-up fields.
+        // Byte-identical to what the advert serialised before pools had set-up fields.
         assert_eq!(
             serde_json::to_string(&a).unwrap(),
             r#"{"server":"ollama","models":[{"id":"qwen3:32b"}],"memory_total_bytes":64,"memory_free_bytes":32,"accelerator":"apple-m3-ultra","max_concurrency":4,"healthy":true,"pool":null}"#
         );
-        // And a pool without set-up fields serialises as P2's did.
+        // And a pool without set-up fields serialises as the advert did before pools had them.
         let p = Pool {
             members: vec![PoolMember {
                 name: "a".into(),
