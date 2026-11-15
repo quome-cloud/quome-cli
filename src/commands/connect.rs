@@ -46,6 +46,12 @@ pub struct Args {
     /// (default: every installed client)
     #[arg(long, value_delimiter = ',', value_parser = ClientId::parse)]
     client: Vec<ClientId>,
+    /// Ask the approval for only these capabilities (repeatable, or comma-separated)
+    #[arg(long, value_delimiter = ',')]
+    scope: Vec<String>,
+    /// The organization (slug) the approval must be for
+    #[arg(long)]
+    org: Option<String>,
     /// Output as JSON
     #[arg(long)]
     json: bool,
@@ -464,7 +470,7 @@ pub async fn run(opts: Options, deps: &Deps<'_>) -> Result<Outcome> {
         if org.slug != want {
             // The approval is live in the other org: for a machine, withdraw
             // it (best effort; the token is only used, never shown).
-            let withdrawn = opts.scopes == ["models_serve"]
+            let withdrawn = !opts.scopes.is_empty()
                 && withdraw_machine(&profile, &mem, &profile_name, &org.id).await;
             return Err(QuomeError::Usage(format!(
                 "This approval is for organization \"{}\", not \"{want}\". \
@@ -767,8 +773,8 @@ pub async fn execute(args: Args) -> Result<()> {
         issuer: args.issuer,
         no_mcp: args.no_mcp,
         clients: args.client,
-        scopes: vec![],
-        org: None,
+        scopes: args.scope,
+        org: args.org,
     };
     let out = run(opts, &deps).await?;
     let p = &out.profile;
@@ -888,6 +894,25 @@ mod tests {
             connect_url("https://console.x", "mac", &k, 4242, "st", &[], None),
             want
         );
+    }
+
+    #[test]
+    fn scope_and_org_flags_reach_the_connect_url() {
+        let a =
+            Args::try_parse_from(["connect", "--scope", "a,b", "--scope", "c", "--org", "acme"])
+                .unwrap();
+        assert_eq!(a.scope, ["a", "b", "c"]);
+        let k = AgentKey::generate();
+        let u = connect_url(
+            "https://console.x",
+            "mac",
+            &k,
+            4242,
+            "st",
+            &a.scope,
+            a.org.as_deref(),
+        );
+        assert!(u.ends_with("&scope=a%20b%20c&org=acme"), "{u}");
     }
 
     #[test]
@@ -1296,6 +1321,31 @@ mod tests {
         }
         assert!(!h.home.path().join(".quome/cloud.json").exists());
         assert!(!h.home.path().join(".quome/cloud-models.key").exists());
+    }
+
+    #[tokio::test]
+    async fn any_scoped_approval_for_another_org_is_withdrawn() {
+        let s = MockServer::start().await;
+        mount_auth(&s).await;
+        mount_me(&s, 0).await;
+        Mock::given(method("DELETE"))
+            .and(path("/api/v1/orgs/org-1/models/machines/me"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let h = Harness::new(ran(true));
+        let mut o = opts(&s, "models");
+        o.org = Some("other".into());
+        o.scopes = vec!["models_join".into()];
+        match h
+            .connect(o, "del-1", "mac", Duration::from_millis(10))
+            .await
+            .unwrap_err()
+        {
+            QuomeError::Usage(m) => assert!(m.contains("The approval was withdrawn."), "{m}"),
+            e => panic!("expected Usage, got {e:?}"),
+        }
     }
 
     #[tokio::test]

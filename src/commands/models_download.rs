@@ -40,6 +40,9 @@ pub struct DownloadArgs {
     /// Replace the file even while the pool server is running from it
     #[arg(long)]
     force: bool,
+    /// Use this saved connection (its API, organization and token)
+    #[arg(long)]
+    profile: Option<String>,
     /// Output as JSON
     #[arg(long)]
     json: bool,
@@ -70,34 +73,47 @@ fn bad_archive() -> QuomeError {
     refuse("The download is not a single pool server file; nothing was installed.")
 }
 
-/// The machine's `models` profile when present, else the default profile.
+/// The named profile when one is given, else the machine's `models` profile when
+/// present, else the default profile.
 fn resolve_api(
+    profile: Option<&str>,
     home: &Path,
     machine_store: &dyn KeyStore,
     default_store: &dyn Fn() -> Result<Box<dyn KeyStore>>,
 ) -> Result<CloudApi> {
     let st = CloudState::load_from(home)?;
-    let (name, store): (String, Box<dyn KeyStore + '_>) = if st.profiles.contains_key(PROFILE) {
-        // Borrowed store: wrap by reference.
-        struct Ref<'a>(&'a dyn KeyStore);
-        impl KeyStore for Ref<'_> {
-            fn put(&self, p: &str, s: &str) -> Result<()> {
-                self.0.put(p, s)
-            }
-            fn get(&self, p: &str) -> Result<String> {
-                self.0.get(p)
-            }
-            fn delete(&self, p: &str) -> Result<()> {
-                self.0.delete(p)
-            }
+    if let Some(n) = profile {
+        if !st.profiles.contains_key(n) {
+            return Err(refuse(&format!(
+                "No connection named \"{n}\". Run `quome connect --profile {n}` first."
+            )));
         }
-        (PROFILE.into(), Box::new(Ref(machine_store)))
-    } else {
-        if !st.has_user_profiles() {
-            return Err(refuse(crate::commands::cloud::NOT_CONNECTED));
-        }
-        (st.default.clone(), default_store()?)
-    };
+    }
+    let wanted = profile.unwrap_or(PROFILE);
+    let (name, store): (String, Box<dyn KeyStore + '_>) =
+        if wanted == PROFILE && st.profiles.contains_key(PROFILE) {
+            // Borrowed store: wrap by reference.
+            struct Ref<'a>(&'a dyn KeyStore);
+            impl KeyStore for Ref<'_> {
+                fn put(&self, p: &str, s: &str) -> Result<()> {
+                    self.0.put(p, s)
+                }
+                fn get(&self, p: &str) -> Result<String> {
+                    self.0.get(p)
+                }
+                fn delete(&self, p: &str) -> Result<()> {
+                    self.0.delete(p)
+                }
+            }
+            (PROFILE.into(), Box::new(Ref(machine_store)))
+        } else if let Some(n) = profile {
+            (n.to_string(), default_store()?)
+        } else {
+            if !st.has_user_profiles() {
+                return Err(refuse(crate::commands::cloud::NOT_CONNECTED));
+            }
+            (st.default.clone(), default_store()?)
+        };
     let p = st.profile(Some(&name))?.clone();
     let (key, vrc) = AgentKey::load_from(store.as_ref(), &name)?;
     Ok(CloudApi::new(&p, TokenSource::new(&p, key, vrc)))
@@ -403,7 +419,7 @@ pub async fn execute(a: DownloadArgs) -> Result<()> {
         None => (crate::cloud::state::quome_dir(&home).join("bin"), true),
     };
     let machine_store = config::key_store(&home);
-    let api = resolve_api(&home, &machine_store, &platform_store)?;
+    let api = resolve_api(a.profile.as_deref(), &home, &machine_store, &platform_store)?;
     let mut done = install(&api, &dir, a.force, private_dir, &is_running).await?;
     // Show where it really is, whatever relative or linked `--dir` was given.
     if let Ok(abs) = done.path.canonicalize() {
@@ -927,7 +943,7 @@ mod tests {
         let machine = config::key_store(home.path());
         let never: &dyn Fn() -> Result<Box<dyn KeyStore>> =
             &|| Err(QuomeError::Usage("default store must not be read".into()));
-        let api = resolve_api(home.path(), &machine, never).unwrap();
+        let api = resolve_api(None, home.path(), &machine, never).unwrap();
         install(&api, &e.bin_dir(), false, true, &|_| false)
             .await
             .unwrap();
@@ -990,7 +1006,7 @@ mod tests {
                 dir: crate::cloud::state::quome_dir(home.path()),
             }))
         };
-        let api = resolve_api(home.path(), &machine, default).unwrap();
+        let api = resolve_api(None, home.path(), &machine, default).unwrap();
         api.models_download_quexo(PLATFORM).await.unwrap();
         let seen = s.received_requests().await.unwrap();
         let dl = seen
@@ -1001,5 +1017,84 @@ mod tests {
             dl.headers.get("authorization").unwrap().to_str().unwrap(),
             "Bearer DEFAULT-TOKEN"
         );
+    }
+
+    fn member_home(s: &MockServer) -> tempfile::TempDir {
+        let home = tempfile::tempdir().unwrap();
+        let store = FileStore {
+            dir: crate::cloud::state::quome_dir(home.path()),
+        };
+        let mut p = profile(&s.uri(), "org-m");
+        p.issuer = s.uri();
+        let mut st = CloudState {
+            default: "cloud".into(),
+            ..Default::default()
+        };
+        st.profiles.insert("pool-member".into(), p.clone());
+        st.profiles.insert("cloud".into(), p);
+        st.save_to(home.path()).unwrap();
+        AgentKey::generate()
+            .store_in(&store, "pool-member", "vrc")
+            .unwrap();
+        home
+    }
+
+    #[tokio::test]
+    async fn the_named_profile_token_and_org_are_used() {
+        let s = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"token_endpoint": format!("{}/oauth/token", s.uri())}),
+            ))
+            .mount(&s)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "MEMBER-TOKEN", "token_type": "Bearer", "expires_in": 3600
+            })))
+            .mount(&s)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/orgs/org-m/models/downloads/quexo"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"x".to_vec()))
+            .mount(&s)
+            .await;
+        let home = member_home(&s);
+        let machine = config::key_store(home.path());
+        let default: &dyn Fn() -> Result<Box<dyn KeyStore>> = &|| {
+            Ok(Box::new(FileStore {
+                dir: crate::cloud::state::quome_dir(home.path()),
+            }))
+        };
+        let api = resolve_api(Some("pool-member"), home.path(), &machine, default).unwrap();
+        api.models_download_quexo(PLATFORM).await.unwrap();
+        let seen = s.received_requests().await.unwrap();
+        let dl = seen
+            .iter()
+            .find(|r| r.url.path().ends_with("/downloads/quexo"))
+            .unwrap();
+        assert_eq!(
+            dl.headers.get("authorization").unwrap().to_str().unwrap(),
+            "Bearer MEMBER-TOKEN"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_named_profile_is_an_error() {
+        let s = MockServer::start().await;
+        let home = member_home(&s);
+        let machine = config::key_store(home.path());
+        let default: &dyn Fn() -> Result<Box<dyn KeyStore>> = &|| {
+            Ok(Box::new(FileStore {
+                dir: crate::cloud::state::quome_dir(home.path()),
+            }))
+        };
+        let err = resolve_api(Some("nope"), home.path(), &machine, default)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("\"nope\""), "{err}");
     }
 }
