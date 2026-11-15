@@ -73,6 +73,8 @@ pub struct Timing {
     pub upgrade_every: Duration,
     /// How long a stop waits for requests in flight.
     pub drain: Duration,
+    /// (The check runs the whole advert closure: it is one dependency, and for a pool the extra
+    /// work is a few loopback requests every couple of seconds, only while serving through quexo.)
     /// How often a pool's set-up is checked between periodic adverts; an advert is sent
     /// when it (or the pool's health) changed. Only for `server: "quexo"`.
     pub setup_watch_every: Duration,

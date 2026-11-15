@@ -153,8 +153,14 @@ pub fn interpret(status: u16, body: &Value) -> (PoolProbe, Option<&'static str>)
             (probe, None)
         }
         Err(why) => {
-            probe.healthy = false;
-            (probe, Some(why))
+            // A refused body contributes nothing: no pool, no numbers.
+            (
+                PoolProbe {
+                    healthy: false,
+                    ..PoolProbe::default()
+                },
+                Some(why),
+            )
         }
     }
 }
@@ -404,8 +410,8 @@ mod tests {
     }
 
     #[test]
-    fn health_body_is_never_logged() {
-        // A refusal carries only a fixed reason: the type is `&'static str`, so no body
+    fn a_refusal_reason_is_a_fixed_string_so_no_body_text_reaches_the_log() {
+        // The log is stderr, so this checks the guarantee by construction: a refusal carries only a fixed reason: the type is `&'static str`, so no body
         // text can reach the log line.
         let mut h = health("ok", "serving");
         h["pool"]["backend"] = json!("SECRET-MARKER");
@@ -467,6 +473,115 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&p).unwrap(),
             r#"{"members":[{"name":"a","memory_total_bytes":1}],"backend":"ring","mode":"pipeline"}"#
+        );
+    }
+
+    fn dropped(h: &Value) -> bool {
+        let (p, why) = interpret(200, h);
+        p.pool.is_none() && !p.healthy && why.is_some()
+    }
+
+    fn kept(status: u16, h: &Value) -> bool {
+        interpret(status, h).0.pool.is_some()
+    }
+
+    fn members(n: usize) -> Value {
+        json!((0..n)
+            .map(|i| json!({"name": format!("m{i}"), "memory_total_bytes": 1u64}))
+            .collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn fast_mode_is_checked() {
+        let mut h = health("ok", "serving");
+        h["pool"]["fast_mode"]["available"] = json!("yes");
+        assert!(dropped(&h));
+        let mut h = health("ok", "serving");
+        h["pool"]["fast_mode"]["missing_rdma"] = json!(["a", "b", "c", "d", "e", "f"]);
+        assert!(dropped(&h));
+        let mut h = health("ok", "serving");
+        h["pool"]["fast_mode"]["missing_rdma"] = json!(["ok", "bad\tname"]);
+        assert!(dropped(&h));
+        let mut h = health("ok", "serving");
+        h["pool"]["fast_mode"]["missing_rdma"] = json!(["a", "b", "c", "d", "e"]);
+        assert!(kept(200, &h));
+    }
+
+    #[test]
+    fn setup_members_are_checked() {
+        let mut h = health("ok", "serving");
+        h["pool"]["setup"]["members"] = json!((0..6)
+            .map(|i| json!({"name": format!("m{i}"), "status": "ready", "detail": ""}))
+            .collect::<Vec<_>>());
+        assert!(dropped(&h));
+        let mut h = health("ok", "serving");
+        h["pool"]["setup"]["members"][0]["name"] = json!("");
+        assert!(dropped(&h));
+        let mut h = health("ok", "serving");
+        h["pool"]["setup"]["members"][1]["name"] = json!("a".repeat(65));
+        assert!(dropped(&h));
+    }
+
+    #[test]
+    fn member_count_depends_on_the_setup_state() {
+        for state in ["installing", "checking", "pairing"] {
+            let mut h = health("starting", state);
+            h["pool"]["members"] = members(1);
+            assert!(kept(503, &h), "1 member in {state}");
+            h["pool"]["members"] = members(0);
+            assert!(dropped(&h), "0 members in {state}");
+            h["pool"]["members"] = members(6);
+            assert!(dropped(&h), "6 members in {state}");
+            h["pool"]["members"] = members(5);
+            assert!(kept(503, &h), "5 members in {state}");
+        }
+        let mut h = health("degraded", "degraded");
+        h["pool"]["members"] = members(1);
+        assert!(dropped(&h));
+        let mut h = health("ok", "serving");
+        h["pool"]["members"] = members(2);
+        assert!(kept(200, &h));
+        h["pool"]["members"] = members(5);
+        assert!(kept(200, &h));
+    }
+
+    #[test]
+    fn boundaries_are_accepted() {
+        let mut h = health("ok", "serving");
+        h["pool"]["members"][0]["name"] = json!("a".repeat(64));
+        h["pool"]["setup"]["members"][0]["detail"] = json!("d".repeat(200));
+        let (p, why) = interpret(200, &h);
+        assert!(why.is_none() && p.healthy);
+        assert_eq!(p.pool.unwrap().members[0].name.len(), 64);
+    }
+
+    #[test]
+    fn a_refused_body_contributes_no_numbers() {
+        let mut h = health("ok", "serving");
+        h["pool"]["backend"] = json!("nope");
+        let (p, why) = interpret(200, &h);
+        assert!(why.is_some());
+        assert_eq!(p, PoolProbe::default());
+        // So the advert keeps the local machine's own numbers and is unhealthy.
+        let base = Advert {
+            server: "quexo".into(),
+            models: vec![],
+            memory_total_bytes: 7,
+            memory_free_bytes: 3,
+            accelerator: "cpu".into(),
+            max_concurrency: 2,
+            healthy: true,
+            pool: None,
+        };
+        let a = apply(base, p);
+        assert_eq!(
+            (
+                a.healthy,
+                a.memory_total_bytes,
+                a.memory_free_bytes,
+                a.max_concurrency
+            ),
+            (false, 7, 3, 2)
         );
     }
 }
