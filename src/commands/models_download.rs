@@ -806,16 +806,34 @@ mod tests {
         assert!(!is_running(Path::new("/nonexistent/quexo")));
     }
 
+    /// Run only by `a_spawned_copy_is_seen_in_the_process_table`, as a long-lived child.
+    #[test]
+    #[ignore = "a helper process for the process-table test"]
+    fn sleeper() {
+        std::thread::sleep(std::time::Duration::from_secs(30));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn a_spawned_copy_is_seen_in_the_process_table() {
         let d = tempfile::tempdir().unwrap();
         let target = d.path().join("quexo");
-        std::fs::copy("/bin/sleep", &target).unwrap();
+        // Copy this test binary (not /bin/sleep: on some images that is a multi-call binary that
+        // exits at once when started under another name) and run only the ignored sleeper test.
+        std::fs::copy(std::env::current_exe().unwrap(), &target).unwrap();
         // A just-copied file can still be open for writing: retry on "Text file busy".
         let mut tries = 0;
         let mut child = loop {
-            match std::process::Command::new(&target).arg("30").spawn() {
+            match std::process::Command::new(&target)
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "commands::models_download::tests::sleeper",
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
                 Ok(c) => break c,
                 Err(e) if e.raw_os_error() == Some(26) && tries < 10 => {
                     tries += 1;
