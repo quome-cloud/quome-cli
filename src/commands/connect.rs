@@ -499,7 +499,10 @@ pub async fn run(opts: Options, deps: &Deps<'_>) -> Result<Outcome> {
     key.store_in(deps.store, &profile_name, &cb.vrc)?;
     let mut st = CloudState::load_from(&deps.home)?;
     st.profiles.insert(profile_name.clone(), profile.clone());
+    // A connect asking for specific capabilities (a machine's or a pool member's own scope) is
+    // purpose-bound: it never becomes the default profile the other commands use.
     if opts.profile != crate::machine::config::PROFILE
+        && opts.scopes.is_empty()
         && (st.default.is_empty() || !opts.profile_given)
     {
         st.default = profile_name.clone();
@@ -1433,6 +1436,28 @@ mod tests {
         assert_eq!(std::fs::read(&key_path).unwrap(), key_before);
         let st = CloudState::load_from(h.home.path()).unwrap();
         assert_eq!(st.profiles["work"], old.profile);
+    }
+
+    #[tokio::test]
+    async fn a_scoped_connect_never_becomes_the_default_profile() {
+        let s = MockServer::start().await;
+        mount_auth(&s).await;
+        mount_me(&s, 0).await;
+        let h = Harness::new(ClaudeResult::NotFound);
+        let mut o = opts(&s, "pool-member");
+        o.scopes = vec!["models_join".into()];
+        h.connect(o, "del-1", "mac", Duration::from_millis(10))
+            .await
+            .unwrap();
+        let st = CloudState::load_from(h.home.path()).unwrap();
+        assert!(st.profiles.contains_key("pool-member"));
+        assert!(st.default.is_empty(), "default became {:?}", st.default);
+        // An ordinary connect afterwards still becomes the default.
+        h.connect(opts(&s, "work"), "del-2", "mac", Duration::from_millis(10))
+            .await
+            .unwrap();
+        let st = CloudState::load_from(h.home.path()).unwrap();
+        assert_eq!(st.default, "work");
     }
 
     #[tokio::test]
