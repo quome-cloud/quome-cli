@@ -176,13 +176,21 @@ It prints the installed path. With `--json` it prints `{"path", "version", "sha2
 
 ### Serving a pool of Macs
 
+The console shows an install line for each step. Run the line with `--pool-member` on each of the other Macs: it checks the Mac and shows a pairing code. Then run the line with `--pool` on the first Mac: it finds the others over Thunderbolt and asks for their codes.
+
+Underneath, the first Mac runs:
+
 ```
+quome models connect <api> --org <org> --server quexo --url http://127.0.0.1:52415
 quome models download quexo
-quome models connect --server quexo
 quome models serve --install
 ```
 
 `--server quexo` makes this machine front the pool server at its default local address (see `models.toml` below); the pool server itself is started from `~/.quome/bin/quexo`.
+
+While the machine serves, it asks the pool server's `/health` (3 second timeout) and reports the pool in its advert: the Macs and their memory, the backend, the mode, the set-up progress and whether fast mode is available. Memory and concurrency in the advert are the pool's, not this Mac's. A pool that is not `ok` (still starting, or degraded) is reported as not healthy, and the platform does not send it requests. A report that fails its checks (more than five Macs, an unknown backend, mode or status, a name over 64 characters) is dropped whole, and the log line names only the check that failed, never the report. A change in set-up progress is sent within a few seconds instead of waiting for the next periodic advert.
+
+Fast mode needs a step in Recovery on each Mac; the console lists the Macs that still need it.
 
 ## Files
 

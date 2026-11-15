@@ -43,6 +43,31 @@ pub struct Pool {
     pub members: Vec<PoolMember>,
     pub backend: String,
     pub mode: String,
+    /// Set-up progress of a pool; absent for every other advert.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub setup: Option<PoolSetup>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub fast_mode: Option<FastMode>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct PoolSetup {
+    /// "pairing" | "installing" | "checking" | "serving" | "degraded"
+    pub state: String,
+    pub members: Vec<SetupMember>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct SetupMember {
+    pub name: String,
+    pub status: String,
+    pub detail: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct FastMode {
+    pub available: bool,
+    pub missing_rdma: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
