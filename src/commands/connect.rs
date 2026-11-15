@@ -470,7 +470,15 @@ pub async fn run(opts: Options, deps: &Deps<'_>) -> Result<Outcome> {
         if org.slug != want {
             // The approval is live in the other org: for a machine, withdraw
             // it (best effort; the token is only used, never shown).
-            let withdrawn = !opts.scopes.is_empty()
+            if opts.scopes != ["models_serve"] && !opts.scopes.is_empty() {
+                return Err(QuomeError::Usage(format!(
+                    "This approval is for organization \"{}\", not \"{want}\". \
+                     You approved it for another organization; revoke it under Agents there, \
+                     then run this again with --org {want}.",
+                    org.slug
+                )));
+            }
+            let withdrawn = opts.scopes == ["models_serve"]
                 && withdraw_machine(&profile, &mem, &profile_name, &org.id).await;
             return Err(QuomeError::Usage(format!(
                 "This approval is for organization \"{}\", not \"{want}\". \
@@ -1324,16 +1332,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn any_scoped_approval_for_another_org_is_withdrawn() {
+    async fn a_member_approval_for_another_org_is_not_withdrawn_and_gets_a_hint() {
         let s = MockServer::start().await;
         mount_auth(&s).await;
         mount_me(&s, 0).await;
-        Mock::given(method("DELETE"))
-            .and(path("/api/v1/orgs/org-1/models/machines/me"))
-            .respond_with(ResponseTemplate::new(204))
-            .expect(1)
-            .mount(&s)
-            .await;
         let h = Harness::new(ran(true));
         let mut o = opts(&s, "models");
         o.org = Some("other".into());
@@ -1343,9 +1345,16 @@ mod tests {
             .await
             .unwrap_err()
         {
-            QuomeError::Usage(m) => assert!(m.contains("The approval was withdrawn."), "{m}"),
+            QuomeError::Usage(m) => {
+                assert!(m.contains("revoke it under Agents there"), "{m}");
+                assert!(m.contains("--org other"), "{m}");
+                assert!(!m.contains("withdrawn"), "{m}");
+            }
             e => panic!("expected Usage, got {e:?}"),
         }
+        let seen = s.received_requests().await.unwrap();
+        assert!(seen.iter().all(|r| r.method.as_str() != "DELETE"));
+        assert!(!h.home.path().join(".quome/cloud.json").exists());
     }
 
     #[tokio::test]
