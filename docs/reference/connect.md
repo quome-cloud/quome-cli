@@ -19,7 +19,10 @@ Options:
       --profile <PROFILE>  Profile to save the connection under
       --console <CONSOLE>  Console URL (default: the API URL with `api.` replaced by `console.`)
       --issuer <ISSUER>    Issuer URL (default: the API URL with `api.` replaced by `auth.`)
-      --no-mcp             Do not register the MCP server with Claude Code
+      --no-mcp             Do not register the MCP server or install skills in any agent client
+      --client <CLIENT>    Set up only these clients: claude, codex, opencode, antigravity (default: every installed client)
+      --scope <SCOPE>      Ask the approval for only these capabilities (repeatable, or comma-separated)
+      --org <ORG>          The organization (slug) the approval must be for
       --json               Output as JSON
   -h, --help               Print help
 ```
@@ -70,6 +73,8 @@ An existing user-scope `quome` server is replaced, so reconnecting updates it. I
 ```
 
 Pass `--no-mcp` to skip registration entirely.
+
+`--scope <capability>` (repeatable, or comma-separated) asks the approval page for only those capabilities, for example `--scope models_join`. `--org <slug>` names the organization the approval must be for. If the approval lands in another organization, nothing is saved and the command says so. A `models_serve` approval is withdrawn automatically; for any other scope, revoke it under Agents in that organization, then run the command again with the right `--org`.
 
 ### macOS Keychain prompt after an upgrade
 

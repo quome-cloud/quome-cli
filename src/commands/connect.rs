@@ -46,6 +46,12 @@ pub struct Args {
     /// (default: every installed client)
     #[arg(long, value_delimiter = ',', value_parser = ClientId::parse)]
     client: Vec<ClientId>,
+    /// Ask the approval for only these capabilities (repeatable, or comma-separated)
+    #[arg(long, value_delimiter = ',')]
+    scope: Vec<String>,
+    /// The organization (slug) the approval must be for
+    #[arg(long)]
+    org: Option<String>,
     /// Output as JSON
     #[arg(long)]
     json: bool,
@@ -464,6 +470,14 @@ pub async fn run(opts: Options, deps: &Deps<'_>) -> Result<Outcome> {
         if org.slug != want {
             // The approval is live in the other org: for a machine, withdraw
             // it (best effort; the token is only used, never shown).
+            if opts.scopes != ["models_serve"] && !opts.scopes.is_empty() {
+                return Err(QuomeError::Usage(format!(
+                    "This approval is for organization \"{}\", not \"{want}\". \
+                     You approved it for another organization; revoke it under Agents there, \
+                     then run this again with --org {want}.",
+                    org.slug
+                )));
+            }
             let withdrawn = opts.scopes == ["models_serve"]
                 && withdraw_machine(&profile, &mem, &profile_name, &org.id).await;
             return Err(QuomeError::Usage(format!(
@@ -485,7 +499,10 @@ pub async fn run(opts: Options, deps: &Deps<'_>) -> Result<Outcome> {
     key.store_in(deps.store, &profile_name, &cb.vrc)?;
     let mut st = CloudState::load_from(&deps.home)?;
     st.profiles.insert(profile_name.clone(), profile.clone());
+    // A connect asking for specific capabilities (a machine's or a pool member's own scope) is
+    // purpose-bound: it never becomes the default profile the other commands use.
     if opts.profile != crate::machine::config::PROFILE
+        && opts.scopes.is_empty()
         && (st.default.is_empty() || !opts.profile_given)
     {
         st.default = profile_name.clone();
@@ -767,8 +784,8 @@ pub async fn execute(args: Args) -> Result<()> {
         issuer: args.issuer,
         no_mcp: args.no_mcp,
         clients: args.client,
-        scopes: vec![],
-        org: None,
+        scopes: args.scope,
+        org: args.org,
     };
     let out = run(opts, &deps).await?;
     let p = &out.profile;
@@ -888,6 +905,25 @@ mod tests {
             connect_url("https://console.x", "mac", &k, 4242, "st", &[], None),
             want
         );
+    }
+
+    #[test]
+    fn scope_and_org_flags_reach_the_connect_url() {
+        let a =
+            Args::try_parse_from(["connect", "--scope", "a,b", "--scope", "c", "--org", "acme"])
+                .unwrap();
+        assert_eq!(a.scope, ["a", "b", "c"]);
+        let k = AgentKey::generate();
+        let u = connect_url(
+            "https://console.x",
+            "mac",
+            &k,
+            4242,
+            "st",
+            &a.scope,
+            a.org.as_deref(),
+        );
+        assert!(u.ends_with("&scope=a%20b%20c&org=acme"), "{u}");
     }
 
     #[test]
@@ -1299,6 +1335,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_member_approval_for_another_org_is_not_withdrawn_and_gets_a_hint() {
+        let s = MockServer::start().await;
+        mount_auth(&s).await;
+        mount_me(&s, 0).await;
+        let h = Harness::new(ran(true));
+        let mut o = opts(&s, "models");
+        o.org = Some("other".into());
+        o.scopes = vec!["models_join".into()];
+        match h
+            .connect(o, "del-1", "mac", Duration::from_millis(10))
+            .await
+            .unwrap_err()
+        {
+            QuomeError::Usage(m) => {
+                assert!(m.contains("revoke it under Agents there"), "{m}");
+                assert!(m.contains("--org other"), "{m}");
+                assert!(!m.contains("withdrawn"), "{m}");
+            }
+            e => panic!("expected Usage, got {e:?}"),
+        }
+        let seen = s.received_requests().await.unwrap();
+        assert!(seen.iter().all(|r| r.method.as_str() != "DELETE"));
+        assert!(!h.home.path().join(".quome/cloud.json").exists());
+    }
+
+    #[tokio::test]
     async fn a_failed_withdrawal_still_refuses_and_stays_quiet() {
         let s = MockServer::start().await;
         mount_auth(&s).await;
@@ -1374,6 +1436,28 @@ mod tests {
         assert_eq!(std::fs::read(&key_path).unwrap(), key_before);
         let st = CloudState::load_from(h.home.path()).unwrap();
         assert_eq!(st.profiles["work"], old.profile);
+    }
+
+    #[tokio::test]
+    async fn a_scoped_connect_never_becomes_the_default_profile() {
+        let s = MockServer::start().await;
+        mount_auth(&s).await;
+        mount_me(&s, 0).await;
+        let h = Harness::new(ClaudeResult::NotFound);
+        let mut o = opts(&s, "pool-member");
+        o.scopes = vec!["models_join".into()];
+        h.connect(o, "del-1", "mac", Duration::from_millis(10))
+            .await
+            .unwrap();
+        let st = CloudState::load_from(h.home.path()).unwrap();
+        assert!(st.profiles.contains_key("pool-member"));
+        assert!(st.default.is_empty(), "default became {:?}", st.default);
+        // An ordinary connect afterwards still becomes the default.
+        h.connect(opts(&s, "work"), "del-2", "mac", Duration::from_millis(10))
+            .await
+            .unwrap();
+        let st = CloudState::load_from(h.home.path()).unwrap();
+        assert_eq!(st.default, "work");
     }
 
     #[tokio::test]
