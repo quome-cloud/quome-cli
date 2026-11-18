@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/quome-cli-logo-dark.svg">
+    <img src="assets/quome-cli-logo-light.svg" alt="Quome CLI" width="520"/>
+  </picture>
+</p>
+
 # Quome CLI
 
 **Deploy apps, manage secrets, and ship to HIPAA-ready infrastructure — without leaving your terminal.**
