@@ -79,15 +79,37 @@ if echo "$info" | grep -q 'Signature=adhoc'; then echo "still ad-hoc signed" >&2
 
 # Notarization. A bare executable cannot be stapled; Gatekeeper looks the
 # ticket up online, and Homebrew installs do not quarantine the file anyway.
+#
+# The wait is bounded and running out of it is not a failure. Apple can hold
+# a submission for a long time (the first ones from a new team sat past 30
+# minutes), and the ticket is issued for the binary's hash whenever Apple
+# finishes, whether or not anyone is still waiting. What the Keychain needs
+# is the signature above, which is already checked. A submission Apple
+# refuses, or one it answers with anything but Accepted, still fails.
+NOTARY_WAIT="${NOTARY_WAIT:-10m}"
+notary=(--key "$tmp/AuthKey.p8" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID")
 ditto -c -k --keepParent "$bin" "$tmp/quome.zip"
-xcrun notarytool submit "$tmp/quome.zip" \
-  --key "$tmp/AuthKey.p8" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID" \
-  --wait --timeout 30m --output-format json >"$tmp/notary.json" || true
-status="$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("status",""))' "$tmp/notary.json" 2>/dev/null || true)"
-id="$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("id",""))' "$tmp/notary.json" 2>/dev/null || true)"
-echo "notarization: ${status:-no result} ${id}"
-if [ "$status" != "Accepted" ]; then
-  [ -z "$id" ] || xcrun notarytool log "$id" \
-    --key "$tmp/AuthKey.p8" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID" || true
-  exit 1
+xcrun notarytool submit "$tmp/quome.zip" "${notary[@]}" \
+  --wait --timeout "$NOTARY_WAIT" --output-format json >"$tmp/notary.json" || true
+field() { /usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2],""))' "$tmp/notary.json" "$1" 2>/dev/null || true; }
+status="$(field status)"; id="$(field id)"; message="$(field message)"
+echo "notarization: ${status:-no status} ${id} ${message}"
+if [ "$status" = "Accepted" ]; then
+  exit 0
 fi
+[ -n "$id" ] || { echo "the notary service did not take the submission" >&2; exit 1; }
+if [ -z "$status" ]; then
+  # Submitted, not answered within the wait.
+  now="$(xcrun notarytool info "$id" "${notary[@]}" --output-format json 2>/dev/null |
+    /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin).get("status",""))' 2>/dev/null || true)"
+  if [ "$now" = "In Progress" ]; then
+    msg="Notarization $id is still in progress at Apple after $NOTARY_WAIT; shipping the signed binary. Check later with: xcrun notarytool info $id"
+    echo "::warning title=Notarization pending::$msg"
+    exit 0
+  fi
+  status="$now"
+  [ "$status" != "Accepted" ] || exit 0
+fi
+echo "notarization ended as: ${status:-unknown}" >&2
+xcrun notarytool log "$id" "${notary[@]}" || true
+exit 1
