@@ -1,0 +1,62 @@
+name: Signing check
+
+# Signs and notarizes a build without releasing it, on pull requests that
+# touch the signing path. A release happens on every push to main, so this
+# is the only place a change to signing is tried before it ships.
+on:
+  pull_request:
+    paths:
+      - scripts/sign-macos.sh
+      - .github/workflows/signing-check.yml
+      - .github/workflows/release.yml
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  sign:
+    name: Sign and notarize ${{ matrix.target }}
+    # Secrets are not available to pull requests from forks.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Sign and notarize
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: scripts/sign-macos.sh target/${{ matrix.target }}/release/quome
+
+      # The signature must survive the tarball the release ships, and the
+      # native build must still start under the hardened runtime.
+      - name: The packaged binary verifies and runs
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar -czf quome.tar.gz quome
+          mkdir out && tar -xzf quome.tar.gz -C out
+          codesign --verify --strict --verbose=2 out/quome
+          spctl --assess --type execute --verbose=4 out/quome 2>&1 || true
+          if [ "${{ matrix.target }}" = "$(rustc -vV | sed -n 's/^host: //p')" ]; then
+            out/quome --version
+          fi
