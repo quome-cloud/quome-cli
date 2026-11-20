@@ -53,9 +53,10 @@ jobs:
           else
             TAG_COMMIT=$(git rev-list -n 1 "$LATEST_TAG" 2>/dev/null || echo "")
           fi
-          HEAD_COMMIT=$(git rev-parse HEAD)
-
-          if [ "$TAG_COMMIT" = "$HEAD_COMMIT" ]; then
+          # A release tag sits on a version-bump commit whose parent is the
+          # main commit it was cut from (the bump is not pushed to main), so
+          # "nothing new" is: HEAD is that tag's commit or an ancestor of it.
+          if [ -n "$TAG_COMMIT" ] && git merge-base --is-ancestor HEAD "$TAG_COMMIT"; then
             echo "No new commits since last tag"
             echo "should_release=false" >> $GITHUB_OUTPUT
           else
@@ -108,14 +109,19 @@ jobs:
           if ! git diff --cached --quiet; then
             git commit -m "chore: bump version to ${{ steps.increment.outputs.new_tag }}"
           fi
+          # Only the tag is pushed. The bump commit lives on the tag, not on
+          # main, so this job never writes to the protected branch.
           git tag ${{ steps.increment.outputs.new_tag }}
-          git push origin main --tags
+          git push origin "refs/tags/${{ steps.increment.outputs.new_tag }}"
 
   build:
     name: Build ${{ matrix.target }}
     needs: version
     if: needs.version.outputs.should_release == 'true'
     runs-on: ${{ matrix.os }}
+    # The signing secrets live in this environment, which only runs from
+    # main: a branch or pull request cannot reach them.
+    environment: release
     strategy:
       matrix:
         include:
@@ -132,8 +138,9 @@ jobs:
           ref: ${{ needs.version.outputs.new_tag }}
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable branch
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
 
       - name: Build release binary
@@ -215,7 +222,7 @@ jobs:
           path: artifacts
 
       - name: Create release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ needs.version.outputs.new_tag }}
           body: ${{ steps.notes.outputs.notes }}
