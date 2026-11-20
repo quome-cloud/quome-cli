@@ -76,9 +76,18 @@ Pass `--no-mcp` to skip registration entirely.
 
 `--scope <capability>` (repeatable, or comma-separated) asks the approval page for only those capabilities, for example `--scope models_join`. `--org <slug>` names the organization the approval must be for. If the approval lands in another organization, nothing is saved and the command says so. A `models_serve` approval is withdrawn automatically; for any other scope, revoke it under Agents in that organization, then run the command again with the right `--org`.
 
-### macOS Keychain prompt after an upgrade
+### macOS Keychain prompt
 
-On macOS the private key is a Keychain item that only the binary that created it may read without asking. The release binaries are not Developer-ID signed yet, so after a `brew upgrade quome` the first `quome mcp` start (or `quome cloud status`) can show a dialog: "quome wants to use your confidential information stored in "cloud.quome.agent" in your keychain." Choose **Always Allow**. If you choose Deny, or the dialog goes unseen, Claude Code shows the quome MCP server as failed with "Quome Cloud key storage: …"; restart it (`/mcp` in Claude Code) and answer the dialog, or run `quome cloud status` in a terminal to trigger it there.
+On macOS the private key is a Keychain item that only the program that created it may read without asking. Release binaries are signed with Quome's Developer ID under the fixed identifier `cloud.quome.cli` and notarized by Apple, so the Keychain treats every release as the same program and a `brew upgrade quome` does not ask again.
+
+You see the dialog ("quome wants to use your confidential information stored in "cloud.quome.agent" in your keychain.") in two cases:
+
+- **Once, on the first signed release**, if your key was saved by an earlier unsigned release. Choose **Always Allow**; later upgrades stay quiet.
+- **With a binary you built yourself**, which is not signed with that identity. Each new build asks again.
+
+If you choose Deny, or the dialog goes unseen, Claude Code shows the quome MCP server as failed with "Quome Cloud key storage: …"; restart it (`/mcp` in Claude Code) and answer the dialog, or run `quome cloud status` in a terminal to trigger it there.
+
+To check a binary: `codesign -dvv "$(which quome)"` prints `Identifier=cloud.quome.cli` and an `Authority=Developer ID Application: …` line.
 
 ### Profiles and reconnecting
 
