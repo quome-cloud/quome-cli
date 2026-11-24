@@ -1599,7 +1599,7 @@ dependencies = [
 
 [[package]]
 name = "quome-cli"
-version = "0.2.46"
+version = "0.2.50"
 dependencies = [
  "base64",
  "bytes",

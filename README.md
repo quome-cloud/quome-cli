@@ -104,8 +104,9 @@ Full walkthrough with expected output: **[Getting started](docs/getting-started.
 | `quome cloud status` / `disconnect` | **Quome Cloud:** check or drop the connection | [Cloud](docs/reference/cloud.md) |
 | `quome git-credential` | **Quome Cloud:** lets plain git sign in to the org's repos | [Git credential](docs/reference/git-credential.md) |
 | `quome models …` | **Quome Cloud:** serve this computer's local models (Ollama, vLLM, llama.cpp, MLX) to your organization, or download the pool server for pooled Macs | [Models](docs/reference/models.md) |
+| `quome desktop …` | **Quome Cloud:** link a dedicated Apple silicon Mac as a desktop your organization's agents can use | [Desktop](docs/reference/desktop.md) |
 
-All commands above these five rows, including `quome login`, are Quome Enterprise and unchanged.
+All commands above these six rows, including `quome login`, are Quome Enterprise and unchanged.
 
 ## Documentation
 
