@@ -98,6 +98,7 @@ fn auto_login(run: &dyn CommandRunner) -> Check {
     )
     .map(|s| s.trim().to_string());
     match (set, me) {
+        (_, None) => check("auto_login", true, "Could not check automatic login."),
         (Some(u), Some(m)) if !u.is_empty() && u == m => {
             check("auto_login", true, "This account signs in automatically.")
         }
@@ -148,8 +149,26 @@ fn screen_lock(run: &dyn CommandRunner) -> Check {
     }
 }
 
+/// `pmset -g custom`: the idle-sleep minutes in the `AC Power:` section only.
+pub fn ac_sleep_minutes(text: &str) -> Option<u32> {
+    let mut lines = text.lines().skip_while(|l| l.trim() != "AC Power:");
+    lines.next()?;
+    let section: Vec<&str> = lines.take_while(|l| l.starts_with(' ')).collect();
+    sleep_minutes(&section.join("\n"))
+}
+
+/// The AC profile decides (a laptop on battery may sleep); a Mac with no AC section
+/// (a desktop) falls back to the profile in use.
 fn sleep(run: &dyn CommandRunner) -> Check {
-    match out(run, "pmset", &["-g"]).as_deref().and_then(sleep_minutes) {
+    let minutes = out(run, "pmset", &["-g", "custom"])
+        .as_deref()
+        .and_then(ac_sleep_minutes)
+        .or_else(|| {
+            out(run, "pmset", &["-g"])
+                .as_deref()
+                .and_then(sleep_minutes)
+        });
+    match minutes {
         Some(0) => check("sleep", true, "This Mac does not sleep."),
         Some(_) => check(
             "sleep",
@@ -301,12 +320,19 @@ mod tests {
         powernap             0\n disksleep            0\n sleep                0 (sleep prevented by powerd, caffeinate)\n \
         displaysleep         0\n womp                 1\n";
 
+    // `pmset -g custom` recorded read-only on a real Mac (trimmed to the lines that matter).
+    const CUSTOM: &str = "Battery Power:\n displaysleep         0\n sleep                0\n \
+        disksleep            0\nAC Power:\n displaysleep         0\n womp                 1\n \
+        sleep                0\n disksleep            0\n";
+
     struct Mac {
         groups: &'static str,
         auto: Option<&'static str>,
         fv: &'static str,
         lock: Option<&'static str>,
         pmset: String,
+        custom: Option<String>,
+        no_id: bool,
     }
 
     impl Mac {
@@ -317,10 +343,13 @@ mod tests {
                 fv: FV_ON,
                 lock: Some("0\n"),
                 pmset: PMSET.into(),
+                custom: Some(CUSTOM.into()),
+                no_id: false,
             }
         }
         fn runner(self) -> Fake {
             Fake::new(move |program, args| match program {
+                "id" if self.no_id => fail("id: failed"),
                 "id" if args == ["-Gn"] => ok(self.groups),
                 "id" => ok("agent\n"),
                 "defaults" if args.contains(&"autoLoginUser".to_string()) => match self.auto {
@@ -332,6 +361,10 @@ mod tests {
                     None => fail("Error: Could not find key 'askForPassword'"),
                 },
                 "fdesetup" => ok(self.fv),
+                "pmset" if args == ["-g", "custom"] => match &self.custom {
+                    Some(c) => ok(c),
+                    None => fail("unsupported"),
+                },
                 "pmset" => ok(&self.pmset),
                 "codesign" => ok(""),
                 _ => fail("unexpected"),
@@ -374,6 +407,11 @@ mod tests {
     fn standard_account_check() {
         let c = get(&run_all(Mac::good(), None, None), "standard_account");
         assert!(c.ok);
+        assert!(!is_admin("staff subadmin _admin"));
+        let mut m = Mac::good();
+        m.no_id = true;
+        let c = get(&run_all(m, None, None), "standard_account");
+        assert!(c.ok && c.say.starts_with("Could not check"));
         let mut m = Mac::good();
         m.groups = GROUPS_ADMIN;
         let c = get(&run_all(m, None, None), "standard_account");
@@ -393,6 +431,11 @@ mod tests {
         let mut m = Mac::good();
         m.auto = Some("someone-else\n");
         assert!(!get(&run_all(m, None, None), "auto_login").ok);
+        // Cannot tell who this is: a note, not a failure.
+        let mut m = Mac::good();
+        m.no_id = true;
+        let c = get(&run_all(m, None, None), "auto_login");
+        assert!(c.ok && c.say.starts_with("Could not check"));
     }
 
     #[test]
@@ -424,9 +467,34 @@ mod tests {
     #[test]
     fn sleep_check() {
         assert!(get(&run_all(Mac::good(), None, None), "sleep").ok);
+        // AC never sleeps, battery sleeps after 10: passes.
         let mut m = Mac::good();
+        m.custom = Some(CUSTOM.replacen("sleep                0", "sleep                10", 1));
+        assert!(get(&run_all(m, None, None), "sleep").ok);
+        // AC sleeps after 10: fails.
+        let mut m = Mac::good();
+        m.custom = Some(CUSTOM.replacen(
+            "AC Power:\n displaysleep         0\n womp                 1\n \
+        sleep                0",
+            "AC Power:\n displaysleep         0\n womp                 1\n \
+        sleep                10",
+            1,
+        ));
+        assert!(!get(&run_all(m, None, None), "sleep").ok);
+        // No AC section: falls back to `pmset -g`.
+        let mut m = Mac::good();
+        m.custom = Some("Battery Power:\n sleep                0\n".into());
         m.pmset = PMSET.replace("sleep                0 (", "sleep                10 (");
         assert!(!get(&run_all(m, None, None), "sleep").ok);
+        let mut m = Mac::good();
+        m.custom = None;
+        assert!(get(&run_all(m, None, None), "sleep").ok);
+        // Nothing readable: a note.
+        let mut m = Mac::good();
+        m.custom = None;
+        m.pmset = "garbage".into();
+        let c = get(&run_all(m, None, None), "sleep");
+        assert!(c.ok && c.say.starts_with("Could not check"));
         assert_eq!(sleep_minutes(" sleep   0\n displaysleep 5"), Some(0));
         assert_eq!(sleep_minutes(" displaysleep 5"), None);
     }
