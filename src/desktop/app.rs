@@ -31,6 +31,9 @@ const MAX_DOWNLOAD: u64 = 512 * 1024 * 1024;
 const MAX_UNPACKED: u64 = 1024 * 1024 * 1024;
 /// The most entries the archive may hold.
 const MAX_ENTRIES: usize = 100_000;
+/// What the decompressed tar stream may hold beyond the unpacked files: headers,
+/// padding, long names and extended headers.
+const STREAM_SLACK: u64 = 256 * 1024 * 1024;
 /// A leftover temporary download or old bundle older than this is removed.
 const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(3600);
 
@@ -126,13 +129,15 @@ fn current_uid() -> u32 {
     0
 }
 
-/// Download, check and install the app into `~/Applications`.
+/// Download, check and install the app into `~/Applications`. `env` is read for
+/// `QUOME_DESKTOP_DEV`.
 pub async fn install_app(
     api: &CloudApi,
     home: &Path,
     run: &dyn CommandRunner,
+    env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<InstalledApp> {
-    let ctx = InstallCtx::real(&crate::cloud::clients::real_env)?;
+    let ctx = InstallCtx::real(env)?;
     install_app_with(api, home, run, &ctx).await
 }
 
@@ -200,6 +205,61 @@ fn remove_any(p: &Path) {
     }
 }
 
+/// An install interrupted between moving the old bundle aside and moving the new one in
+/// leaves no app and an `.old.*` bundle: put the newest such bundle back. The caller
+/// restarts the app's job afterwards, as after any install.
+fn restore_interrupted(apps: &Path, target: &Path) {
+    if std::fs::symlink_metadata(target).is_ok() {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(apps) else {
+        return;
+    };
+    let newest = rd
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with(OLD_PREFIX))
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter(|e| e.path().join(EXECUTABLE).is_file())
+        .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok());
+    if let Some(e) = newest {
+        let _ = std::fs::rename(e.path(), target);
+    }
+}
+
+/// Create `dir` (its parent exists), failing if anything is already there, then make it
+/// 0700 whatever the umask.
+fn make_new_private_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        std::fs::DirBuilder::new().mode(0o700).create(dir)?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir(dir)
+    }
+}
+
+/// Reads at most `cap` bytes from `inner`; past that it fails and sets `tripped`.
+struct CappedReader<R> {
+    inner: R,
+    left: u64,
+    tripped: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
+impl<R: Read> Read for CappedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n as u64 > self.left {
+            self.tripped.set(true);
+            return Err(std::io::Error::other("the archive is too large"));
+        }
+        self.left -= n as u64;
+        Ok(n)
+    }
+}
+
 /// Delete temporary downloads and old bundles an earlier, interrupted run left behind.
 fn sweep_stale(dir: &Path) {
     let Ok(rd) = std::fs::read_dir(dir) else {
@@ -261,6 +321,10 @@ pub async fn install_app_with(
     run: &dyn CommandRunner,
     ctx: &InstallCtx,
 ) -> Result<InstalledApp> {
+    let apps = applications(home);
+    let target = app_path(home);
+    restore_interrupted(&apps, &target);
+
     // A local build cannot vouch for the app's developer: refuse before downloading.
     let self_team = codesign_info(run, &ctx.self_exe).team;
     if self_team.is_none() && !ctx.dev {
@@ -285,7 +349,6 @@ pub async fn install_app_with(
         return Err(refuse(TOO_BIG));
     }
 
-    let apps = applications(home);
     make_dir(&apps, 0o755)?;
     sweep_stale(&apps);
 
@@ -319,9 +382,10 @@ pub async fn install_app_with(
     // 2. Unpack into a fresh staging directory.
     let staging = apps.join(STAGING);
     remove_any(&staging);
-    make_dir(&staging, 0o700)?;
+    make_new_private_dir(&staging)?;
     let _staging_guard = DirGuard(staging.clone());
-    unpack_bundle(&tmp, &staging, ctx.max_unpacked)?;
+    let max_stream = ctx.max_unpacked.saturating_add(STREAM_SLACK);
+    unpack_bundle(&tmp, &staging, ctx.max_unpacked, max_stream)?;
     drop(tmp_guard);
     let new_app = staging.join(APP_DIR);
 
@@ -329,7 +393,6 @@ pub async fn install_app_with(
     check_signature(run, &new_app, self_team.as_deref())?;
 
     // 4. Swap it in.
-    let target = app_path(home);
     swap_in(run, &apps, &new_app, &target, ctx.uid)?;
     Ok(InstalledApp {
         path: target,
@@ -357,11 +420,30 @@ fn bundle_path(raw: &[u8]) -> Option<PathBuf> {
 
 /// Unpack the bundle in `tarball` into `staging`. Refuses any entry that is not a
 /// regular file or a directory inside `Quome Desktop.app/`, and an unpacked size over
-/// `max_unpacked`.
-fn unpack_bundle(tarball: &Path, staging: &Path, max_unpacked: u64) -> Result<()> {
+/// `max_unpacked`; the decompressed stream as a whole may not pass `max_stream`.
+fn unpack_bundle(tarball: &Path, staging: &Path, max_unpacked: u64, max_stream: u64) -> Result<()> {
+    let tripped = std::rc::Rc::new(std::cell::Cell::new(false));
+    let r = unpack_entries(tarball, staging, max_unpacked, max_stream, tripped.clone());
+    if tripped.get() {
+        return Err(refuse(TOO_BIG));
+    }
+    r
+}
+
+fn unpack_entries(
+    tarball: &Path,
+    staging: &Path,
+    max_unpacked: u64,
+    max_stream: u64,
+    tripped: std::rc::Rc<std::cell::Cell<bool>>,
+) -> Result<()> {
     let bad = || refuse(BAD_ARCHIVE);
     let gz = flate2::read::GzDecoder::new(std::fs::File::open(tarball)?);
-    let mut ar = tar::Archive::new(gz);
+    let mut ar = tar::Archive::new(CappedReader {
+        inner: gz,
+        left: max_stream,
+        tripped,
+    });
     let mut total = 0u64;
     let mut count = 0usize;
     for entry in ar.entries().map_err(|_| bad())? {
@@ -378,6 +460,9 @@ fn unpack_bundle(tarball: &Path, staging: &Path, max_unpacked: u64) -> Result<()
         let rel = bundle_path(&entry.path_bytes()).ok_or_else(bad)?;
         let dest = staging.join(&rel);
         if is_dir {
+            if entry.header().size().map_err(|_| bad())? != 0 {
+                return Err(bad());
+            }
             make_dir(&dest, 0o755).map_err(|_| bad())?;
             continue;
         }
@@ -429,7 +514,11 @@ fn parse_codesign(text: &str) -> SigningInfo {
             info.identifier = Some(v.trim().to_string()).filter(|v| !v.is_empty());
         } else if let Some(v) = line.strip_prefix("TeamIdentifier=") {
             let v = v.trim();
-            info.team = (!v.is_empty() && v != "not set").then(|| v.to_string());
+            // A Team ID is a short run of letters and digits; anything else (including
+            // `not set`) is no Team ID, so it can never reach the requirement below.
+            let shaped =
+                !v.is_empty() && v.len() <= 20 && v.bytes().all(|b| b.is_ascii_alphanumeric());
+            info.team = shaped.then(|| v.to_string());
         }
     }
     info
@@ -452,15 +541,25 @@ fn path_arg(p: &Path) -> String {
     p.to_string_lossy().into_owned()
 }
 
+/// The designated requirement the app must meet: an Apple-issued certificate chain whose
+/// leaf names `team`, and our bundle identifier. `team` has been checked to be letters and
+/// digits only.
+fn requirement(team: &str) -> String {
+    format!(
+        "anchor apple generic and identifier \"{BUNDLE_ID}\" and certificate leaf[subject.OU] = \"{team}\""
+    )
+}
+
 /// The staged app must pass a strict deep verify, carry the bundle identifier, and be
-/// signed by quome's own team (any team when `self_team` is `None`, the dev case).
+/// signed by quome's own team (any team when `self_team` is `None`, the dev case). With a
+/// team, the verify also tests `requirement(team)`: the `TeamIdentifier=` that `-dv`
+/// prints is only a field of the signature, which a self-made certificate could fill in.
 fn check_signature(run: &dyn CommandRunner, app: &Path, self_team: Option<&str>) -> Result<()> {
-    let verify = [
-        "--verify".into(),
-        "--strict".into(),
-        "--deep".into(),
-        path_arg(app),
-    ];
+    let mut verify: Vec<String> = vec!["--verify".into(), "--strict".into(), "--deep".into()];
+    if let Some(team) = self_team {
+        verify.push(format!("-R={}", requirement(team)));
+    }
+    verify.push(path_arg(app));
     if !matches!(
         run.run("codesign", &verify),
         RunResult::Ran { ok: true, .. }
@@ -651,6 +750,9 @@ pub mod fixture {
         pub app_team: String,
         pub app_id: String,
         pub verify_ok: bool,
+        /// The app's certificate chains to Apple; false: a self-made certificate, which
+        /// fails any `-R=anchor apple generic ...` test.
+        pub anchor_apple: bool,
         pub job_loaded: bool,
         pub probe: String,
     }
@@ -663,6 +765,7 @@ pub mod fixture {
                 app_team: TEAM.into(),
                 app_id: BUNDLE_ID.into(),
                 verify_ok: true,
+                anchor_apple: true,
                 job_loaded: false,
                 probe: r#"{"displays": 1, "main_display": {"w": 3024, "h": 1890, "scale": 2.0}}"#
                     .into(),
@@ -691,7 +794,8 @@ pub mod fixture {
                 match program {
                     "scutil" => ok(&m.computer_name),
                     "codesign" if args.first().map(String::as_str) == Some("--verify") => {
-                        if m.verify_ok {
+                        let tests_anchor = args.iter().any(|a| a.starts_with("-R=anchor apple"));
+                        if m.verify_ok && (m.anchor_apple || !tests_anchor) {
                             ok("")
                         } else {
                             fail("a sealed resource is missing or invalid")
@@ -943,7 +1047,7 @@ mod tests {
         let calls = run.calls();
         assert!(
             calls.contains(&format!(
-                "codesign --verify --strict --deep {}",
+                "codesign --verify --strict --deep -R=anchor apple generic and identifier \"cloud.quome.desktop\" and certificate leaf[subject.OU] = \"ABCDE12345\" {}",
                 staged.display()
             )),
             "{calls:?}"
@@ -1091,6 +1195,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_directory_entry_with_contents_is_refused() {
+        refused_with(
+            app_tarball_with(&[(
+                "Quome Desktop.app/Contents/Resources/",
+                tar::EntryType::Directory,
+                b"hidden data",
+                0o755,
+            )]),
+            BAD_ARCHIVE,
+        )
+        .await;
+    }
+
+    #[test]
+    fn the_decompressed_stream_is_capped() {
+        // A long name (GNU long-name data) adds to the stream, not to the files' sizes.
+        let long = format!("Quome Desktop.app/Contents/{}x", "d123456789/".repeat(60));
+        let tar_of = |with_long: bool| {
+            let mut b = tar::Builder::new(Vec::new());
+            for (name, kind, bytes, mode) in bundle_entries() {
+                b.append(
+                    &super::fixture::header(name, kind, bytes.len(), mode),
+                    bytes,
+                )
+                .unwrap();
+            }
+            if with_long {
+                let mut h = tar::Header::new_gnu();
+                h.set_size(1);
+                h.set_mode(0o644);
+                h.set_entry_type(Regular);
+                b.append_data(&mut h, &long, &b"x"[..]).unwrap();
+            }
+            b.into_inner().unwrap()
+        };
+        let (short, with_long) = (tar_of(false), tar_of(true));
+        // Past the good bundle's entries (the last 1024 bytes are the end marker) and the
+        // long name's header, partway into the long name itself.
+        let cap = (short.len() - 1024 + 512 + 100) as u64;
+        let whole = with_long.len() as u64;
+        let d = tempfile::tempdir().unwrap();
+        let fresh = |n: &str| {
+            let s = d.path().join(n);
+            std::fs::create_dir(&s).unwrap();
+            s
+        };
+        let f = d.path().join("t.tar.gz");
+        std::fs::write(&f, gz(with_long)).unwrap();
+        // Under a cap it fits, it unpacks (the long name is a real path).
+        unpack_bundle(&f, &fresh("a"), 1 << 20, whole).unwrap();
+        assert!(d.path().join("a").join(&long).is_file());
+        let err = unpack_bundle(&f, &fresh("b"), 1 << 20, cap).unwrap_err();
+        assert_eq!(err.to_string(), TOO_BIG);
+    }
+
+    #[test]
+    fn the_staging_directory_must_be_new_and_private() {
+        let d = tempfile::tempdir().unwrap();
+        let s = d.path().join(".quome-desktop.new");
+        make_new_private_dir(&s).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&s).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+        }
+        assert!(make_new_private_dir(&s).is_err());
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_swap_puts_the_old_app_back() {
+        let e = Env::new().await;
+        // The old bundle was moved aside; the new one never arrived.
+        let aside = e.apps().join(".quome-desktop.old.4242");
+        std::fs::create_dir_all(aside.join("Contents/MacOS")).unwrap();
+        std::fs::write(aside.join(EXECUTABLE), b"old").unwrap();
+        e.serve(app_tarball(), Some("0".repeat(64))).await;
+        assert_eq!(e.install().await.unwrap_err().to_string(), MISMATCH);
+        let target = app_path(e.home.path());
+        assert_eq!(std::fs::read(target.join(EXECUTABLE)).unwrap(), b"old");
+        assert_eq!(e.leftovers(), vec![APP_DIR.to_string()]);
+        // With an app in place, an `.old.*` bundle is left for the sweep.
+        let aside = e.apps().join(".quome-desktop.old.4243");
+        std::fs::create_dir_all(aside.join("Contents/MacOS")).unwrap();
+        std::fs::write(aside.join(EXECUTABLE), b"older").unwrap();
+        restore_interrupted(&e.apps(), &target);
+        assert_eq!(std::fs::read(target.join(EXECUTABLE)).unwrap(), b"old");
+    }
+
+    #[tokio::test]
     async fn foreign_team_id_refused() {
         let mut e = Env::new().await;
         e.mac.app_team = "ZZZZZ99999".into();
@@ -1106,6 +1300,68 @@ mod tests {
         e.serve_good(app_tarball()).await;
         assert_eq!(e.install().await.unwrap_err().to_string(), BAD_SIGNATURE);
         e.nothing_installed();
+    }
+
+    #[tokio::test]
+    async fn the_verify_tests_apples_anchor_our_identifier_and_our_team() {
+        let e = Env::new().await;
+        e.serve_good(app_tarball()).await;
+        let run = e.mac.runner();
+        e.install_with(&run).await.unwrap();
+        let verify: Vec<String> = run
+            .calls()
+            .into_iter()
+            .filter(|c| c.starts_with("codesign --verify"))
+            .collect();
+        assert_eq!(verify.len(), 1);
+        // One argument, as codesign gets it (the fake joins arguments with spaces).
+        let want = r#"-R=anchor apple generic and identifier "cloud.quome.desktop" and certificate leaf[subject.OU] = "ABCDE12345""#;
+        assert!(verify[0].contains(want), "{}", verify[0]);
+        assert_eq!(requirement("ABCDE12345"), &want[3..]);
+    }
+
+    #[test]
+    fn the_requirement_is_one_argument() {
+        let mac = FakeMac::default();
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(vec![]));
+        struct Spy(
+            crate::cloud::clients::runner::fake::Fake,
+            std::rc::Rc<std::cell::RefCell<Vec<Vec<String>>>>,
+        );
+        impl CommandRunner for Spy {
+            fn run(&self, program: &str, args: &[String]) -> RunResult {
+                self.1.borrow_mut().push(args.to_vec());
+                self.0.run(program, args)
+            }
+        }
+        let spy = Spy(mac.runner(), seen.clone());
+        check_signature(&spy, Path::new("/x/Quome Desktop.app"), Some(TEAM)).unwrap();
+        let args = seen.borrow()[0].clone();
+        assert_eq!(
+            args,
+            [
+                "--verify".to_string(),
+                "--strict".into(),
+                "--deep".into(),
+                format!("-R={}", requirement(TEAM)),
+                "/x/Quome Desktop.app".into()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_self_made_certificate_claiming_our_team_is_refused() {
+        let mut e = Env::new().await;
+        e.mac.anchor_apple = false; // TeamIdentifier= still reads as ours
+        e.serve_good(app_tarball()).await;
+        assert_eq!(e.install().await.unwrap_err().to_string(), BAD_SIGNATURE);
+        e.nothing_installed();
+    }
+
+    #[test]
+    fn a_team_id_that_is_not_letters_and_digits_is_no_team_id() {
+        let i = parse_codesign("TeamIdentifier=AB\" or true or \"\n");
+        assert_eq!(i.team, None);
     }
 
     #[tokio::test]

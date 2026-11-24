@@ -118,9 +118,69 @@ fn scope_not_allowed(e: &QuomeError) -> bool {
     }
 }
 
-/// Link this computer: the identity step, then the computer's own set-up.
+/// True when the computer's own set-up after the identity step did not finish: no
+/// settings file, no screen in it, or no app installed.
+fn setup_unfinished(home: &Path) -> Result<bool> {
+    let done = matches!(
+        config::load(home)?,
+        Some(DesktopConfig {
+            screen: Some(_),
+            ..
+        })
+    ) && app::app_path(home).join(app::EXECUTABLE).is_file();
+    Ok(!done)
+}
+
+/// Finish the set-up of a computer that is linked already, without a second approval.
+async fn resume(o: &ConnectOpts, deps: &Deps<'_>) -> Result<Connected> {
+    let p = CloudState::load_from(&deps.home)?
+        .profile(Some(PROFILE))?
+        .clone();
+    if let Some(org) = o.org.as_deref() {
+        if org != p.org_slug {
+            return Err(QuomeError::Usage(format!(
+                "This computer is linked to org \"{}\", not \"{org}\". \
+                 Run `quome desktop connect --replace` to link it again.",
+                p.org_slug
+            )));
+        }
+    }
+    (deps.say)("This computer is linked; finishing its set-up.");
+    let cfg = match config::load(&deps.home)? {
+        Some(c) => DesktopConfig {
+            small_frames: if c.screen.is_some() {
+                c.small_frames
+            } else {
+                o.small_frames
+            },
+            ..c
+        },
+        None => DesktopConfig {
+            api: p.api_url.clone(),
+            org: p.org_slug.clone(),
+            screen: None,
+            small_frames: o.small_frames,
+        },
+    };
+    let cfg = prepare_computer(cfg, deps).await?;
+    config::save(&deps.home, &cfg)?;
+    start_computer(&cfg, deps).await?;
+    Ok(Connected {
+        org_slug: p.org_slug,
+        org_id: p.org_id,
+        name: p.agent_name,
+        expires_at: p.expires_at,
+        config: cfg,
+    })
+}
+
+/// Link this computer: the identity step, then the computer's own set-up. A computer
+/// linked already whose set-up did not finish resumes it; `--replace` links afresh.
 pub async fn connect(o: ConnectOpts, deps: &Deps<'_>) -> Result<Connected> {
     if has_desktop_profile(&deps.home)? {
+        if !o.replace && setup_unfinished(&deps.home)? {
+            return resume(&o, deps).await;
+        }
         if !o.replace {
             return Err(QuomeError::Usage(
                 "This computer is already linked. \
@@ -181,7 +241,7 @@ async fn prepare_computer(mut cfg: DesktopConfig, deps: &Deps<'_>) -> Result<Des
     let api = api_for(&deps.home, deps.store)?
         .ok_or_else(|| QuomeError::Usage("This computer is not linked.".into()))?;
     (deps.say)("Downloading Quome Desktop...");
-    let installed = app::install_app(&api, &deps.home, deps.runner).await?;
+    let installed = app::install_app(&api, &deps.home, deps.runner, deps.env).await?;
     (deps.say)(&format!(
         "Installed Quome Desktop {} in {}.",
         installed.version,
@@ -189,7 +249,11 @@ async fn prepare_computer(mut cfg: DesktopConfig, deps: &Deps<'_>) -> Result<Des
     ));
     let probe = app::probe(&installed.path, deps.runner)?;
     let (w, h, _) = app::main_display(&probe)?;
-    cfg.screen = Some(pick_size(w, h, cfg.small_frames));
+    // A size picked before (a resumed set-up) stays: the platform fixes it at the
+    // first session.
+    if cfg.screen.is_none() {
+        cfg.screen = Some(pick_size(w, h, cfg.small_frames));
+    }
     Ok(cfg)
 }
 
@@ -459,6 +523,8 @@ mod tests {
         claude: NoClaude,
         /// The "browser" delivers the approval; false = the page refused it.
         approves: bool,
+        /// `QUOME_DESKTOP_DEV=1` in the environment.
+        dev_env: bool,
         listen_timeout: Duration,
     }
 
@@ -482,6 +548,7 @@ mod tests {
                 runner: mac.runner(),
                 claude: NoClaude(Default::default()),
                 approves: true,
+                dev_env: false,
                 listen_timeout: Duration::from_secs(20),
             }
         }
@@ -492,6 +559,8 @@ mod tests {
             edit: impl Fn(&mut ConnectOpts),
         ) -> Result<Connected> {
             let say = |_: &str| {};
+            let dev_env = self.dev_env;
+            let env = move |k: &str| (dev_env && k == "QUOME_DESKTOP_DEV").then(|| "1".to_string());
             let open = |u: &str| {
                 self.opened.borrow_mut().push(u.to_string());
                 if self.approves {
@@ -506,7 +575,7 @@ mod tests {
                 claude: &self.claude,
                 runner: &self.runner,
                 on_path: &|_: &str| true,
-                env: &crate::cloud::clients::no_env,
+                env: &env,
                 say: &say,
                 hostname: "studio.local".into(),
                 listen_timeout: self.listen_timeout,
@@ -713,6 +782,90 @@ mod tests {
             .join("Applications/Quome Desktop.app")
             .exists());
         assert_eq!(config::load(h.home.path()).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn the_dev_setting_comes_from_the_connect_environment() {
+        let s = MockServer::start().await;
+        mount_platform(&s, me_ok()).await;
+        let unsigned = FakeMac {
+            self_team: None,
+            ..FakeMac::default()
+        };
+        let h = Harness::with_mac(unsigned.clone());
+        let e = h.connect(&s, |_| {}).await.unwrap_err().to_string();
+        assert_eq!(e, crate::desktop::app::UNSIGNED);
+        let mut h = Harness::with_mac(unsigned);
+        h.dev_env = true;
+        h.connect(&s, |_| {}).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unfinished_setup_resumes_without_a_second_approval() {
+        let s = MockServer::start().await;
+        mount_platform(&s, me_ok()).await;
+        let mut h = Harness::with_mac(FakeMac {
+            probe: r#"{"displays": 0, "main_display": null}"#.into(),
+            ..FakeMac::default()
+        });
+        let e = h.connect(&s, |_| {}).await.unwrap_err().to_string();
+        assert!(e.starts_with("No display is attached."), "{e}");
+        assert_eq!(config::load(h.home.path()).unwrap(), None);
+
+        // A display is attached now; running connect again finishes the set-up.
+        h.runner = FakeMac::default().runner();
+        let c = h.connect(&s, |o| o.small_frames = true).await.unwrap();
+        assert_eq!(h.opened.borrow().len(), 1, "no second approval");
+        assert_eq!(*h.store.puts.lock().unwrap(), ["desktop"]);
+        assert_eq!((c.org_slug.as_str(), c.name.as_str()), ("acme", "studio"));
+        assert_eq!(c.config.screen, Some((1440, 900)));
+        assert_eq!(config::load(h.home.path()).unwrap(), Some(c.config.clone()));
+
+        // Finished now: a plain re-run refuses as before.
+        let e = h.connect(&s, |_| {}).await.unwrap_err().to_string();
+        assert!(e.starts_with("This computer is already linked."), "{e}");
+
+        // The app removed: it resumes, reinstalls, and keeps the screen it had.
+        std::fs::remove_dir_all(h.home.path().join("Applications/Quome Desktop.app")).unwrap();
+        let c = h.connect(&s, |o| o.small_frames = false).await.unwrap();
+        assert_eq!(h.opened.borrow().len(), 1);
+        assert_eq!(c.config.screen, Some((1440, 900)));
+        assert!(h
+            .home
+            .path()
+            .join("Applications/Quome Desktop.app/Contents/MacOS/quome-desktop")
+            .is_file());
+
+        // Another org is not a resume.
+        std::fs::remove_file(config::config_path(h.home.path())).unwrap();
+        let e = h
+            .connect(&s, |o| o.org = Some("other".into()))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("linked to org \"acme\", not \"other\""), "{e}");
+        assert_eq!(h.opened.borrow().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn replace_links_afresh_even_when_setup_is_unfinished() {
+        let s = MockServer::start().await;
+        mount_platform(&s, me_ok()).await;
+        Mock::given(method("DELETE"))
+            .and(path("/api/v1/orgs/org-1/desktops/computers/me"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let mut h = Harness::with_mac(FakeMac {
+            probe: r#"{"displays": 0, "main_display": null}"#.into(),
+            ..FakeMac::default()
+        });
+        assert!(h.connect(&s, |_| {}).await.is_err());
+        h.runner = FakeMac::default().runner();
+        h.connect(&s, |o| o.replace = true).await.unwrap();
+        assert_eq!(h.opened.borrow().len(), 2, "a fresh approval");
+        assert_eq!(*h.store.puts.lock().unwrap(), ["desktop", "desktop"]);
     }
 
     #[tokio::test]
