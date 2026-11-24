@@ -74,6 +74,11 @@ pub struct Connected {
 pub const MEMBER_APPROVAL: &str = "Only an Owner or Admin can approve a computer. \
      Ask one to approve it, or to run this command with you.";
 pub const NOT_TURNED_ON: &str = "Linking computers is not turned on for this organization.";
+/// When linking computers is off, the approval page refuses and nothing comes back, so
+/// a wait that runs out names that as the likely cause.
+pub const NO_APPROVAL: &str = "No approval arrived. If the approval page said this permission \
+     isn't available, linking computers is not turned on for this organization: \
+     ask an Owner or Admin.";
 
 fn short_hostname(hostname: &str) -> String {
     let short = hostname.split('.').next().unwrap_or("").trim();
@@ -98,7 +103,9 @@ fn has_desktop_profile(home: &Path) -> Result<bool> {
     Ok(CloudState::load_from(home)?.profiles.contains_key(PROFILE))
 }
 
-/// True for the platform's refusal of a scope the organization does not offer.
+/// True for the platform's refusal of a scope the organization does not offer. Defensive:
+/// today that refusal is shown on the approval page and never reaches the CLI (see
+/// `NO_APPROVAL`), but an API answer carrying it reads the same way.
 fn scope_not_allowed(e: &QuomeError) -> bool {
     match e {
         QuomeError::ApiRefused { status, reason, .. } => {
@@ -140,6 +147,9 @@ pub async fn connect(o: ConnectOpts, deps: &Deps<'_>) -> Result<Connected> {
     };
     let out = connect::run(opts, deps).await.map_err(|e| match e {
         QuomeError::CloudNotYetConnected => QuomeError::Usage(MEMBER_APPROVAL.into()),
+        QuomeError::CloudState(m) if m == crate::cloud::loopback::TIMED_OUT => {
+            QuomeError::Usage(NO_APPROVAL.into())
+        }
         e if scope_not_allowed(&e) => QuomeError::Usage(NOT_TURNED_ON.into()),
         e => e,
     })?;
@@ -421,6 +431,9 @@ mod tests {
         opened: RefCell<Vec<String>>,
         runner: crate::cloud::clients::runner::fake::Fake,
         claude: NoClaude,
+        /// The "browser" delivers the approval; false = the page refused it.
+        approves: bool,
+        listen_timeout: Duration,
     }
 
     impl Harness {
@@ -437,6 +450,8 @@ mod tests {
                     crate::cloud::clients::runner::fake::ok(name)
                 }),
                 claude: NoClaude(Default::default()),
+                approves: true,
+                listen_timeout: Duration::from_secs(20),
             }
         }
 
@@ -448,7 +463,9 @@ mod tests {
             let say = |_: &str| {};
             let open = |u: &str| {
                 self.opened.borrow_mut().push(u.to_string());
-                page(u);
+                if self.approves {
+                    page(u);
+                }
                 Ok(())
             };
             let deps = Deps {
@@ -461,7 +478,7 @@ mod tests {
                 env: &crate::cloud::clients::no_env,
                 say: &say,
                 hostname: "studio.local".into(),
-                listen_timeout: Duration::from_secs(20),
+                listen_timeout: self.listen_timeout,
                 retry_interval: Duration::from_millis(20),
                 retry_total: Duration::from_millis(200),
             };
@@ -660,6 +677,23 @@ mod tests {
             e,
             "Linking computers is not turned on for this organization."
         );
+    }
+
+    #[tokio::test]
+    async fn no_approval_names_the_likely_cause() {
+        let s = MockServer::start().await;
+        mount_platform(&s, me_ok()).await;
+        let mut h = Harness::new();
+        h.approves = false;
+        h.listen_timeout = Duration::from_millis(200);
+        let e = h.connect(&s, |_| {}).await.unwrap_err().to_string();
+        assert_eq!(
+            e,
+            "No approval arrived. If the approval page said this permission isn't available, \
+             linking computers is not turned on for this organization: ask an Owner or Admin."
+        );
+        assert!(h.store.puts.lock().unwrap().is_empty());
+        assert!(!h.home.path().join(".quome/cloud.json").exists());
     }
 
     #[tokio::test]

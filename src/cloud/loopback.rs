@@ -133,8 +133,11 @@ impl Listener {
     }
 }
 
+/// What a wait that ran out says (a caller may recognize it to say more).
+pub const TIMED_OUT: &str = "timed out after 5 minutes waiting for the browser";
+
 fn timed_out() -> QuomeError {
-    QuomeError::CloudState("timed out after 5 minutes waiting for the browser".into())
+    QuomeError::CloudState(TIMED_OUT.into())
 }
 
 /// Answer one request; `Some` only for the accepted callback.

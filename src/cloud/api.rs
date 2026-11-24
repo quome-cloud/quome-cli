@@ -4120,7 +4120,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn desktop_session_sends_only_the_contract_fields() {
+    async fn desktop_session_sends_only_os_screen_and_version() {
         let (s, api) = setup().await;
         Mock::given(method("POST"))
             .and(path(format!(

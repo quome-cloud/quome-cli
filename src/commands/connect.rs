@@ -515,8 +515,7 @@ pub async fn run(opts: Options, deps: &Deps<'_>) -> Result<Outcome> {
     st.profiles.insert(profile_name.clone(), profile.clone());
     // A connect asking for specific capabilities (a machine's, a computer's or a pool member's
     // own scope) is purpose-bound: it never becomes the default profile the other commands use.
-    if opts.profile != crate::machine::config::PROFILE
-        && opts.profile != crate::desktop::config::PROFILE
+    if !crate::cloud::state::is_purpose_bound(&opts.profile)
         && opts.scopes.is_empty()
         && (st.default.is_empty() || !opts.profile_given)
     {
