@@ -28,6 +28,8 @@ pub enum DesktopCommands {
     Status(JsonArgs),
     /// Unlink this computer and stop its background agents
     Disconnect(JsonArgs),
+    /// Check this Mac for what would stop agents using it
+    Doctor(JsonArgs),
 }
 
 #[derive(Args)]
@@ -45,7 +47,8 @@ impl DesktopCommands {
         match self {
             DesktopCommands::Connect(_)
             | DesktopCommands::Status(_)
-            | DesktopCommands::Disconnect(_) => false,
+            | DesktopCommands::Disconnect(_)
+            | DesktopCommands::Doctor(_) => false,
             DesktopCommands::Serve(_) => true,
         }
     }
@@ -566,6 +569,7 @@ async fn run(command: DesktopCommands) -> Result<()> {
         DesktopCommands::Serve(a) => execute_serve(a).await,
         DesktopCommands::Status(a) => execute_status(a).await,
         DesktopCommands::Disconnect(a) => execute_disconnect(a).await,
+        DesktopCommands::Doctor(a) => execute_doctor(a).await,
     }
 }
 
@@ -580,6 +584,31 @@ async fn execute_status(a: JsonArgs) -> Result<()> {
         .ok_or_else(|| QuomeError::CloudState("cannot find home directory".into()))?;
     let store = crate::cloud::keys::KeychainStore;
     let (out, code) = status(&home, &crate::cloud::clients::real_env, &store, a.json).await?;
+    println!("{out}");
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+async fn execute_doctor(a: JsonArgs) -> Result<()> {
+    let home = dirs::home_dir()
+        .ok_or_else(|| QuomeError::CloudState("cannot find home directory".into()))?;
+    let store = crate::cloud::keys::KeychainStore;
+    // Anything that stops us asking the platform reads as "no answer": the link check fails.
+    let me = match api_for(&home, &store) {
+        Ok(Some(api)) => api.desktop_self().await.ok(),
+        _ => None,
+    };
+    let state = files::read_state(&files::runtime_dir(&home));
+    let list = crate::desktop::doctor::checks(
+        &crate::cloud::clients::runner::RealRunner,
+        &app::app_path(&home),
+        state.as_ref(),
+        me.as_ref(),
+    );
+    let (out, code) = crate::desktop::doctor::render(&list, a.json);
     println!("{out}");
     if code != 0 {
         std::process::exit(code);
