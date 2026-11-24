@@ -10,7 +10,9 @@ use crate::cloud::clients::runner::{CommandRunner, RunResult};
 use crate::cloud::keys::{AgentKey, KeyStore};
 use crate::cloud::state::CloudState;
 use crate::commands::connect::{self, Deps, Options};
+use crate::desktop::app;
 use crate::desktop::config::{self, DesktopConfig, PROFILE, SCOPE};
+use crate::desktop::size::pick_size;
 use crate::errors::{QuomeError, Result};
 
 #[derive(Subcommand)]
@@ -172,10 +174,22 @@ pub async fn connect(o: ConnectOpts, deps: &Deps<'_>) -> Result<Connected> {
     })
 }
 
-/// After the identity step and before the config is saved: the step that downloads,
-/// checks and installs the desktop app, probes the display and picks the agents' size
-/// into `cfg.screen`. For now it hands `cfg` back unchanged.
-async fn prepare_computer(cfg: DesktopConfig, _deps: &Deps<'_>) -> Result<DesktopConfig> {
+/// After the identity step and before the config is saved: download, check and install
+/// the desktop app, ask it about the displays, and pick the agents' size from the main
+/// display's shape into `cfg.screen`. No main display stops here.
+async fn prepare_computer(mut cfg: DesktopConfig, deps: &Deps<'_>) -> Result<DesktopConfig> {
+    let api = api_for(&deps.home, deps.store)?
+        .ok_or_else(|| QuomeError::Usage("This computer is not linked.".into()))?;
+    (deps.say)("Downloading Quome Desktop...");
+    let installed = app::install_app(&api, &deps.home, deps.runner).await?;
+    (deps.say)(&format!(
+        "Installed Quome Desktop {} in {}.",
+        installed.version,
+        installed.path.display()
+    ));
+    let probe = app::probe(&installed.path, deps.runner)?;
+    let (w, h, _) = app::main_display(&probe)?;
+    cfg.screen = Some(pick_size(w, h, cfg.small_frames));
     Ok(cfg)
 }
 
@@ -333,6 +347,7 @@ async fn execute_connect(a: ConnectArgs) -> Result<()> {
 mod tests {
     use super::*;
     use crate::cloud::state::Profile;
+    use crate::desktop::app::fixture::{self as app_fixture, FakeMac};
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -398,6 +413,17 @@ mod tests {
             .respond_with(me)
             .mount(s)
             .await;
+        let t = app_fixture::app_tarball();
+        Mock::given(method("GET"))
+            .and(path("/api/v1/orgs/org-1/desktops/downloads/quome-desktop"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("X-Checksum-Sha256", app_fixture::sha(&t).as_str())
+                    .insert_header("X-Quome-Desktop-Version", "0.1.0")
+                    .set_body_bytes(t),
+            )
+            .mount(s)
+            .await;
     }
 
     /// The "browser": delivers the delegation to the loopback listener.
@@ -442,13 +468,18 @@ mod tests {
         }
 
         fn with_computer_name(name: &'static str) -> Harness {
+            Harness::with_mac(FakeMac {
+                computer_name: name.into(),
+                ..FakeMac::default()
+            })
+        }
+
+        fn with_mac(mac: FakeMac) -> Harness {
             Harness {
                 home: tempfile::tempdir().unwrap(),
                 store: FakeKeychain::default(),
                 opened: RefCell::new(vec![]),
-                runner: crate::cloud::clients::runner::fake::Fake::new(move |_, _| {
-                    crate::cloud::clients::runner::fake::ok(name)
-                }),
+                runner: mac.runner(),
                 claude: NoClaude(Default::default()),
                 approves: true,
                 listen_timeout: Duration::from_secs(20),
@@ -584,7 +615,15 @@ mod tests {
         let c = h.connect(&s, |_| {}).await.unwrap();
         assert_eq!(c.name, "Studio Upstairs");
         assert_eq!(h.query(0)["name"], "Studio Upstairs");
-        assert_eq!(h.runner.calls(), ["scutil --get ComputerName"]);
+        assert_eq!(h.runner.calls()[0], "scutil --get ComputerName");
+        assert_eq!(
+            h.runner
+                .calls()
+                .iter()
+                .filter(|c| c.starts_with("scutil"))
+                .count(),
+            1
+        );
 
         let h = Harness::new();
         let c = h
@@ -603,11 +642,77 @@ mod tests {
         let want = DesktopConfig {
             api: s.uri(),
             org: "acme".into(),
-            screen: None,
+            screen: Some((1440, 900)),
             small_frames: true,
         };
         assert_eq!(c.config, want);
         assert_eq!(config::load(h.home.path()).unwrap(), Some(want));
+    }
+
+    #[tokio::test]
+    async fn connect_installs_the_app_and_picks_the_screen() {
+        let s = MockServer::start().await;
+        mount_platform(&s, me_ok()).await;
+        // 3024x1890 is 16:10.
+        let h = Harness::new();
+        let c = h.connect(&s, |_| {}).await.unwrap();
+        assert_eq!(c.config.screen, Some((1920, 1200)));
+        let app = h.home.path().join("Applications/Quome Desktop.app");
+        assert!(app.join("Contents/MacOS/quome-desktop").is_file());
+        assert!(h.runner.calls().contains(&format!(
+            "{}/Contents/MacOS/quome-desktop probe --json",
+            app.display()
+        )));
+        // A 16:9 display, with and without --small-frames.
+        let mac = FakeMac {
+            probe: r#"{"displays": 1, "main_display": {"w": 2560, "h": 1440, "scale": 1.0}}"#
+                .into(),
+            ..FakeMac::default()
+        };
+        let h = Harness::with_mac(mac.clone());
+        let c = h.connect(&s, |_| {}).await.unwrap();
+        assert_eq!(c.config.screen, Some((1920, 1080)));
+        let h = Harness::with_mac(mac);
+        let c = h.connect(&s, |o| o.small_frames = true).await.unwrap();
+        assert_eq!(c.config.screen, Some((1366, 768)));
+        assert_eq!(
+            config::load(h.home.path()).unwrap().unwrap().screen,
+            Some((1366, 768))
+        );
+    }
+
+    #[tokio::test]
+    async fn no_display_stops_connect() {
+        let s = MockServer::start().await;
+        mount_platform(&s, me_ok()).await;
+        let h = Harness::with_mac(FakeMac {
+            probe: r#"{"displays": 0, "main_display": null}"#.into(),
+            ..FakeMac::default()
+        });
+        let e = h.connect(&s, |_| {}).await.unwrap_err().to_string();
+        assert_eq!(
+            e,
+            "No display is attached. Attach a monitor or an HDMI dummy plug, then run this again."
+        );
+        assert_eq!(config::load(h.home.path()).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_refused_app_stops_connect() {
+        let s = MockServer::start().await;
+        mount_platform(&s, me_ok()).await;
+        let h = Harness::with_mac(FakeMac {
+            app_team: "ZZZZZ99999".into(),
+            ..FakeMac::default()
+        });
+        let e = h.connect(&s, |_| {}).await.unwrap_err().to_string();
+        assert_eq!(e, crate::desktop::app::FOREIGN_TEAM);
+        assert!(!h
+            .home
+            .path()
+            .join("Applications/Quome Desktop.app")
+            .exists());
+        assert_eq!(config::load(h.home.path()).unwrap(), None);
     }
 
     #[tokio::test]
