@@ -27,6 +27,9 @@ pub struct DesktopConfig {
     /// Agents get the smaller size of the display's shape.
     #[serde(default)]
     pub small_frames: bool,
+    /// Set once the agents are installed and the permission panes were shown.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub panes_shown: bool,
 }
 
 /// `~/.config/quome/desktop.toml`.
@@ -90,6 +93,7 @@ mod tests {
             api: "https://api.example.test".into(),
             org: "acme".into(),
             screen: Some((1920, 1200)),
+            panes_shown: false,
             small_frames: false,
         };
         save(d.path(), &c).unwrap();

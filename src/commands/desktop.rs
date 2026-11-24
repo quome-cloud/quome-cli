@@ -37,6 +37,7 @@ impl DesktopCommands {
 }
 
 #[derive(Args)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub struct ServeArgs {
     /// Install and start the background agents, then exit
     #[arg(long, conflicts_with = "uninstall")]
@@ -143,6 +144,7 @@ fn setup_unfinished(home: &Path) -> Result<bool> {
         config::load(home)?,
         Some(DesktopConfig {
             screen: Some(_),
+            panes_shown: true,
             ..
         })
     ) && app::app_path(home).join(app::EXECUTABLE).is_file();
@@ -178,11 +180,12 @@ async fn resume(o: &ConnectOpts, deps: &Deps<'_>) -> Result<Connected> {
             org: p.org_slug.clone(),
             screen: None,
             small_frames: o.small_frames,
+            panes_shown: false,
         },
     };
     let cfg = prepare_computer(cfg, deps).await?;
     config::save(&deps.home, &cfg)?;
-    start_computer(&cfg, deps).await?;
+    let cfg = start_computer(cfg, deps).await?;
     Ok(Connected {
         org_slug: p.org_slug,
         org_id: p.org_id,
@@ -239,10 +242,12 @@ pub async fn connect(o: ConnectOpts, deps: &Deps<'_>) -> Result<Connected> {
         org: out.profile.org_slug.clone(),
         screen: None,
         small_frames: o.small_frames,
+        // The permissions outlive a re-link: do not ask for them again.
+        panes_shown: config::load(&deps.home)?.is_some_and(|c| c.panes_shown),
     };
     let cfg = prepare_computer(cfg, deps).await?;
     config::save(&deps.home, &cfg)?;
-    start_computer(&cfg, deps).await?;
+    let cfg = start_computer(cfg, deps).await?;
     Ok(Connected {
         org_slug: out.profile.org_slug,
         org_id: out.profile.org_id,
@@ -277,8 +282,7 @@ async fn prepare_computer(mut cfg: DesktopConfig, deps: &Deps<'_>) -> Result<Des
 
 /// After the config is saved: install and start both background agents. After the
 /// first install only, open the two permission panes and say what to turn on.
-async fn start_computer(_cfg: &DesktopConfig, deps: &Deps<'_>) -> Result<()> {
-    let first = !service::installed(&deps.home);
+async fn start_computer(cfg: DesktopConfig, deps: &Deps<'_>) -> Result<DesktopConfig> {
     let uid = machine_service::current_uid(deps.runner)?;
     let exe = std::env::current_exe()?;
     service::install_services(
@@ -288,11 +292,19 @@ async fn start_computer(_cfg: &DesktopConfig, deps: &Deps<'_>) -> Result<()> {
         uid,
         &machine_service::Waits::REAL,
     )?;
-    if first {
-        service::open_panes(deps.runner);
-        (deps.say)(service::PANES_SAID);
+    // Keyed on a mark saved after the agents are in, so a failed first install
+    // shows the panes on the next run.
+    if cfg.panes_shown {
+        return Ok(cfg);
     }
-    Ok(())
+    service::open_panes(deps.runner);
+    (deps.say)(service::PANES_SAID);
+    let cfg = DesktopConfig {
+        panes_shown: true,
+        ..cfg
+    };
+    config::save(&deps.home, &cfg)?;
+    Ok(cfg)
 }
 
 fn api_for(home: &Path, store: &dyn KeyStore) -> Result<Option<CloudApi>> {
@@ -765,6 +777,7 @@ mod tests {
         let h = Harness::new();
         let c = h.connect(&s, |o| o.small_frames = true).await.unwrap();
         let want = DesktopConfig {
+            panes_shown: true,
             api: s.uri(),
             org: "acme".into(),
             screen: Some((1440, 900)),
@@ -1094,6 +1107,39 @@ mod tests {
             .filter(|m| m.contains("Turn on Quome Desktop"))
             .count();
         assert_eq!(after, 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_first_install_shows_the_panes_on_the_retry() {
+        let s = MockServer::start().await;
+        mount_platform(&s, me_ok()).await;
+        let mac = FakeMac::default();
+        // Bootstrap fails the first time through (both tries), then works.
+        mac.bootstrap_failures
+            .store(2, std::sync::atomic::Ordering::SeqCst);
+        let h = Harness::with_mac(mac);
+        assert!(h.connect(&s, |_| {}).await.is_err());
+        let shown = |h: &Harness| {
+            h.said
+                .borrow()
+                .iter()
+                .filter(|m| m.contains("Turn on Quome Desktop"))
+                .count()
+        };
+        assert_eq!(shown(&h), 0);
+        assert!(!h.runner.calls().iter().any(|c| c.starts_with("open ")));
+        h.connect(&s, |_| {}).await.unwrap();
+        assert_eq!(shown(&h), 1);
+        assert_eq!(
+            h.runner
+                .calls()
+                .iter()
+                .filter(|c| c.starts_with("open "))
+                .count(),
+            2
+        );
+        h.connect(&s, |o| o.replace = true).await.unwrap();
+        assert_eq!(shown(&h), 1);
     }
 
     #[test]

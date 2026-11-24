@@ -755,6 +755,8 @@ pub mod fixture {
         pub anchor_apple: bool,
         pub job_loaded: bool,
         pub probe: String,
+        /// How many `launchctl bootstrap` calls fail before they work.
+        pub bootstrap_failures: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl Default for FakeMac {
@@ -769,6 +771,7 @@ pub mod fixture {
                 job_loaded: false,
                 probe: r#"{"displays": 1, "main_display": {"w": 3024, "h": 1890, "scale": 2.0}}"#
                     .into(),
+                bootstrap_failures: Default::default(),
             }
         }
     }
@@ -815,6 +818,16 @@ pub mod fixture {
                             ok("state = running")
                         } else {
                             fail("Could not find service")
+                        }
+                    }
+                    "launchctl" if args.first().map(String::as_str) == Some("bootstrap") => {
+                        use std::sync::atomic::Ordering::SeqCst;
+                        let left = m.bootstrap_failures.load(SeqCst);
+                        if left > 0 {
+                            m.bootstrap_failures.store(left - 1, SeqCst);
+                            fail("Bootstrap failed: 5")
+                        } else {
+                            ok("")
                         }
                     }
                     "launchctl" => ok(""),

@@ -137,15 +137,13 @@ pub fn install_services(
 
 /// Stop both agents and remove their plists.
 pub fn uninstall_services(home: &Path, run: &dyn CommandRunner, uid: u32) -> Result<()> {
+    let mut first_error = None;
     for label in [APP_LABEL, SERVE_LABEL] {
-        uninstall_job(run, label, &plist_path(home, label), uid)?;
+        if let Err(e) = uninstall_job(run, label, &plist_path(home, label), uid) {
+            first_error.get_or_insert(e);
+        }
     }
-    Ok(())
-}
-
-/// True when the link's agent is installed (this is not the first install).
-pub fn installed(home: &Path) -> bool {
-    plist_path(home, SERVE_LABEL).exists()
+    first_error.map_or(Ok(()), Err)
 }
 
 /// Open the two permission panes. A failure to open one is not an error: the person
@@ -277,7 +275,6 @@ mod tests {
         assert!(calls[6..].contains(&format!("launchctl bootstrap gui/501 {}", serve.display())));
         assert!(calls[6..].contains(&format!("launchctl bootstrap gui/501 {}", app.display())));
         assert!(serve.exists() && app.exists());
-        assert!(installed(h.path()));
     }
 
     #[test]
@@ -297,6 +294,20 @@ mod tests {
             ]
         );
         uninstall_services(h.path(), &run, 501).unwrap();
+    }
+
+    #[test]
+    fn uninstall_tries_both_and_reports_the_first_error() {
+        let h = tempfile::tempdir().unwrap();
+        let run = Fake::new(|_, _| ok(""));
+        install_services(h.path(), &run, Path::new("/q"), 501, &ZERO).unwrap();
+        // A directory where the app's plist was: removing it fails (not NotFound).
+        let app = plist_path(h.path(), APP_LABEL);
+        std::fs::remove_file(&app).unwrap();
+        std::fs::create_dir(&app).unwrap();
+        std::fs::write(app.join("x"), "").unwrap();
+        assert!(uninstall_services(h.path(), &run, 501).is_err());
+        assert!(!plist_path(h.path(), SERVE_LABEL).exists());
     }
 
     #[test]
