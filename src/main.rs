@@ -4,6 +4,9 @@ mod client;
 mod cloud;
 mod commands;
 mod config;
+// Only the platform check runs off macOS; the rest is built and tested everywhere.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod desktop;
 mod errors;
 mod machine;
 mod manifest;
@@ -109,6 +112,11 @@ enum Commands {
         #[command(subcommand)]
         command: commands::models::ModelsCommands,
     },
+    /// Link this Mac to your organization as a desktop its agents can use
+    Desktop {
+        #[command(subcommand)]
+        command: commands::desktop::DesktopCommands,
+    },
     /// Inspect or drop this computer's Quome Cloud connection
     Cloud {
         #[command(subcommand)]
@@ -127,6 +135,9 @@ enum Commands {
 impl Commands {
     /// `git-credential` runs inside git and `upgrade` already updates.
     fn starts_update_check(&self) -> bool {
+        if let Commands::Desktop { command } = self {
+            return !command.runs_in_background();
+        }
         !matches!(
             self,
             Commands::GitCredential(_)
@@ -140,6 +151,9 @@ impl Commands {
 
     /// `mcp` and `git-credential` are read by programs, so they never print the update line.
     fn shows_update_notice(&self) -> bool {
+        if let Commands::Desktop { command } = self {
+            return !command.runs_in_background();
+        }
         !matches!(
             self,
             Commands::Mcp(_)
@@ -182,6 +196,7 @@ async fn main() {
         Commands::Mcp(args) => commands::mcp::execute(args).await,
         Commands::Skills { command } => commands::skills::execute(command).await,
         Commands::Models { command } => commands::models::execute(command).await,
+        Commands::Desktop { command } => commands::desktop::execute(command).await,
         Commands::Cloud { command } => commands::cloud::execute(command).await,
         Commands::GitCredential(args) => commands::git_credential::execute(args).await,
         Commands::Upgrade => commands::upgrade::execute().await,
@@ -266,5 +281,11 @@ mod tests {
                 "{args:?}"
             );
         }
+    }
+
+    #[test]
+    fn desktop_connect_is_an_ordinary_command() {
+        let c = command(&["desktop", "connect", "--org", "acme"]);
+        assert!(c.starts_update_check() && c.shows_update_notice());
     }
 }

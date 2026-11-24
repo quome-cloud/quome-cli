@@ -169,6 +169,63 @@ pub struct MachineSelf {
     pub approved_by: Option<String>,
 }
 
+/// A desktop's screen size in pixels.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Screen {
+    pub w: u16,
+    pub h: u16,
+}
+
+/// What a computer tells the platform when it asks for a session.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SessionBody {
+    pub os: String,
+    pub screen: Screen,
+    pub app_version: String,
+}
+
+/// Where this computer's desktop dials, and the key it dials with.
+#[derive(Clone, Deserialize, PartialEq, Eq)]
+pub struct Session {
+    pub desktop: String,
+    pub name: String,
+    pub url: String,
+    pub key: String,
+    pub screen: Screen,
+}
+
+/// Never prints the key itself.
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("desktop", &self.desktop)
+            .field("name", &self.name)
+            .field("url", &self.url)
+            .field("key", &"<redacted>")
+            .field("screen", &self.screen)
+            .finish()
+    }
+}
+
+/// What the platform knows about this computer.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ComputerSelf {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub os: Option<String>,
+    #[serde(default)]
+    pub screen: Option<Screen>,
+    #[serde(default)]
+    pub online: bool,
+    #[serde(default)]
+    pub screen_state: Option<String>,
+    #[serde(default)]
+    pub delegation_expires_at: Option<String>,
+    #[serde(default)]
+    pub approved_by: Option<String>,
+}
+
 /// Which way an agent reaches the org's tools.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrontDoor {
@@ -1678,6 +1735,50 @@ impl CloudApi {
         self.send_mapping(Method::DELETE, &p, |b| b, map_error_with_reason)
             .await?;
         Ok(())
+    }
+
+    /// A session for this computer's desktop: where to dial and the key to dial with.
+    /// The first call fixes the computer's OS and screen. A 503 keeps its
+    /// `Retry-After`; other refusals keep their status and `reason`.
+    pub async fn desktop_session(&self, body: &SessionBody) -> Result<Session, QuomeError> {
+        self.send_git_mapping(
+            Method::POST,
+            &self.org_path("/desktops/computers/me/session"),
+            |b| b.json(body),
+            map_error_with_reason,
+        )
+        .await
+    }
+
+    /// This computer's record on the platform.
+    pub async fn desktop_self(&self) -> Result<ComputerSelf, QuomeError> {
+        let p = self.org_path("/desktops/computers/me");
+        Ok(self
+            .send_mapping(Method::GET, &p, |b| b, map_error_with_reason)
+            .await?
+            .json()
+            .await?)
+    }
+
+    /// Unlink this computer: the platform revokes its own delegation.
+    pub async fn desktop_revoke(&self) -> Result<(), QuomeError> {
+        let p = self.org_path("/desktops/computers/me");
+        self.send_mapping(Method::DELETE, &p, |b| b, map_error_with_reason)
+            .await?;
+        Ok(())
+    }
+
+    /// The desktop app's macOS release, as the platform's streamed answer. The caller
+    /// reads the body and checks it; it takes the long timeout because the file is large.
+    pub async fn desktop_download(&self) -> Result<Response, QuomeError> {
+        let p = self.org_path("/desktops/downloads/quome-desktop");
+        self.send_mapping(
+            Method::GET,
+            &p,
+            |b| b.query(&[("os", "macos")]).timeout(DOWNLOAD_TIMEOUT),
+            map_error_with_reason,
+        )
+        .await
     }
 
     /// How this org's agents reach its tools.
@@ -4016,5 +4117,127 @@ mod tests {
             }
             e => panic!("{e:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn desktop_session_sends_only_the_contract_fields() {
+        let (s, api) = setup().await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/api/v1/orgs/{ORG}/desktops/computers/me/session"
+            )))
+            .and(header("authorization", "Bearer AT"))
+            .and(body_json(serde_json::json!({
+                "os": "macos", "screen": {"w": 1920, "h": 1200}, "app_version": "0.1.0"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "desktop": "d-1", "name": "Studio", "url": "wss://desktops.x/acme/v1/daemon",
+                "key": "qpk_secret", "screen": {"w": 1920, "h": 1200}
+            })))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let body = SessionBody {
+            os: "macos".into(),
+            screen: Screen { w: 1920, h: 1200 },
+            app_version: "0.1.0".into(),
+        };
+        let got = api.desktop_session(&body).await.unwrap();
+        assert_eq!(got.desktop, "d-1");
+        assert_eq!(got.screen, Screen { w: 1920, h: 1200 });
+        assert_eq!(got.key, "qpk_secret");
+        assert!(!format!("{got:?}").contains("qpk_secret"));
+    }
+
+    #[tokio::test]
+    async fn desktop_session_refusals_keep_their_reason() {
+        let (s, api) = setup().await;
+        let route = format!("/api/v1/orgs/{ORG}/desktops/computers/me/session");
+        Mock::given(method("POST"))
+            .and(path(route.clone()))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .insert_header("Retry-After", "5")
+                    .set_body_json(serde_json::json!({"reason": "desktops_starting"})),
+            )
+            .up_to_n_times(1)
+            .mount(&s)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(route))
+            .respond_with(
+                ResponseTemplate::new(409)
+                    .set_body_json(serde_json::json!({"reason": "screen_is_fixed"})),
+            )
+            .mount(&s)
+            .await;
+        let body = SessionBody {
+            os: "macos".into(),
+            screen: Screen { w: 1440, h: 900 },
+            app_version: "0.1.0".into(),
+        };
+        match api.desktop_session(&body).await.unwrap_err() {
+            QuomeError::RetryLater { retry_after, .. } => assert_eq!(retry_after, Some(5)),
+            e => panic!("{e:?}"),
+        }
+        match api.desktop_session(&body).await.unwrap_err() {
+            QuomeError::ApiRefused { status, reason, .. } => {
+                assert_eq!((status, reason.as_str()), (409, "screen_is_fixed"))
+            }
+            e => panic!("{e:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn desktop_self_revoke_and_download_routes() {
+        let (s, api) = setup().await;
+        let me = format!("/api/v1/orgs/{ORG}/desktops/computers/me");
+        Mock::given(method("GET"))
+            .and(path(me.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "c-1", "name": "Studio", "os": null, "screen": null, "online": false,
+                "screen_state": null, "delegation_expires_at": "2027-01-01T00:00:00Z",
+                "approved_by": "owner@example.test"
+            })))
+            .up_to_n_times(1)
+            .mount(&s)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(me.clone()))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_json(serde_json::json!({"reason": "computer_not_found"})),
+            )
+            .mount(&s)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(me))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&s)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/api/v1/orgs/{ORG}/desktops/downloads/quome-desktop"
+            )))
+            .and(query_param("os", "macos"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("X-Quome-Desktop-Version", "0.1.0")
+                    .set_body_bytes(b"tgz".to_vec()),
+            )
+            .expect(1)
+            .mount(&s)
+            .await;
+        let c = api.desktop_self().await.unwrap();
+        assert_eq!((c.id.as_str(), c.os, c.screen), ("c-1", None, None));
+        assert!(!c.online);
+        match api.desktop_self().await.unwrap_err() {
+            QuomeError::NotFound(r) => assert_eq!(r, "computer_not_found"),
+            e => panic!("{e:?}"),
+        }
+        api.desktop_revoke().await.unwrap();
+        let r = api.desktop_download().await.unwrap();
+        assert_eq!(r.headers()["x-quome-desktop-version"], "0.1.0");
     }
 }

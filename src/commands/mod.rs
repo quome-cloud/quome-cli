@@ -5,6 +5,9 @@ pub mod connect;
 pub mod databases;
 pub mod deploy;
 pub mod deployments;
+// Only the platform check runs off macOS; the rest is built and tested everywhere.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub mod desktop;
 pub mod events;
 pub mod functions;
 pub mod git_credential;
