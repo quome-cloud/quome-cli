@@ -197,7 +197,7 @@ pub async fn run(deps: TunnelDeps, proxy: Arc<ProxyState>) -> Stop {
 }
 
 /// The token errors that end `run`.
-fn permanent(e: &QuomeError) -> Option<Stop> {
+pub(crate) fn permanent(e: &QuomeError) -> Option<Stop> {
     match e {
         QuomeError::CloudDisconnected | QuomeError::CloudInvalidGrant => Some(Stop::Revoked),
         QuomeError::ApiRefused { status, reason, .. }
@@ -274,27 +274,27 @@ impl Backoff {
 }
 
 /// Resolves once a stop was asked for (never, when nobody can ask).
-async fn stopped(rx: &mut watch::Receiver<bool>) {
+pub(crate) async fn stopped(rx: &mut watch::Receiver<bool>) {
     if rx.wait_for(|stop| *stop).await.is_err() {
         std::future::pending::<()>().await;
     }
 }
 
 /// The program path and what it resolved to at start.
-struct Program {
+pub(crate) struct Program {
     path: PathBuf,
     at_start: Option<PathBuf>,
 }
 
 impl Program {
-    fn new(path: PathBuf) -> Self {
+    pub(crate) fn new(path: PathBuf) -> Self {
         let at_start = std::fs::canonicalize(&path).ok();
         Program { path, at_start }
     }
 
     /// True when the path now resolves elsewhere. A path that cannot be
     /// resolved right now (mid-upgrade) is not a change yet.
-    fn changed(&self) -> bool {
+    pub(crate) fn changed(&self) -> bool {
         match (&self.at_start, std::fs::canonicalize(&self.path)) {
             (Some(was), Ok(now)) => *was != now,
             _ => false,

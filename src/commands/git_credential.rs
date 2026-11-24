@@ -95,11 +95,12 @@ pub fn pick_profile<'a>(
             None
         }
     };
-    // The model machine's profile is never a candidate unless named with `only`.
+    // A purpose-bound profile (the model machine's, the desktop's) is never a candidate
+    // unless named with `only`.
     let found: Vec<(&String, &Profile, CredTarget)> = state
         .profiles
         .iter()
-        .filter(|(n, _)| only.is_some() || n.as_str() != crate::machine::config::PROFILE)
+        .filter(|(n, _)| only.is_some() || !crate::cloud::state::is_purpose_bound(n))
         .filter(|(n, _)| only.is_none_or(|(name, _)| n.as_str() == name))
         .filter_map(|(n, p)| target_of(p).map(|t| (n, p, t)))
         .filter(|(_, p, _)| org.is_none_or(|o| p.org_slug == o))
@@ -320,6 +321,33 @@ mod tests {
         assert_eq!((alone.as_str(), with.as_str()), ("cloud", "cloud"));
         let egress = pick_profile(&st, &req("https", "git.apps.example", Some("o/x")), None);
         assert!(egress.is_ok());
+    }
+
+    #[test]
+    fn the_desktop_profile_is_never_a_candidate() {
+        let mut st = CloudState::default();
+        let mut desk = profile("http://127.0.0.1:9");
+        desk.org_slug = "acme".into();
+        st.profiles.insert("desktop".into(), desk.clone());
+        // Alone, even with the org in the path (useHttpPath), it serves nothing.
+        for path in [None, Some("acme/x.git")] {
+            assert!(
+                pick_profile(&st, &req("https", "git.apps.example", path), None)
+                    .unwrap()
+                    .is_none(),
+                "{path:?}"
+            );
+        }
+        // Beside a user profile of the same org it neither wins nor makes it ambiguous.
+        st.profiles.insert("cloud".into(), desk);
+        let (name, _, _) = pick_profile(
+            &st,
+            &req("https", "git.apps.example", Some("acme/x.git")),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(name, "cloud");
     }
 
     #[test]

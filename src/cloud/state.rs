@@ -82,6 +82,13 @@ impl Profile {
     }
 }
 
+/// True for a profile that holds one purpose-bound capability (the model machine's or
+/// the desktop computer's). It never serves as a default or fallback for the commands
+/// that act as the user's agent.
+pub fn is_purpose_bound(name: &str) -> bool {
+    name == crate::machine::config::PROFILE || name == crate::desktop::config::PROFILE
+}
+
 impl CloudState {
     pub fn load() -> Result<CloudState, QuomeError> {
         Self::load_from(&home()?)
@@ -105,18 +112,14 @@ impl CloudState {
         write_private(&quome_dir(home).join("cloud.json"), &json)
     }
 
-    /// True when a profile other than the model machine's is saved.
+    /// True when a profile that is not purpose-bound is saved.
     pub fn has_user_profiles(&self) -> bool {
         self.first_user_profile().is_some()
     }
 
-    /// The first profile that is not the model machine's, which never serves as a
-    /// default or fallback for the commands that act as the user's agent.
+    /// The first profile that is not purpose-bound (see `is_purpose_bound`).
     pub fn first_user_profile(&self) -> Option<String> {
-        self.profiles
-            .keys()
-            .find(|k| k.as_str() != crate::machine::config::PROFILE)
-            .cloned()
+        self.profiles.keys().find(|k| !is_purpose_bound(k)).cloned()
     }
 
     /// The named profile, or the default one when `name` is `None`.
@@ -142,6 +145,22 @@ impl CloudState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn purpose_bound_profiles_are_not_user_profiles() {
+        assert!(is_purpose_bound("models") && is_purpose_bound("desktop"));
+        assert!(!is_purpose_bound("cloud") && !is_purpose_bound("work"));
+        let mut st = CloudState::default();
+        for name in ["desktop", "models"] {
+            st.profiles
+                .insert(name.into(), crate::cloud::auth::tests::profile("x"));
+        }
+        assert!(!st.has_user_profiles());
+        assert_eq!(st.first_user_profile(), None);
+        st.profiles
+            .insert("work".into(), crate::cloud::auth::tests::profile("x"));
+        assert_eq!(st.first_user_profile().as_deref(), Some("work"));
+    }
 
     fn sample(n: &str) -> Profile {
         Profile {

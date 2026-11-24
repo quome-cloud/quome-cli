@@ -281,6 +281,11 @@ mod tests {
 
     /// Adds the model machine's profile (and key) beside whatever is saved.
     fn add_machine(home: &Path, store: &FileStore) {
+        add_purpose_bound(home, store, "models");
+    }
+
+    /// Adds a purpose-bound profile `name` (and key) beside whatever is saved.
+    fn add_purpose_bound(home: &Path, store: &FileStore, name: &str) {
         let mut st = CloudState::load_from(home).unwrap();
         let mut p = st.profiles.values().next().cloned().unwrap_or_else(|| {
             let d = tempfile::tempdir().unwrap();
@@ -292,9 +297,32 @@ mod tests {
             loaded.profiles.values().next().cloned().unwrap()
         });
         p.agent_name = "machine".into();
-        st.profiles.insert("models".into(), p);
+        st.profiles.insert(name.into(), p);
         st.save_to(home).unwrap();
-        store.put("models", "machine-key").unwrap();
+        store.put(name, "machine-key").unwrap();
+    }
+
+    #[tokio::test]
+    async fn disconnecting_the_default_never_falls_back_to_the_desktop() {
+        let home = tempfile::tempdir().unwrap();
+        let store = FileStore {
+            dir: home.path().to_path_buf(),
+        };
+        save(home.path(), "http://127.0.0.1:9", &store);
+        add_purpose_bound(home.path(), &store, "desktop");
+        disconnect(home.path(), None, &store).unwrap();
+        let st = CloudState::load_from(home.path()).unwrap();
+        assert!(st.profiles.contains_key("desktop"));
+        assert!(st.default.is_empty(), "{:?}", st.default);
+        assert!(!st.has_user_profiles());
+        assert!(store.get("desktop").is_ok());
+        // Only the desktop left reads as not connected.
+        let (out, code) = status(home.path(), None, true, &store).await.unwrap();
+        assert_eq!(code, 1);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&out).unwrap(),
+            serde_json::json!({"connected": false})
+        );
     }
 
     #[test]

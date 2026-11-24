@@ -40,7 +40,7 @@ pub fn service_program(exe: &Path, on_path: Option<&Path>) -> PathBuf {
     canon
 }
 
-fn xml(s: &str) -> String {
+pub(crate) fn xml(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -163,10 +163,31 @@ pub fn install_macos_waiting(
     uid: u32,
     waits: &Waits,
 ) -> Result<(), QuomeError> {
-    let plist = launchd_plist_path(home);
     let log_dir = home.join("Library/Logs/quome");
+    install_job(
+        run,
+        LAUNCHD_LABEL,
+        &launchd_plist_path(home),
+        &launchd_plist(program, &log_dir),
+        &log_dir,
+        uid,
+        waits,
+    )
+}
+
+/// Replace a launchd user agent: boot out any loaded copy, write the plist,
+/// bootstrap it into `gui/<uid>` and kickstart it. Safe to run again.
+pub fn install_job(
+    run: &dyn CommandRunner,
+    label: &str,
+    plist: &Path,
+    text: &str,
+    log_dir: &Path,
+    uid: u32,
+    waits: &Waits,
+) -> Result<(), QuomeError> {
     let domain = format!("gui/{uid}");
-    let target = format!("gui/{uid}/{LAUNCHD_LABEL}");
+    let target = format!("gui/{uid}/{label}");
     // A previous copy may or may not be loaded. `bootout` can return before
     // launchd has removed the job, so wait for `print` to stop finding it.
     if let RunResult::Ran { ok: true, .. } = call(run, "launchctl", &["bootout", &target]) {
@@ -181,9 +202,9 @@ pub fn install_macos_waiting(
             }
         }
     }
-    std::fs::create_dir_all(&log_dir)?;
+    std::fs::create_dir_all(log_dir)?;
     std::fs::create_dir_all(plist.parent().expect("plist has a parent"))?;
-    std::fs::write(&plist, launchd_plist(program, &log_dir))?;
+    std::fs::write(plist, text)?;
     let plist_s = plist.to_string_lossy();
     let bootstrap = ["bootstrap", &domain, &plist_s];
     if must(run, "launchctl bootstrap", "launchctl", &bootstrap).is_err() {
@@ -199,9 +220,19 @@ pub fn install_macos_waiting(
 }
 
 pub fn uninstall_macos(home: &Path, run: &dyn CommandRunner, uid: u32) -> Result<(), QuomeError> {
-    let target = format!("gui/{uid}/{LAUNCHD_LABEL}");
+    uninstall_job(run, LAUNCHD_LABEL, &launchd_plist_path(home), uid)
+}
+
+/// Boot a launchd user agent out and delete its plist; already gone is fine.
+pub fn uninstall_job(
+    run: &dyn CommandRunner,
+    label: &str,
+    plist: &Path,
+    uid: u32,
+) -> Result<(), QuomeError> {
+    let target = format!("gui/{uid}/{label}");
     let _ = call(run, "launchctl", &["bootout", &target]);
-    match std::fs::remove_file(launchd_plist_path(home)) {
+    match std::fs::remove_file(plist) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
         _ => Ok(()),
     }
@@ -327,6 +358,15 @@ mod tests {
 </dict>
 </plist>
 "#;
+
+    #[test]
+    fn models_plist_unchanged() {
+        let p = launchd_plist(
+            Path::new("/opt/homebrew/bin/quome"),
+            Path::new("/Users/a/Library/Logs/quome"),
+        );
+        assert_eq!(p, PLIST);
+    }
 
     #[test]
     fn plist_golden() {

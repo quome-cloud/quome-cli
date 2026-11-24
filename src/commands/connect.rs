@@ -386,18 +386,30 @@ async fn me_with_retry(
     }
 }
 
-/// Best effort: delete the machine record the just-issued delegation made in
-/// organization `org_id`. True only when the platform confirmed.
-async fn withdraw_machine(profile: &Profile, mem: &MemStore, name: &str, org_id: &str) -> bool {
+/// The capability of a link that withdraws itself when approved for the wrong org.
+const MACHINE_SCOPE: &str = "models_serve";
+const COMPUTER_SCOPE: &str = crate::desktop::config::SCOPE;
+
+/// Best effort: delete the machine (or computer) record the just-issued delegation
+/// made in organization `org_id`. True only when the platform confirmed.
+async fn withdraw_machine(
+    profile: &Profile,
+    mem: &MemStore,
+    name: &str,
+    org_id: &str,
+    computer: bool,
+) -> bool {
     let Ok((key, vrc)) = AgentKey::load_from(mem, name) else {
         return false;
     };
     let mut p = profile.clone();
     p.org_id = org_id.to_string();
-    CloudApi::new(&p, TokenSource::new(&p, key, vrc))
-        .models_machine_revoke()
-        .await
-        .is_ok()
+    let api = CloudApi::new(&p, TokenSource::new(&p, key, vrc));
+    if computer {
+        api.desktop_revoke().await.is_ok()
+    } else {
+        api.models_machine_revoke().await.is_ok()
+    }
 }
 
 pub async fn run(opts: Options, deps: &Deps<'_>) -> Result<Outcome> {
@@ -468,9 +480,11 @@ pub async fn run(opts: Options, deps: &Deps<'_>) -> Result<Outcome> {
         .ok_or_else(|| QuomeError::Usage("This agent has no Quome Cloud organization.".into()))?;
     if let Some(want) = opts.org.as_deref() {
         if org.slug != want {
-            // The approval is live in the other org: for a machine, withdraw
-            // it (best effort; the token is only used, never shown).
-            if opts.scopes != ["models_serve"] && !opts.scopes.is_empty() {
+            // The approval is live in the other org: for a machine or a computer,
+            // withdraw it (best effort; the token is only used, never shown).
+            let machine = opts.scopes == [MACHINE_SCOPE];
+            let computer = opts.scopes == [COMPUTER_SCOPE];
+            if !machine && !computer && !opts.scopes.is_empty() {
                 return Err(QuomeError::Usage(format!(
                     "This approval is for organization \"{}\", not \"{want}\". \
                      You approved it for another organization; revoke it under Agents there, \
@@ -478,16 +492,16 @@ pub async fn run(opts: Options, deps: &Deps<'_>) -> Result<Outcome> {
                     org.slug
                 )));
             }
-            let withdrawn = opts.scopes == ["models_serve"]
-                && withdraw_machine(&profile, &mem, &profile_name, &org.id).await;
+            let withdrawn = (machine || computer)
+                && withdraw_machine(&profile, &mem, &profile_name, &org.id, computer).await;
             return Err(QuomeError::Usage(format!(
                 "This approval is for organization \"{}\", not \"{want}\". \
                  {}Run the command again and choose \"{want}\" on the approval page.",
                 org.slug,
-                if withdrawn {
-                    "The approval was withdrawn. "
-                } else {
-                    ""
+                match (withdrawn, computer) {
+                    (true, true) => "The approval for this computer was withdrawn. ",
+                    (true, false) => "The approval was withdrawn. ",
+                    (false, _) => "",
                 }
             )));
         }
@@ -499,9 +513,9 @@ pub async fn run(opts: Options, deps: &Deps<'_>) -> Result<Outcome> {
     key.store_in(deps.store, &profile_name, &cb.vrc)?;
     let mut st = CloudState::load_from(&deps.home)?;
     st.profiles.insert(profile_name.clone(), profile.clone());
-    // A connect asking for specific capabilities (a machine's or a pool member's own scope) is
-    // purpose-bound: it never becomes the default profile the other commands use.
-    if opts.profile != crate::machine::config::PROFILE
+    // A connect asking for specific capabilities (a machine's, a computer's or a pool member's
+    // own scope) is purpose-bound: it never becomes the default profile the other commands use.
+    if !crate::cloud::state::is_purpose_bound(&opts.profile)
         && opts.scopes.is_empty()
         && (st.default.is_empty() || !opts.profile_given)
     {
@@ -1332,6 +1346,37 @@ mod tests {
         }
         assert!(!h.home.path().join(".quome/cloud.json").exists());
         assert!(!h.home.path().join(".quome/cloud-models.key").exists());
+    }
+
+    /// The machine link's wrong-org answer and withdrawal are word for word as before
+    /// the desktop link shared them.
+    #[tokio::test]
+    async fn models_connect_unchanged() {
+        let s = MockServer::start().await;
+        mount_auth(&s).await;
+        mount_me(&s, 0).await;
+        Mock::given(method("DELETE"))
+            .and(path("/api/v1/orgs/org-1/models/machines/me"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let h = Harness::new(ran(true));
+        let mut o = opts(&s, "models");
+        o.org = Some("other".into());
+        o.scopes = vec!["models_serve".into()];
+        let err = h
+            .connect(o, "del-1", "mac", Duration::from_millis(10))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "This approval is for organization \"acme\", not \"other\". \
+             The approval was withdrawn. \
+             Run the command again and choose \"other\" on the approval page."
+        );
+        let seen = s.received_requests().await.unwrap();
+        assert!(!seen.iter().any(|r| r.url.path().contains("/desktops/")));
     }
 
     #[tokio::test]
