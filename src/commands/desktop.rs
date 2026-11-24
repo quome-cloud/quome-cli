@@ -12,6 +12,7 @@ use crate::cloud::state::CloudState;
 use crate::commands::connect::{self, Deps, Options};
 use crate::desktop::app;
 use crate::desktop::config::{self, DesktopConfig, PROFILE, SCOPE};
+use crate::desktop::files;
 use crate::desktop::service;
 use crate::desktop::size::pick_size;
 use crate::errors::{QuomeError, Result};
@@ -23,6 +24,18 @@ pub enum DesktopCommands {
     Connect(ConnectArgs),
     /// Run the link between this computer and the platform (started by launchd)
     Serve(ServeArgs),
+    /// Show whether this computer is linked and what the platform and the app say
+    Status(JsonArgs),
+    /// Unlink this computer and stop its background agents
+    Disconnect(JsonArgs),
+}
+
+#[derive(Args)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub struct JsonArgs {
+    /// Output as JSON
+    #[arg(long)]
+    json: bool,
 }
 
 impl DesktopCommands {
@@ -30,7 +43,9 @@ impl DesktopCommands {
     /// checks for updates or prints the update line.
     pub fn runs_in_background(&self) -> bool {
         match self {
-            DesktopCommands::Connect(_) => false,
+            DesktopCommands::Connect(_)
+            | DesktopCommands::Status(_)
+            | DesktopCommands::Disconnect(_) => false,
             DesktopCommands::Serve(_) => true,
         }
     }
@@ -195,6 +210,7 @@ async fn resume(o: &ConnectOpts, deps: &Deps<'_>) -> Result<Connected> {
 /// Link this computer: the identity step, then the computer's own set-up. A computer
 /// linked already whose set-up did not finish resumes it; `--replace` links afresh.
 pub async fn connect(o: ConnectOpts, deps: &Deps<'_>) -> Result<Connected> {
+    let mut panes_shown = false;
     if has_desktop_profile(&deps.home)? {
         if !o.replace && setup_unfinished(&deps.home)? {
             return resume(&o, deps).await;
@@ -206,7 +222,9 @@ pub async fn connect(o: ConnectOpts, deps: &Deps<'_>) -> Result<Connected> {
                     .into(),
             ));
         }
-        disconnect(&deps.home, deps.store, deps.say).await?;
+        // The permissions outlive a re-link: do not ask for them again.
+        panes_shown = config::load(&deps.home)?.is_some_and(|c| c.panes_shown);
+        disconnect(&deps.home, deps.store, deps.say, deps.runner).await?;
     }
 
     let name = o
@@ -239,8 +257,7 @@ pub async fn connect(o: ConnectOpts, deps: &Deps<'_>) -> Result<Connected> {
         org: out.profile.org_slug.clone(),
         screen: None,
         small_frames: o.small_frames,
-        // The permissions outlive a re-link: do not ask for them again.
-        panes_shown: config::load(&deps.home)?.is_some_and(|c| c.panes_shown),
+        panes_shown,
     };
     let cfg = prepare_computer(cfg, deps).await?;
     config::save(&deps.home, &cfg)?;
@@ -320,12 +337,14 @@ pub struct Disconnected {
     pub revoke_error: Option<String>,
 }
 
-/// Unlink on the platform (a failure is reported, not fatal), then delete the key
-/// and the `desktop` profile. The default profile is left alone.
+/// Unlink on the platform (a failure is reported, not fatal), stop the agents and
+/// forget the session, then delete the key, the `desktop` profile and its settings.
+/// The default profile and every other profile are left alone, and so is the app.
 pub async fn disconnect(
     home: &Path,
     store: &dyn KeyStore,
     say: &dyn Fn(&str),
+    run: &dyn CommandRunner,
 ) -> Result<Disconnected> {
     let mut report = Disconnected::default();
     let mut st = CloudState::load_from(home)?;
@@ -349,6 +368,18 @@ pub async fn disconnect(
             }
         }
     }
+    // The agents go with the link; a failure is reported, not fatal.
+    let agents = [service::SERVE_LABEL, service::APP_LABEL]
+        .iter()
+        .any(|l| service::plist_path(home, l).exists());
+    if report.was_connected || agents {
+        let gone = machine_service::current_uid(run)
+            .and_then(|uid| service::uninstall_services(home, run, uid));
+        if let Err(e) = gone {
+            say(&format!("Could not remove the background agents: {e}"));
+        }
+    }
+    files::remove_session(&files::runtime_dir(home));
     store.delete(PROFILE)?;
     if report.was_connected {
         st.profiles.remove(PROFILE);
@@ -356,8 +387,166 @@ pub async fn disconnect(
             st.default = st.first_user_profile().unwrap_or_default();
         }
         st.save_to(home)?;
+        // A fresh link shows the permission panes again.
+        match std::fs::remove_file(config::config_path(home)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        }
+        let app = app::app_path(home);
+        if app.exists() {
+            say(&format!(
+                "Quome Desktop stays in {}; drag it to the Trash to remove it.",
+                app.display()
+            ));
+        }
     }
     Ok(report)
+}
+
+/// Whole days until `expires_at`, rounded up; `None` when it cannot be read.
+fn days_left(expires_at: &str) -> Option<i64> {
+    let end = chrono::DateTime::parse_from_rfc3339(expires_at).ok()?;
+    let secs = (end.with_timezone(&chrono::Utc) - chrono::Utc::now()).num_seconds();
+    Some(if secs <= 0 {
+        0
+    } else {
+        (secs + 86_399) / 86_400
+    })
+}
+
+/// Said within this many days of the link's end.
+const EXPIRY_WARN_DAYS: i64 = 7;
+
+fn expiry_warning(expires_at: &str) -> Option<String> {
+    let d = days_left(expires_at)?;
+    if d > EXPIRY_WARN_DAYS {
+        return None;
+    }
+    if d == 0 {
+        return Some(
+            "The link has expired. Run `quome desktop connect --replace` to link again.".into(),
+        );
+    }
+    Some(format!(
+        "The link expires in {d} day{}. Run `quome desktop connect --replace` before then.",
+        if d == 1 { "" } else { "s" }
+    ))
+}
+
+/// Text (or JSON) to print and the exit code, 0 whether linked or not. The platform's
+/// answer gives name, online, screen state and expiry; the app's `state.json` gives
+/// permissions and version. A failure to ask is a warning, never an error.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub async fn status(
+    home: &Path,
+    _env: &dyn Fn(&str) -> Option<String>,
+    store: &dyn KeyStore,
+    json: bool,
+) -> Result<(String, i32)> {
+    let st = CloudState::load_from(home)?;
+    let Some(p) = st.profiles.get(PROFILE).cloned() else {
+        let out = if json {
+            serde_json::to_string_pretty(&serde_json::json!({
+                "linked": false, "api": null, "org": null, "name": null, "os": null,
+                "screen": null, "online": false, "screen_state": null, "permissions": null,
+                "app_version": null, "link_expires_at": null, "warnings": [],
+            }))?
+        } else {
+            "This computer is not linked. Run `quome desktop connect`.".into()
+        };
+        return Ok((out, 0));
+    };
+    let mut warnings: Vec<String> = vec![];
+    let remote = match api_for(home, store) {
+        Ok(Some(api)) => match api.desktop_self().await {
+            Ok(c) => Some(c),
+            Err(QuomeError::NotFound(_)) => {
+                warnings.push(
+                    "The platform no longer knows this computer. \
+                     Run `quome desktop connect --replace`."
+                        .into(),
+                );
+                None
+            }
+            Err(e) => {
+                warnings.push(format!("Could not reach the platform: {e}"));
+                None
+            }
+        },
+        Ok(None) => None,
+        Err(e) => {
+            warnings.push(format!("Could not reach the platform: {e}"));
+            None
+        }
+    };
+    let state = files::read_state(&files::runtime_dir(home));
+    let cfg = config::load(home).ok().flatten();
+    let name = remote
+        .as_ref()
+        .map_or(p.agent_name.clone(), |c| c.name.clone());
+    let os = remote.as_ref().and_then(|c| c.os.clone());
+    let screen = remote
+        .as_ref()
+        .and_then(|c| c.screen.as_ref().map(|s| (s.w, s.h)))
+        .or(cfg.as_ref().and_then(|c| c.screen))
+        .map(|(w, h)| format!("{w}x{h}"));
+    let online = remote.as_ref().is_some_and(|c| c.online);
+    let screen_state = remote.as_ref().and_then(|c| c.screen_state.clone());
+    let expires = remote
+        .as_ref()
+        .and_then(|c| c.delegation_expires_at.clone())
+        .unwrap_or_else(|| p.expires_at.clone());
+    if let Some(w) = expiry_warning(&expires) {
+        warnings.insert(0, w);
+    }
+    let permissions = state.as_ref().map(|s| {
+        serde_json::json!({
+            "screen_recording": s.permissions.screen_recording,
+            "accessibility": s.permissions.accessibility,
+        })
+    });
+    let app_version = state.as_ref().and_then(|s| s.version.clone());
+
+    if json {
+        let v = serde_json::json!({
+            "linked": true, "api": p.api_url, "org": p.org_slug, "name": name, "os": os,
+            "screen": screen, "online": online, "screen_state": screen_state,
+            "permissions": permissions, "app_version": app_version,
+            "link_expires_at": expires, "warnings": warnings,
+        });
+        return Ok((serde_json::to_string_pretty(&v)?, 0));
+    }
+    let yes = |b: bool| if b { "on" } else { "off" };
+    let mut out = format!(
+        "Desktop computer\n  Name:    {name}\n  Org:     {}\n  API:     {}\n  Online:  {}",
+        p.org_slug,
+        p.api_url,
+        if online { "yes" } else { "no" }
+    );
+    if let Some(s) = &screen_state {
+        out.push_str(&format!("\n  Screen:  {s}"));
+    }
+    if let Some(s) = &screen {
+        out.push_str(&format!("\n  Size:    {s}"));
+    }
+    if let Some(s) = &state {
+        out.push_str(&format!(
+            "\n  App:     {}\n  Screen recording: {}\n  Accessibility:    {}",
+            app_version.as_deref().unwrap_or("unknown"),
+            yes(s.permissions.screen_recording),
+            yes(s.permissions.accessibility)
+        ));
+    } else {
+        out.push_str("\n  App:     not reporting");
+    }
+    out.push_str(&format!(
+        "\n  Expires: {}",
+        expires.split('T').next().unwrap_or(&expires)
+    ));
+    for w in &warnings {
+        out.push_str(&format!("\n  Warning: {w}"));
+    }
+    Ok((out, 0))
 }
 
 pub async fn execute(command: DesktopCommands) -> Result<()> {
@@ -375,12 +564,64 @@ async fn run(command: DesktopCommands) -> Result<()> {
     match command {
         DesktopCommands::Connect(a) => execute_connect(a).await,
         DesktopCommands::Serve(a) => execute_serve(a).await,
+        DesktopCommands::Status(a) => execute_status(a).await,
+        DesktopCommands::Disconnect(a) => execute_disconnect(a).await,
     }
 }
 
 #[cfg(not(target_os = "macos"))]
 async fn run(_command: DesktopCommands) -> Result<()> {
     Err(QuomeError::Usage(crate::desktop::UNSUPPORTED.into()))
+}
+
+#[cfg(target_os = "macos")]
+async fn execute_status(a: JsonArgs) -> Result<()> {
+    let home = dirs::home_dir()
+        .ok_or_else(|| QuomeError::CloudState("cannot find home directory".into()))?;
+    let store = crate::cloud::keys::KeychainStore;
+    let (out, code) = status(&home, &crate::cloud::clients::real_env, &store, a.json).await?;
+    println!("{out}");
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+async fn execute_disconnect(a: JsonArgs) -> Result<()> {
+    let home = dirs::home_dir()
+        .ok_or_else(|| QuomeError::CloudState("cannot find home directory".into()))?;
+    let store = crate::cloud::keys::KeychainStore;
+    let json = a.json;
+    let say = move |s: &str| {
+        if json {
+            eprintln!("{s}");
+        } else {
+            println!("{s}");
+        }
+    };
+    let r = disconnect(
+        &home,
+        &store,
+        &say,
+        &crate::cloud::clients::runner::RealRunner,
+    )
+    .await?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "disconnected": r.was_connected,
+                "revoked": r.revoked,
+                "revoke_error": r.revoke_error,
+            }))?
+        );
+    } else if r.was_connected {
+        println!("Disconnected this computer.");
+    } else {
+        println!("This computer was not linked.");
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -1064,35 +1305,219 @@ mod tests {
         assert_eq!(*h.store.puts.lock().unwrap(), ["desktop", "desktop"]);
     }
 
+    /// A models profile and key beside the desktop's, to see them left alone.
+    fn seed_models(home: &Path, store: &dyn KeyStore) {
+        let mut st = CloudState::load_from(home).unwrap();
+        let p = st.profiles["cloud"].clone();
+        st.profiles.insert("models".into(), p);
+        st.save_to(home).unwrap();
+        store.put("models", "models-key").unwrap();
+    }
+
+    async fn mount_revoke(s: &MockServer, status: u16) {
+        Mock::given(method("DELETE"))
+            .and(path("/api/v1/orgs/org-1/desktops/computers/me"))
+            .respond_with(
+                ResponseTemplate::new(status).set_body_json(serde_json::json!({"detail": "boom"})),
+            )
+            .mount(s)
+            .await;
+    }
+
     #[tokio::test]
     async fn disconnect_removes_only_the_desktop() {
         let s = MockServer::start().await;
         mount_platform(&s, me_ok()).await;
-        Mock::given(method("DELETE"))
-            .and(path("/api/v1/orgs/org-1/desktops/computers/me"))
-            .respond_with(
-                ResponseTemplate::new(500).set_body_json(serde_json::json!({"detail": "boom"})),
-            )
-            .mount(&s)
-            .await;
+        mount_revoke(&s, 204).await;
+        let h = Harness::new();
+        seed_default(h.home.path(), &h.store);
+        h.connect(&s, |_| {}).await.unwrap();
+        seed_models(h.home.path(), &h.store);
+        let run = files::runtime_dir(h.home.path());
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(run.join("session.json"), "{}").unwrap();
+        let said = RefCell::new(vec![]);
+        let r = disconnect(
+            h.home.path(),
+            &h.store,
+            &|m| said.borrow_mut().push(m.to_string()),
+            &h.runner,
+        )
+        .await
+        .unwrap();
+        assert!(r.was_connected && r.revoked && r.revoke_error.is_none());
+        let st = CloudState::load_from(h.home.path()).unwrap();
+        assert!(st.profiles.contains_key("cloud") && st.profiles.contains_key("models"));
+        assert!(!st.profiles.contains_key("desktop"));
+        assert_eq!(st.default, "cloud");
+        assert!(h.store.get("desktop").is_err());
+        assert_eq!(h.store.get("cloud").unwrap(), "default-key");
+        assert_eq!(h.store.get("models").unwrap(), "models-key");
+        assert_eq!(config::load(h.home.path()).unwrap(), None);
+        assert!(!run.join("session.json").exists());
+        assert!(!service::plist_path(h.home.path(), service::SERVE_LABEL).exists());
+        assert!(!service::plist_path(h.home.path(), service::APP_LABEL).exists());
+        // The app stays, and the output says where.
+        let app = app::app_path(h.home.path());
+        assert!(app.join(app::EXECUTABLE).is_file());
+        let said = said.borrow().join("\n");
+        assert!(said.contains(&app.display().to_string()), "{said}");
+        let r = disconnect(h.home.path(), &h.store, &|_| {}, &h.runner)
+            .await
+            .unwrap();
+        assert!(!r.was_connected);
+    }
+
+    #[tokio::test]
+    async fn disconnect_offline_still_cleans_up() {
+        let s = MockServer::start().await;
+        mount_platform(&s, me_ok()).await;
+        mount_revoke(&s, 500).await;
         let h = Harness::new();
         seed_default(h.home.path(), &h.store);
         h.connect(&s, |_| {}).await.unwrap();
         let said = RefCell::new(vec![]);
-        let r = disconnect(h.home.path(), &h.store, &|m| {
-            said.borrow_mut().push(m.to_string())
-        })
+        let r = disconnect(
+            h.home.path(),
+            &h.store,
+            &|m| said.borrow_mut().push(m.to_string()),
+            &h.runner,
+        )
         .await
         .unwrap();
         assert!(r.was_connected && !r.revoked && r.revoke_error.is_some());
         assert!(said.borrow().join("\n").contains("Could not unlink"));
         let st = CloudState::load_from(h.home.path()).unwrap();
         assert!(st.profiles.contains_key("cloud") && !st.profiles.contains_key("desktop"));
-        assert_eq!(st.default, "cloud");
         assert!(h.store.get("desktop").is_err());
-        assert_eq!(h.store.get("cloud").unwrap(), "default-key");
-        let r = disconnect(h.home.path(), &h.store, &|_| {}).await.unwrap();
-        assert!(!r.was_connected);
+        assert_eq!(config::load(h.home.path()).unwrap(), None);
+        assert!(!service::plist_path(h.home.path(), service::APP_LABEL).exists());
+    }
+
+    fn me_self(expires: &str) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "c-1", "name": "Studio", "os": "macos", "screen": {"w": 1920, "h": 1200},
+            "online": true, "screen_state": "ok", "delegation_expires_at": expires,
+            "approved_by": "owner@example.test"
+        }))
+    }
+
+    async fn mount_self(s: &MockServer, r: ResponseTemplate) {
+        Mock::given(method("GET"))
+            .and(path("/api/v1/orgs/org-1/desktops/computers/me"))
+            .respond_with(r)
+            .mount(s)
+            .await;
+    }
+
+    fn write_state(home: &Path) {
+        let run = files::runtime_dir(home);
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(
+            run.join("state.json"),
+            r#"{"v": 1, "version": "0.1.0", "screen_state": "ok",
+                "permissions": {"screen_recording": true, "accessibility": false},
+                "displays": 1, "main_display": null, "connected": true,
+                "dial_failures": 0, "updated_at": "2026-11-24T00:00:00Z"}"#,
+        )
+        .unwrap();
+    }
+
+    fn no_env(_: &str) -> Option<String> {
+        None
+    }
+
+    fn far_future() -> String {
+        (chrono::Utc::now() + chrono::Duration::days(20)).to_rfc3339()
+    }
+
+    #[tokio::test]
+    async fn status_json_shape_exact() {
+        let s = MockServer::start().await;
+        mount_platform(&s, me_ok()).await;
+        let exp = far_future();
+        mount_self(&s, me_self(&exp)).await;
+        let h = Harness::new();
+        h.connect(&s, |_| {}).await.unwrap();
+        write_state(h.home.path());
+        let (out, code) = status(h.home.path(), &no_env, &h.store, true)
+            .await
+            .unwrap();
+        assert_eq!(code, 0);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "linked": true, "api": s.uri(), "org": "acme", "name": "Studio",
+                "os": "macos", "screen": "1920x1200", "online": true,
+                "screen_state": "ok",
+                "permissions": {"screen_recording": true, "accessibility": false},
+                "app_version": "0.1.0", "link_expires_at": exp, "warnings": [],
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn status_not_linked_exit_0() {
+        let h = Harness::new();
+        let (out, code) = status(h.home.path(), &no_env, &h.store, false)
+            .await
+            .unwrap();
+        assert_eq!(code, 0);
+        assert!(out.contains("not linked") && out.contains("quome desktop connect"));
+        let (out, code) = status(h.home.path(), &no_env, &h.store, true)
+            .await
+            .unwrap();
+        assert_eq!(code, 0);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["linked"], false);
+        assert_eq!(v["online"], false);
+        assert!(v["org"].is_null() && v["permissions"].is_null());
+        assert_eq!(v["warnings"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn status_expiry_warning_within_7_days() {
+        let s = MockServer::start().await;
+        mount_platform(&s, me_ok()).await;
+        let soon = (chrono::Utc::now() + chrono::Duration::days(3)).to_rfc3339();
+        mount_self(&s, me_self(&soon)).await;
+        let h = Harness::new();
+        h.connect(&s, |_| {}).await.unwrap();
+        let (out, _) = status(h.home.path(), &no_env, &h.store, true)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v["warnings"],
+            serde_json::json!([
+                "The link expires in 3 days. Run `quome desktop connect --replace` before then."
+            ])
+        );
+        let (text, code) = status(h.home.path(), &no_env, &h.store, false)
+            .await
+            .unwrap();
+        assert_eq!(code, 0);
+        assert!(text.contains("The link expires in 3 days."), "{text}");
+        // Without state.json the permissions and version are unknown.
+        assert!(v["permissions"].is_null() && v["app_version"].is_null());
+    }
+
+    #[tokio::test]
+    async fn status_has_no_key() {
+        let s = MockServer::start().await;
+        mount_platform(&s, me_ok()).await;
+        mount_self(&s, me_self(&far_future())).await;
+        let h = Harness::new();
+        h.connect(&s, |_| {}).await.unwrap();
+        write_state(h.home.path());
+        let key = h.store.get("desktop").unwrap();
+        for json in [true, false] {
+            let (out, _) = status(h.home.path(), &no_env, &h.store, json)
+                .await
+                .unwrap();
+            assert!(!key.is_empty() && !out.contains(&key), "{out}");
+        }
     }
 
     #[tokio::test]
