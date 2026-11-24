@@ -24,7 +24,8 @@ use crate::errors::{QuomeError, Result};
 /// Said, and exit 0, when there is no link to serve.
 pub const NOT_LINKED: &str = "This computer is not linked. Run `quome desktop connect`.";
 /// Said, and exit 0, once the platform no longer knows this computer.
-pub const UNLINKED: &str = "This computer is no longer linked. Run `quome desktop connect` again.";
+pub const UNLINKED: &str =
+    "This computer is no longer linked. Run `quome desktop connect --replace` again.";
 /// Said, and exit 0, when the platform fixed another screen size for this computer.
 pub const SCREEN_FIXED: &str = "The screen size in desktop.toml no longer matches this \
      computer's link. Run `quome desktop connect --replace`.";
@@ -180,17 +181,6 @@ impl Backoff {
     }
 }
 
-/// A `state.json` older than this is a stopped or missing app's: it asks for nothing.
-const STATE_FRESH_FOR: chrono::Duration = chrono::Duration::seconds(60);
-
-/// True when the app wrote `s` within `STATE_FRESH_FOR` of `now`.
-fn fresh(s: &files::AppState, now: chrono::DateTime<chrono::Utc>) -> bool {
-    s.updated_at
-        .as_deref()
-        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
-        .is_some_and(|t| now - t.with_timezone(&chrono::Utc) <= STATE_FRESH_FOR)
-}
-
 /// When the app's failed dials ask for a new session: five in a row in a fresh
 /// state, and at least `every` since the last session was written.
 fn wants_new_session(
@@ -199,7 +189,7 @@ fn wants_new_session(
     every: Duration,
     now: chrono::DateTime<chrono::Utc>,
 ) -> bool {
-    state.is_some_and(|s| s.dial_failures >= NEW_SESSION_AFTER && fresh(s, now))
+    state.is_some_and(|s| s.dial_failures >= NEW_SESSION_AFTER && files::fresh(s, now))
         && since_last >= every
 }
 
@@ -349,7 +339,14 @@ pub async fn serve(
     // A profile without its key is as good as not linked: nothing a restart could fix.
     let (key, vrc) = match AgentKey::load_from(store, PROFILE) {
         Ok(k) => k,
-        Err(QuomeError::CloudKey(_)) => return Ok(Served::NotConnected),
+        // Only a key that is not there is "not linked". A Keychain that cannot be read
+        // (locked at login) is an error: exit non-zero so launchd tries again.
+        Err(e @ QuomeError::CloudKey(_)) => {
+            return match store.has(PROFILE) {
+                Ok(false) => Ok(Served::NotConnected),
+                _ => Err(e),
+            }
+        }
         Err(e) => return Err(e),
     };
     let api = Arc::new(CloudApi::new(&p, TokenSource::new(&p, key, vrc)));
@@ -532,7 +529,7 @@ mod tests {
         );
         assert_eq!(
             Served::Unlinked.message(),
-            Some("This computer is no longer linked. Run `quome desktop connect` again.")
+            Some("This computer is no longer linked. Run `quome desktop connect --replace` again.")
         );
         assert_eq!(
             Served::ScreenFixed.message(),
@@ -842,6 +839,32 @@ mod tests {
         h.store.delete(PROFILE).unwrap();
         assert_eq!(serve_once(&h).await, Served::NotConnected);
         assert!(s.received_requests().await.unwrap().is_empty());
+    }
+
+    /// A Keychain that holds a key but cannot be read (locked at login).
+    struct LockedStore;
+    impl KeyStore for LockedStore {
+        fn put(&self, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn get(&self, _: &str) -> Result<String> {
+            Err(QuomeError::CloudKey("keychain is locked".into()))
+        }
+        fn has(&self, _: &str) -> Result<bool> {
+            Ok(true)
+        }
+        fn delete(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_keychain_is_an_error_not_not_linked() {
+        let s = MockServer::start().await;
+        let h = linked(&s);
+        let (_tx, rx) = watch::channel(false);
+        let r = serve(h.home.path(), &LockedStore, Timing::default(), None, rx).await;
+        assert!(matches!(r, Err(QuomeError::CloudKey(_))), "{r:?}");
     }
 
     #[tokio::test]

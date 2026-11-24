@@ -59,7 +59,7 @@ pub fn sleep_minutes(text: &str) -> Option<u32> {
     })
 }
 
-/// Provisional (spike R6 has not run): the screen saver's `askForPassword`, "1" meaning
+/// Provisional until checked on hardware: the screen saver's `askForPassword`, "1" meaning
 /// a password is asked when the screen locks.
 pub fn lock_on(text: &str) -> Option<bool> {
     match text.trim() {
@@ -180,7 +180,7 @@ fn sleep(run: &dyn CommandRunner) -> Check {
 }
 
 const NOT_REPORTING: &str =
-    "The app is not reporting. Run `quome desktop connect` to start it, then run this again.";
+    "The app is not reporting. Run `quome desktop serve --install` to start it, then run this again.";
 
 fn displays(state: Option<&AppState>) -> Check {
     match state.map(|s| s.displays) {

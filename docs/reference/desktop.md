@@ -2,7 +2,7 @@
 
 Link a dedicated Mac to your organization as a computer its agents can use. An agent sees the screen and uses the mouse and keyboard through the desktop app, which ships separately as Quome Desktop.
 
-This works on Apple silicon Macs only. On any other computer every `quome desktop` command says so and exits with code 69.
+This works on Apple silicon Macs only. On any other computer every `quome desktop` command says so and exits with code 69. It needs macOS 14 or later; on an older Mac the commands say so and exit with code 69.
 
 ## What a dedicated computer is
 
@@ -47,7 +47,7 @@ Options:
 
 Opens an approval page in your browser. A person approves one switch there. Then `connect` installs the desktop app, starts the two background agents and opens the macOS permission panes the app needs (Screen Recording and Accessibility). Turn both on for Quome Desktop.
 
-If this Mac is already linked, `connect` stops. Use `--replace` to unlink first and link again.
+If this Mac is already linked but set-up did not finish, `connect` resumes it. If it is linked and set up, `connect` stops. Use `--replace` to unlink first and link again.
 
 ### `quome desktop serve`
 
@@ -123,4 +123,4 @@ The `desktop` profile is separate from the default `quome` profile. Linking a de
 quome desktop disconnect
 ```
 
-This removes the computer from your organization, stops and removes both background agents, removes the runtime files, the `desktop` profile, its Keychain item and `desktop.toml`. Quome Desktop stays in `~/Applications`; drag it to the Trash to remove it. The computer disappears from the console within a few seconds. The default `quome` profile keeps working.
+This removes the computer from your organization, stops and removes both background agents, removes the `session.json` file, the `desktop` profile, its Keychain item and `desktop.toml`. Quome Desktop stays in `~/Applications`; drag it to the Trash to remove it. The computer disappears from the console within a few seconds. The default `quome` profile keeps working.

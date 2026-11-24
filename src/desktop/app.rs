@@ -60,7 +60,7 @@ pub const UNSIGNED: &str = "This quome is not a signed release; install the app 
 pub const NOT_AVAILABLE: &str = "The platform has no desktop app to download for this computer.";
 pub const LATER: &str = "The desktop app is not available to download yet; try again later.";
 pub const PROBE_FAILED: &str = "The desktop app could not read this computer's displays.";
-/// No main display: the app has nothing to show agents (spike R8).
+/// No main display: the app has nothing to show agents. Provisional until checked on hardware.
 pub const NO_DISPLAY: &str =
     "No display is attached. Attach a monitor or an HDMI dummy plug, then run this again.";
 

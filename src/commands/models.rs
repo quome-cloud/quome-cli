@@ -681,7 +681,7 @@ pub fn uninstall_service(home: &Path, run: &dyn CommandRunner, say: &dyn Fn(&str
 }
 
 /// This binary as the unit should start it.
-fn unit_program() -> Result<std::path::PathBuf> {
+pub(crate) fn unit_program() -> Result<std::path::PathBuf> {
     let exe = std::env::current_exe()?;
     let on_path = std::env::var_os("PATH").and_then(|paths| {
         std::env::split_paths(&paths)

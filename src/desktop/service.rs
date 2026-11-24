@@ -68,8 +68,8 @@ pub fn serve_plist(program: &Path, log_dir: &Path) -> String {
 }
 
 /// The app's agent, run in the person's graphical session so it can see the screen.
-/// Written as one function: spike ruling R1 chose method A (the app's executable run
-/// directly, associated with its bundle); method B would change only this text.
+/// Written as one function: the app's executable is run directly, associated with its
+/// bundle. Provisional until checked on hardware; another way would change only this text.
 pub fn app_plist(app: &Path, log_dir: &Path) -> String {
     let log = xml(&log_dir.join("desktop-app.log").to_string_lossy());
     let exe = xml(&app.join(EXECUTABLE).to_string_lossy());

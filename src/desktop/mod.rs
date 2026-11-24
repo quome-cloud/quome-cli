@@ -18,9 +18,46 @@ pub fn unsupported(os: &str, arch: &str) -> Option<(&'static str, i32)> {
     (os != "macos" || arch != "aarch64").then_some((UNSUPPORTED, UNSUPPORTED_EXIT))
 }
 
+/// The oldest macOS that can be linked. Provisional until checked on hardware.
+pub const MIN_MACOS: &str = "14.0";
+/// Said, and exit 69, on a macOS older than `MIN_MACOS`.
+pub const OLD_MACOS: &str = "Linking a computer as a desktop needs macOS 14 or later.";
+
+/// True when `v` ("13.6", "14.10", "15") is clearly older than `MIN_MACOS`, compared
+/// number by number. A version that does not parse is allowed: the app checks its own.
+pub fn unsupported_version(v: &str) -> bool {
+    fn parts(s: &str) -> Option<Vec<u64>> {
+        s.trim().split('.').map(|p| p.parse().ok()).collect()
+    }
+    match (parts(v), parts(MIN_MACOS)) {
+        (Some(have), Some(min)) => {
+            for i in 0..have.len().max(min.len()) {
+                let (a, b) = (
+                    have.get(i).copied().unwrap_or(0),
+                    min.get(i).copied().unwrap_or(0),
+                );
+                if a != b {
+                    return a < b;
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn macos_before_14_is_refused() {
+        assert!(unsupported_version("13.6"));
+        assert!(unsupported_version("12"));
+        for v in ["14.0", "14.10", "15", "26.1", "14", "garbage", ""] {
+            assert!(!unsupported_version(v), "{v}");
+        }
+    }
 
     #[test]
     fn only_an_apple_silicon_mac_is_supported() {

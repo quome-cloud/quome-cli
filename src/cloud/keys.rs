@@ -17,6 +17,10 @@ pub struct AgentKey {
 pub trait KeyStore: Send + Sync {
     fn put(&self, profile: &str, secret: &str) -> Result<(), QuomeError>;
     fn get(&self, profile: &str) -> Result<String, QuomeError>;
+    /// Whether a key is stored. An unreadable store is an error, not "no".
+    fn has(&self, profile: &str) -> Result<bool, QuomeError> {
+        self.get(profile).map(|_| true)
+    }
     /// Remove the stored key; an absent key is fine.
     fn delete(&self, profile: &str) -> Result<(), QuomeError>;
 }
@@ -50,6 +54,9 @@ impl KeyStore for FileStore {
         std::fs::read_to_string(self.path(profile)?)
             .map_err(|e| QuomeError::CloudKey(format!("cannot read key for \"{profile}\": {e}")))
     }
+    fn has(&self, profile: &str) -> Result<bool, QuomeError> {
+        Ok(self.path(profile)?.exists())
+    }
     fn delete(&self, profile: &str) -> Result<(), QuomeError> {
         match std::fs::remove_file(self.path(profile)?) {
             Ok(()) => Ok(()),
@@ -81,6 +88,13 @@ impl KeyStore for KeychainStore {
         Self::entry(profile)?
             .get_password()
             .map_err(|e| QuomeError::CloudKey(format!("no key for \"{profile}\": {e}")))
+    }
+    fn has(&self, profile: &str) -> Result<bool, QuomeError> {
+        match Self::entry(profile)?.get_password() {
+            Ok(_) => Ok(true),
+            Err(keyring::Error::NoEntry) => Ok(false),
+            Err(e) => Err(QuomeError::CloudKey(e.to_string())),
+        }
     }
     fn delete(&self, profile: &str) -> Result<(), QuomeError> {
         match Self::entry(profile)?.delete_credential() {

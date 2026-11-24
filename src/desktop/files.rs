@@ -150,9 +150,48 @@ pub fn read_state(dir: &Path) -> Option<AppState> {
     (s.v == VERSION).then_some(s)
 }
 
+/// A `state.json` older than this is a stopped or missing app's: it asks for nothing.
+pub const STATE_FRESH_FOR: chrono::Duration = chrono::Duration::seconds(60);
+
+/// True when the app wrote `s` within `STATE_FRESH_FOR` of `now`.
+pub fn fresh(s: &AppState, now: chrono::DateTime<chrono::Utc>) -> bool {
+    s.updated_at
+        .as_deref()
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        .is_some_and(|t| now - t.with_timezone(&chrono::Utc) <= STATE_FRESH_FOR)
+}
+
+/// `read_state`, but a state older than a minute reads as no state: the app is not reporting.
+pub fn read_fresh_state(dir: &Path) -> Option<AppState> {
+    read_state(dir).filter(|s| fresh(s, chrono::Utc::now()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stale_state_reads_as_not_reporting() {
+        let dir = tempfile::tempdir().unwrap();
+        let at = |secs: i64| {
+            (chrono::Utc::now() - chrono::Duration::seconds(secs))
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        };
+        let write = |t: String| {
+            std::fs::write(
+                dir.path().join(STATE_FILE),
+                serde_json::json!({"v": 1, "updated_at": t}).to_string(),
+            )
+            .unwrap()
+        };
+        write(at(5));
+        assert!(read_fresh_state(dir.path()).is_some());
+        write(at(120));
+        assert!(read_state(dir.path()).is_some());
+        assert!(read_fresh_state(dir.path()).is_none());
+        std::fs::write(dir.path().join(STATE_FILE), r#"{"v": 1}"#).unwrap();
+        assert!(read_fresh_state(dir.path()).is_none(), "no timestamp");
+    }
 
     fn session(key: &str) -> SessionFile {
         SessionFile {

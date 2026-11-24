@@ -301,7 +301,7 @@ async fn prepare_computer(mut cfg: DesktopConfig, deps: &Deps<'_>) -> Result<Des
 /// first install only, open the two permission panes and say what to turn on.
 async fn start_computer(cfg: DesktopConfig, deps: &Deps<'_>) -> Result<DesktopConfig> {
     let uid = machine_service::current_uid(deps.runner)?;
-    let exe = std::env::current_exe()?;
+    let exe = crate::commands::models::unit_program()?;
     service::install_services(
         &deps.home,
         deps.runner,
@@ -482,7 +482,7 @@ pub async fn status(
             None
         }
     };
-    let state = files::read_state(&files::runtime_dir(home));
+    let state = files::read_fresh_state(&files::runtime_dir(home));
     let cfg = config::load(home).ok().flatten();
     let name = remote
         .as_ref()
@@ -559,6 +559,20 @@ pub async fn execute(command: DesktopCommands) -> Result<()> {
         eprintln!("{message}");
         std::process::exit(code);
     }
+    #[cfg(target_os = "macos")]
+    {
+        use crate::cloud::clients::runner::{CommandRunner, RealRunner, RunResult};
+        let v = RealRunner.run("sw_vers", &["-productVersion".to_string()]);
+        if let RunResult::Ran {
+            ok: true, stdout, ..
+        } = v
+        {
+            if crate::desktop::unsupported_version(&stdout) {
+                eprintln!("{}", crate::desktop::OLD_MACOS);
+                std::process::exit(crate::desktop::UNSUPPORTED_EXIT);
+            }
+        }
+    }
     run(command).await
 }
 
@@ -601,7 +615,7 @@ async fn execute_doctor(a: JsonArgs) -> Result<()> {
         Ok(Some(api)) => api.desktop_self().await.ok(),
         _ => None,
     };
-    let state = files::read_state(&files::runtime_dir(&home));
+    let state = files::read_fresh_state(&files::runtime_dir(&home));
     let list = crate::desktop::doctor::checks(
         &crate::cloud::clients::runner::RealRunner,
         &app::app_path(&home),
@@ -660,7 +674,7 @@ async fn execute_serve(a: ServeArgs) -> Result<()> {
     let run = crate::cloud::clients::runner::RealRunner;
     if a.install {
         let uid = machine_service::current_uid(&run)?;
-        let exe = std::env::current_exe()?;
+        let exe = crate::commands::models::unit_program()?;
         service::install_services(&home, &run, &exe, uid, &machine_service::Waits::REAL)?;
         println!("Installed the desktop agents.");
         Ok(())
@@ -1447,7 +1461,11 @@ mod tests {
             r#"{"v": 1, "version": "0.1.0", "screen_state": "ok",
                 "permissions": {"screen_recording": true, "accessibility": false},
                 "displays": 1, "main_display": null, "connected": true,
-                "dial_failures": 0, "updated_at": "2026-11-24T00:00:00Z"}"#,
+                "dial_failures": 0, "updated_at": "{NOW}"}"#
+                .replace(
+                    "{NOW}",
+                    &chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                ),
         )
         .unwrap();
     }
