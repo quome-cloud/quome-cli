@@ -1,6 +1,7 @@
 //! Linking this Mac to an organization as a desktop its agents can drive.
 pub mod app;
 pub mod config;
+pub mod service;
 pub mod size;
 
 /// Said, and exit 69, on any computer other than an Apple silicon Mac.

@@ -12,13 +12,17 @@ use crate::cloud::state::CloudState;
 use crate::commands::connect::{self, Deps, Options};
 use crate::desktop::app;
 use crate::desktop::config::{self, DesktopConfig, PROFILE, SCOPE};
+use crate::desktop::service;
 use crate::desktop::size::pick_size;
 use crate::errors::{QuomeError, Result};
+use crate::machine::service as machine_service;
 
 #[derive(Subcommand)]
 pub enum DesktopCommands {
     /// Link this Mac to an organization as a desktop its agents can use
     Connect(ConnectArgs),
+    /// Run the link between this computer and the platform (started by launchd)
+    Serve(ServeArgs),
 }
 
 impl DesktopCommands {
@@ -27,9 +31,23 @@ impl DesktopCommands {
     pub fn runs_in_background(&self) -> bool {
         match self {
             DesktopCommands::Connect(_) => false,
+            DesktopCommands::Serve(_) => true,
         }
     }
 }
+
+#[derive(Args)]
+pub struct ServeArgs {
+    /// Install and start the background agents, then exit
+    #[arg(long, conflicts_with = "uninstall")]
+    install: bool,
+    /// Stop and remove the background agents, then exit
+    #[arg(long)]
+    uninstall: bool,
+}
+
+/// What `serve` says until the link itself is built.
+pub const SERVE_NOT_YET: &str = "`quome desktop serve` is not available yet.";
 
 #[derive(Args)]
 pub struct ConnectArgs {
@@ -257,9 +275,23 @@ async fn prepare_computer(mut cfg: DesktopConfig, deps: &Deps<'_>) -> Result<Des
     Ok(cfg)
 }
 
-/// After the config is saved: the step that installs the background services and
-/// opens the permission panes. For now it does nothing.
-async fn start_computer(_cfg: &DesktopConfig, _deps: &Deps<'_>) -> Result<()> {
+/// After the config is saved: install and start both background agents. After the
+/// first install only, open the two permission panes and say what to turn on.
+async fn start_computer(_cfg: &DesktopConfig, deps: &Deps<'_>) -> Result<()> {
+    let first = !service::installed(&deps.home);
+    let uid = machine_service::current_uid(deps.runner)?;
+    let exe = std::env::current_exe()?;
+    service::install_services(
+        &deps.home,
+        deps.runner,
+        &exe,
+        uid,
+        &machine_service::Waits::REAL,
+    )?;
+    if first {
+        service::open_panes(deps.runner);
+        (deps.say)(service::PANES_SAID);
+    }
     Ok(())
 }
 
@@ -333,12 +365,34 @@ pub async fn execute(command: DesktopCommands) -> Result<()> {
 async fn run(command: DesktopCommands) -> Result<()> {
     match command {
         DesktopCommands::Connect(a) => execute_connect(a).await,
+        DesktopCommands::Serve(a) => execute_serve(a),
     }
 }
 
 #[cfg(not(target_os = "macos"))]
 async fn run(_command: DesktopCommands) -> Result<()> {
     Err(QuomeError::Usage(crate::desktop::UNSUPPORTED.into()))
+}
+
+#[cfg(target_os = "macos")]
+fn execute_serve(a: ServeArgs) -> Result<()> {
+    let home = dirs::home_dir()
+        .ok_or_else(|| QuomeError::CloudState("cannot find home directory".into()))?;
+    let run = crate::cloud::clients::runner::RealRunner;
+    if a.install {
+        let uid = machine_service::current_uid(&run)?;
+        let exe = std::env::current_exe()?;
+        service::install_services(&home, &run, &exe, uid, &machine_service::Waits::REAL)?;
+        println!("Installed the desktop agents.");
+        Ok(())
+    } else if a.uninstall {
+        let uid = machine_service::current_uid(&run)?;
+        service::uninstall_services(&home, &run, uid)?;
+        println!("Removed the desktop agents.");
+        Ok(())
+    } else {
+        Err(QuomeError::Usage(SERVE_NOT_YET.into()))
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -519,6 +573,7 @@ mod tests {
         home: tempfile::TempDir,
         store: FakeKeychain,
         opened: RefCell<Vec<String>>,
+        said: RefCell<Vec<String>>,
         runner: crate::cloud::clients::runner::fake::Fake,
         claude: NoClaude,
         /// The "browser" delivers the approval; false = the page refused it.
@@ -545,6 +600,7 @@ mod tests {
                 home: tempfile::tempdir().unwrap(),
                 store: FakeKeychain::default(),
                 opened: RefCell::new(vec![]),
+                said: RefCell::new(vec![]),
                 runner: mac.runner(),
                 claude: NoClaude(Default::default()),
                 approves: true,
@@ -558,7 +614,7 @@ mod tests {
             s: &MockServer,
             edit: impl Fn(&mut ConnectOpts),
         ) -> Result<Connected> {
-            let say = |_: &str| {};
+            let say = |m: &str| self.said.borrow_mut().push(m.to_string());
             let dev_env = self.dev_env;
             let env = move |k: &str| (dev_env && k == "QUOME_DESKTOP_DEV").then(|| "1".to_string());
             let open = |u: &str| {
@@ -1008,6 +1064,59 @@ mod tests {
         assert!(!r.was_connected);
     }
 
+    #[tokio::test]
+    async fn connect_installs_agents_and_opens_panes_once() {
+        let s = MockServer::start().await;
+        mount_platform(&s, me_ok()).await;
+        let h = Harness::new();
+        h.connect(&s, |_| {}).await.unwrap();
+        assert!(service::plist_path(h.home.path(), service::SERVE_LABEL).exists());
+        assert!(service::plist_path(h.home.path(), service::APP_LABEL).exists());
+        let calls = h.runner.calls();
+        let opens: Vec<_> = calls.iter().filter(|c| c.starts_with("open ")).collect();
+        assert_eq!(opens.len(), 2, "{calls:?}");
+        assert!(calls
+            .iter()
+            .any(|c| c.starts_with("launchctl bootstrap gui/501 ")));
+        // A second set-up (replace) does not say it again.
+        let before = h
+            .said
+            .borrow()
+            .iter()
+            .filter(|m| m.contains("Turn on Quome Desktop"))
+            .count();
+        assert_eq!(before, 1);
+        h.connect(&s, |o| o.replace = true).await.unwrap();
+        let after = h
+            .said
+            .borrow()
+            .iter()
+            .filter(|m| m.contains("Turn on Quome Desktop"))
+            .count();
+        assert_eq!(after, 1);
+    }
+
+    #[test]
+    fn serve_flags() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(subcommand)]
+            c: DesktopCommands,
+        }
+        let cli = Cli::try_parse_from(["desktop", "serve", "--install"]).unwrap();
+        let DesktopCommands::Serve(a) = cli.c else {
+            panic!()
+        };
+        assert!(a.install && !a.uninstall);
+        assert!(Cli::try_parse_from(["desktop", "serve", "--install", "--uninstall"]).is_err());
+        assert!(DesktopCommands::Serve(ServeArgs {
+            install: false,
+            uninstall: false
+        })
+        .runs_in_background());
+    }
+
     #[test]
     fn connect_flags() {
         use clap::Parser;
@@ -1029,7 +1138,9 @@ mod tests {
             "--json",
         ])
         .unwrap();
-        let DesktopCommands::Connect(a) = cli.c;
+        let DesktopCommands::Connect(a) = cli.c else {
+            panic!()
+        };
         assert_eq!(a.api_url, "https://api.example.test");
         assert_eq!(a.org.as_deref(), Some("acme"));
         assert_eq!(a.name.as_deref(), Some("Studio"));

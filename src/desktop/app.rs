@@ -793,6 +793,8 @@ pub mod fixture {
                 let last = args.last().map(String::as_str).unwrap_or("");
                 match program {
                     "scutil" => ok(&m.computer_name),
+                    "id" => ok("501\n"),
+                    "open" => ok(""),
                     "codesign" if args.first().map(String::as_str) == Some("--verify") => {
                         let tests_anchor = args.iter().any(|a| a.starts_with("-R=anchor apple"));
                         if m.verify_ok && (m.anchor_apple || !tests_anchor) {
