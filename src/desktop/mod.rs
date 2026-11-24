@@ -1,6 +1,8 @@
 //! Linking this Mac to an organization as a desktop its agents can drive.
 pub mod app;
 pub mod config;
+pub mod files;
+pub mod serve;
 pub mod service;
 pub mod size;
 

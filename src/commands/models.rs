@@ -611,7 +611,7 @@ pub async fn serve(
 
 /// The path this process was started from (as typed or found on PATH), so a
 /// package upgrade that repoints it is noticed.
-fn program_path() -> Option<std::path::PathBuf> {
+pub(crate) fn program_path() -> Option<std::path::PathBuf> {
     let argv0 = std::path::PathBuf::from(std::env::args_os().next()?);
     if argv0.components().count() > 1 {
         return std::path::absolute(&argv0).ok();
@@ -626,7 +626,7 @@ fn program_path() -> Option<std::path::PathBuf> {
 }
 
 /// SIGTERM or SIGINT.
-async fn stop_signal() {
+pub(crate) async fn stop_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};

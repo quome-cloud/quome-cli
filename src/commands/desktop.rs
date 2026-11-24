@@ -47,9 +47,6 @@ pub struct ServeArgs {
     uninstall: bool,
 }
 
-/// What `serve` says until the link itself is built.
-pub const SERVE_NOT_YET: &str = "`quome desktop serve` is not available yet.";
-
 #[derive(Args)]
 pub struct ConnectArgs {
     /// Quome Cloud API URL
@@ -377,7 +374,7 @@ pub async fn execute(command: DesktopCommands) -> Result<()> {
 async fn run(command: DesktopCommands) -> Result<()> {
     match command {
         DesktopCommands::Connect(a) => execute_connect(a).await,
-        DesktopCommands::Serve(a) => execute_serve(a),
+        DesktopCommands::Serve(a) => execute_serve(a).await,
     }
 }
 
@@ -387,7 +384,7 @@ async fn run(_command: DesktopCommands) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn execute_serve(a: ServeArgs) -> Result<()> {
+async fn execute_serve(a: ServeArgs) -> Result<()> {
     let home = dirs::home_dir()
         .ok_or_else(|| QuomeError::CloudState("cannot find home directory".into()))?;
     let run = crate::cloud::clients::runner::RealRunner;
@@ -403,7 +400,28 @@ fn execute_serve(a: ServeArgs) -> Result<()> {
         println!("Removed the desktop agents.");
         Ok(())
     } else {
-        Err(QuomeError::Usage(SERVE_NOT_YET.into()))
+        let store = crate::cloud::keys::KeychainStore;
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(async move {
+            super::models::stop_signal().await;
+            let _ = stop_tx.send(true);
+        });
+        let out = crate::desktop::serve::serve(
+            &home,
+            &store,
+            crate::desktop::serve::Timing::default(),
+            super::models::program_path(),
+            stop_rx,
+        )
+        .await?;
+        if let Some(m) = out.message() {
+            println!("{m}");
+        }
+        let code = crate::desktop::serve::serve_exit_code(&out);
+        if code != 0 {
+            std::process::exit(code);
+        }
+        Ok(())
     }
 }
 
