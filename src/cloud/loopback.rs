@@ -9,6 +9,8 @@ use tiny_http::{Header, Method, Request, Response, Server};
 
 /// Largest accepted request body.
 pub const MAX_BODY: usize = 64 * 1024;
+/// Longest refusal text kept, in characters.
+const MAX_REASON: usize = 200;
 /// How long `connect` waits for the browser.
 pub const TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -103,10 +105,12 @@ impl Listener {
         timeout: Duration,
     ) -> Result<Callback, QuomeError> {
         let deadline = Instant::now() + timeout;
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel::<Result<Callback, String>>();
         loop {
-            if let Ok(cb) = rx.try_recv() {
-                return Ok(cb);
+            if let Ok(done) = rx.try_recv() {
+                return done.map_err(|m| {
+                    QuomeError::CloudState(format!("The approval page refused the request: {m}"))
+                });
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -121,8 +125,8 @@ impl Listener {
                         (tx.clone(), state.to_string(), issuer_origin.to_string());
                     let limit = self.request_deadline;
                     std::thread::spawn(move || {
-                        if let Some(cb) = handle(req, &state, &origin, Instant::now() + limit) {
-                            let _ = tx.send(cb);
+                        if let Some(done) = handle(req, &state, &origin, Instant::now() + limit) {
+                            let _ = tx.send(done);
                         }
                     });
                 }
@@ -137,8 +141,32 @@ fn timed_out() -> QuomeError {
     QuomeError::CloudState("timed out after 5 minutes waiting for the browser".into())
 }
 
-/// Answer one request; `Some` only for the accepted callback.
-fn handle(mut req: Request, state: &str, origin: &str, by: Instant) -> Option<Callback> {
+/// Strip control characters and cut to `MAX_REASON` characters.
+fn clean_reason(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_REASON)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// The text of a refusal: its description, else its error code.
+fn refusal_reason(v: &serde_json::Value) -> String {
+    let pick = |k: &str| v[k].as_str().map(clean_reason).filter(|s| !s.is_empty());
+    pick("error_description")
+        .or_else(|| pick("error"))
+        .unwrap_or_else(|| "no reason given".into())
+}
+
+/// Answer one request; `Some` only for the accepted callback (`Ok`) or a
+/// refusal carrying the expected state (`Err`, the cleaned reason).
+fn handle(
+    mut req: Request,
+    state: &str,
+    origin: &str,
+    by: Instant,
+) -> Option<Result<Callback, String>> {
     let path = req.url().split('?').next().unwrap_or("").to_string();
     if path != "/callback" {
         reply(req, 404, origin, None);
@@ -200,6 +228,15 @@ fn handle(mut req: Request, state: &str, origin: &str, by: Instant) -> Option<Ca
                     return None;
                 }
             };
+            if v.get("error").is_some() {
+                if v["state"].as_str() != Some(state) {
+                    reply(req, 400, origin, None);
+                    return None;
+                }
+                let echo = serde_json::json!({ "state": state }).to_string();
+                reply(req, 200, origin, Some(echo));
+                return Some(Err(refusal_reason(&v)));
+            }
             if v["state"].as_str() != Some(state) {
                 reply(req, 403, origin, None);
                 return None;
@@ -208,7 +245,7 @@ fn handle(mut req: Request, state: &str, origin: &str, by: Instant) -> Option<Ca
                 Ok(cb) => {
                     let echo = serde_json::json!({ "state": state }).to_string();
                     reply(req, 200, origin, Some(echo));
-                    Some(cb)
+                    Some(Ok(cb))
                 }
                 Err(_) => {
                     reply(req, 400, origin, None);
@@ -347,6 +384,71 @@ mod tests {
             200
         );
         h.join().unwrap().unwrap();
+    }
+
+    fn refusal(state: &str, desc: &str) -> serde_json::Value {
+        serde_json::json!({"state":state,"error":"access_denied","error_description":desc})
+    }
+
+    #[tokio::test]
+    async fn a_refusal_with_the_right_state_ends_the_wait() {
+        let (port, h) = start(Duration::from_secs(10));
+        let r = reqwest::Client::new()
+            .post(url(port))
+            .json(&refusal("abc123", "Not allowed"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let e = h.join().unwrap().unwrap_err().to_string();
+        assert!(
+            e.contains("The approval page refused the request: Not allowed"),
+            "{e}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refusal_without_a_description_names_the_error() {
+        let (port, h) = start(Duration::from_secs(10));
+        let body = serde_json::json!({"state":"abc123","error":"invalid_scope"});
+        reqwest::Client::new()
+            .post(url(port))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let e = h.join().unwrap().unwrap_err().to_string();
+        assert!(e.contains("refused the request: invalid_scope"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn a_refusal_with_a_wrong_or_missing_state_is_ignored() {
+        let (port, h) = start(Duration::from_secs(10));
+        let c = reqwest::Client::new();
+        let r = c
+            .post(url(port))
+            .json(&refusal("nope", "x"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400);
+        let body = serde_json::json!({"error":"access_denied"});
+        assert_eq!(
+            c.post(url(port)).json(&body).send().await.unwrap().status(),
+            400
+        );
+        assert!(!h.is_finished());
+        c.post(url(port)).json(&good()).send().await.unwrap();
+        h.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn a_long_or_control_character_reason_is_cleaned() {
+        let v = refusal("s", &format!("a\u{1b}[31mb\n\r\tc{}", "z".repeat(500)));
+        let r = refusal_reason(&v);
+        assert!(r.starts_with("a[31mbc"), "{r}");
+        assert!(!r.chars().any(|c| c.is_control()));
+        assert_eq!(r.chars().count(), 200);
     }
 
     #[test]
