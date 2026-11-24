@@ -180,14 +180,27 @@ impl Backoff {
     }
 }
 
-/// When the app's failed dials ask for a new session: five in a row, and at least
-/// `every` since the last session was written.
+/// A `state.json` older than this is a stopped or missing app's: it asks for nothing.
+const STATE_FRESH_FOR: chrono::Duration = chrono::Duration::seconds(60);
+
+/// True when the app wrote `s` within `STATE_FRESH_FOR` of `now`.
+fn fresh(s: &files::AppState, now: chrono::DateTime<chrono::Utc>) -> bool {
+    s.updated_at
+        .as_deref()
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        .is_some_and(|t| now - t.with_timezone(&chrono::Utc) <= STATE_FRESH_FOR)
+}
+
+/// When the app's failed dials ask for a new session: five in a row in a fresh
+/// state, and at least `every` since the last session was written.
 fn wants_new_session(
     state: Option<&files::AppState>,
     since_last: Duration,
     every: Duration,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> bool {
-    state.is_some_and(|s| s.dial_failures >= NEW_SESSION_AFTER) && since_last >= every
+    state.is_some_and(|s| s.dial_failures >= NEW_SESSION_AFTER && fresh(s, now))
+        && since_last >= every
 }
 
 /// Ask for sessions and keep `session.json` current until a permanent stop.
@@ -246,6 +259,7 @@ pub async fn run(l: Link) -> Served {
                                 state.as_ref(),
                                 written.elapsed(),
                                 l.timing.new_session_every,
+                                chrono::Utc::now(),
                             ) {
                                 let n = state.map_or(0, |s| s.dial_failures);
                                 log(&format!("new_session dial_failures={n}"));
@@ -263,6 +277,8 @@ pub async fn run(l: Link) -> Served {
                     return Served::Unlinked;
                 }
                 Refusal::ScreenFixed => {
+                    // The key is for a link that no longer matches: the app stops dialing.
+                    files::remove_session(&l.dir);
                     log("screen_is_fixed");
                     return Served::ScreenFixed;
                 }
@@ -435,14 +451,60 @@ mod tests {
     }
 
     fn write_state(dir: &Path, dial_failures: u32) {
+        write_state_at(dir, dial_failures, &chrono::Utc::now().to_rfc3339());
+    }
+
+    fn write_state_at(dir: &Path, dial_failures: u32, updated_at: &str) {
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(
             dir.join("state.json"),
             serde_json::json!({"v": 1, "version": "0.1.0", "connected": false,
-                "dial_failures": dial_failures})
+                "dial_failures": dial_failures, "updated_at": updated_at})
             .to_string(),
         )
         .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stale_state_asks_for_no_new_session() {
+        let (f, link) = fake(|n| Ok(good_session(n)), Timing::default(), None);
+        let old = (chrono::Utc::now() - chrono::Duration::seconds(61)).to_rfc3339();
+        write_state_at(&link.dir, 5, &old);
+        let running = tokio::spawn(run(link));
+        sleep(Duration::from_secs(300)).await;
+        assert_eq!(f.calls.lock().unwrap().len(), 1);
+        f.stop.send(true).unwrap();
+        assert_eq!(running.await.unwrap(), Served::Shutdown);
+    }
+
+    #[test]
+    fn a_state_counts_only_while_fresh() {
+        let now = chrono::Utc::now();
+        let state = |updated_at: Option<String>| files::AppState {
+            v: 1,
+            dial_failures: 5,
+            updated_at,
+            ..Default::default()
+        };
+        let every = Duration::from_secs(30);
+        let at = |secs: i64| Some((now - chrono::Duration::seconds(secs)).to_rfc3339());
+        assert!(wants_new_session(Some(&state(at(10))), every, every, now));
+        assert!(wants_new_session(Some(&state(at(60))), every, every, now));
+        assert!(!wants_new_session(Some(&state(at(61))), every, every, now));
+        assert!(!wants_new_session(Some(&state(None)), every, every, now));
+        assert!(!wants_new_session(
+            Some(&state(Some("yesterday".into()))),
+            every,
+            every,
+            now
+        ));
+        assert!(!wants_new_session(
+            Some(&state(at(10))),
+            Duration::from_secs(29),
+            every,
+            now
+        ));
+        assert!(!wants_new_session(None, every, every, now));
     }
 
     fn refused(status: u16, reason: &str) -> QuomeError {
@@ -925,8 +987,10 @@ mod tests {
         )
         .await;
         let h = linked(&s);
+        let file = seed_session(&h);
         let out = serve_once(&h).await;
         assert_eq!(out, Served::ScreenFixed);
+        assert!(!file.exists(), "the app must stop dialing with the old key");
         assert_eq!(serve_exit_code(&out), 0);
         assert_eq!(out.message(), Some(SCREEN_FIXED));
     }

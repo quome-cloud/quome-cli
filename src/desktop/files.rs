@@ -129,8 +129,13 @@ pub fn write_session(dir: &Path, s: &SessionFile) -> io::Result<()> {
     })();
     if res.is_err() {
         let _ = std::fs::remove_file(&tmp);
+        return res;
     }
-    res
+    // Make the rename durable; best effort (a directory cannot be opened everywhere).
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+    Ok(())
 }
 
 /// Remove `session.json`; an absent file is fine.
