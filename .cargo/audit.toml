@@ -15,4 +15,9 @@ ignore = [
     # proc-macro-error2: unmaintained, compile-time only (the `tabled` derive
     # macro); not part of the shipped binary.
     "RUSTSEC-2026-0173",
+    # chrono: flagged unmaintained, no fixed release (latest 0.4.x still
+    # flagged). No vulnerability; used for timestamps and pulled in by `rmcp`
+    # and `schemars`. Revisit when upstream resolves the notice or a drop-in
+    # replacement exists.
+    "RUSTSEC-2026-0543",
 ]
