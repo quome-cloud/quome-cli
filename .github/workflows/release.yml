@@ -16,6 +16,12 @@ on:
           - minor
           - major
 
+# One release at a time. Merges that land close together each start a run; without this they
+# race, and an older version's formula can reach the tap after a newer one's.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -302,6 +308,14 @@ jobs:
       - name: Commit and push
         run: |
           cd homebrew-quome
+          # Never move the tap backwards: if a newer version is already there, keep it.
+          CURRENT=$(git show HEAD:Formula/quome.rb 2>/dev/null | sed -n 's/^ *version "\(.*\)"/\1/p' | head -n1)
+          NEW="${{ steps.info.outputs.version }}"
+          if [ -n "$CURRENT" ] && [ "$CURRENT" != "$NEW" ] && \
+             [ "$(printf '%s\n%s\n' "$CURRENT" "$NEW" | sort -V | tail -n1)" = "$CURRENT" ]; then
+            echo "The tap already has $CURRENT, newer than $NEW; leaving it."
+            exit 0
+          fi
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Formula/quome.rb
