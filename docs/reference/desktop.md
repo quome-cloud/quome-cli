@@ -49,6 +49,8 @@ Opens an approval page in your browser. A person approves one switch there. Then
 
 If this Mac is already linked but set-up did not finish, `connect` resumes it. If it is linked and set up, `connect` stops. Use `--replace` to unlink first and link again.
 
+If the link is over on the platform (the computer was removed in the console, its approval was revoked or expired, or its approver is no longer an Owner or Admin), `connect` says so, forgets the old link on this Mac and asks for a new approval. Running the install command again does the same. The macOS permissions are not asked for again.
+
 ### `quome desktop serve`
 
 ```
