@@ -214,6 +214,13 @@ async fn resume(o: &ConnectOpts, deps: &Deps<'_>) -> Result<Connected> {
 /// linked already whose set-up did not finish resumes it; `--replace` links afresh.
 pub async fn connect(o: ConnectOpts, deps: &Deps<'_>) -> Result<Connected> {
     let mut panes_shown = false;
+    if has_desktop_profile(&deps.home)? && !o.replace && link_gone_on_platform(deps).await? {
+        // Unlinked in the console, revoked or expired: what this computer holds is
+        // dead. Forget it here (the platform has nothing left to unlink) and link afresh.
+        (deps.say)("This computer was unlinked on the platform; linking it again.");
+        panes_shown = config::load(&deps.home)?.is_some_and(|c| c.panes_shown);
+        forget(&deps.home, deps.store, deps.say, deps.runner)?;
+    }
     if has_desktop_profile(&deps.home)? {
         if !o.replace && setup_unfinished(&deps.home)? {
             return resume(&o, deps).await;
@@ -340,6 +347,35 @@ pub struct Disconnected {
     pub revoke_error: Option<String>,
 }
 
+/// True when the platform says this computer's link is over: its delegation revoked
+/// or expired, the computer unlinked (`computer_not_found`), or its approver no longer
+/// an Owner or Admin. Any other failure (offline, a bare 404, the engine starting) is
+/// not proof, and keeps today's behavior.
+fn link_gone(e: &QuomeError) -> bool {
+    match e {
+        QuomeError::CloudDisconnected | QuomeError::CloudInvalidGrant => true,
+        QuomeError::NotFound(r) => r == "computer_not_found",
+        QuomeError::ApiRefused { status, reason, .. } => {
+            (*status == 404 && reason == "computer_not_found")
+                || (*status == 403 && reason == "approver_not_admin")
+        }
+        _ => false,
+    }
+}
+
+/// Ask the platform about this computer's link; true only on a clear "gone".
+async fn link_gone_on_platform(deps: &Deps<'_>) -> Result<bool> {
+    let Some(api) = api_for(&deps.home, deps.store)? else {
+        return Ok(false);
+    };
+    Ok(
+        match tokio::time::timeout(Duration::from_secs(30), api.desktop_self()).await {
+            Ok(Err(e)) => link_gone(&e),
+            _ => false,
+        },
+    )
+}
+
 /// Unlink on the platform (a failure is reported, not fatal), stop the agents and
 /// forget the session, then delete the key, the `desktop` profile and its settings.
 /// The default profile and every other profile are left alone, and so is the app.
@@ -350,7 +386,7 @@ pub async fn disconnect(
     run: &dyn CommandRunner,
 ) -> Result<Disconnected> {
     let mut report = Disconnected::default();
-    let mut st = CloudState::load_from(home)?;
+    let st = CloudState::load_from(home)?;
     report.was_connected = st.profiles.contains_key(PROFILE);
     if report.was_connected {
         let revoked = match api_for(home, store) {
@@ -371,11 +407,26 @@ pub async fn disconnect(
             }
         }
     }
+    forget(home, store, say, run)?;
+    Ok(report)
+}
+
+/// This computer's side of an unlink, without asking the platform: stop and remove
+/// the agents, forget the session, delete the key, the `desktop` profile and its
+/// settings. Every other profile is left alone, and so is the app.
+fn forget(
+    home: &Path,
+    store: &dyn KeyStore,
+    say: &dyn Fn(&str),
+    run: &dyn CommandRunner,
+) -> Result<()> {
+    let mut st = CloudState::load_from(home)?;
+    let was_connected = st.profiles.contains_key(PROFILE);
     // The agents go with the link; a failure is reported, not fatal.
     let agents = [service::SERVE_LABEL, service::APP_LABEL]
         .iter()
         .any(|l| service::plist_path(home, l).exists());
-    if report.was_connected || agents {
+    if was_connected || agents {
         let gone = machine_service::current_uid(run)
             .and_then(|uid| service::uninstall_services(home, run, uid));
         if let Err(e) = gone {
@@ -384,7 +435,7 @@ pub async fn disconnect(
     }
     files::remove_session(&files::runtime_dir(home));
     store.delete(PROFILE)?;
-    if report.was_connected {
+    if was_connected {
         st.profiles.remove(PROFILE);
         if st.default == PROFILE {
             st.default = st.first_user_profile().unwrap_or_default();
@@ -403,7 +454,7 @@ pub async fn disconnect(
             ));
         }
     }
-    Ok(report)
+    Ok(())
 }
 
 /// Whole days until `expires_at`, rounded up; `None` when it cannot be read.
@@ -466,7 +517,7 @@ pub async fn status(
             Err(QuomeError::NotFound(_)) => {
                 warnings.push(
                     "The platform no longer knows this computer. \
-                     Run `quome desktop connect --replace`."
+                     Run `quome desktop connect` to link it again."
                         .into(),
                 );
                 None
@@ -1346,6 +1397,88 @@ mod tests {
         h.connect(&s, |o| o.replace = true).await.unwrap();
         assert_eq!(h.opened.borrow().len(), 2);
         assert_eq!(*h.store.puts.lock().unwrap(), ["desktop", "desktop"]);
+    }
+
+    /// A computer unlinked in the console: a plain connect (what the installer runs)
+    /// links it again with a fresh approval, never asks the platform to unlink, and
+    /// keeps the permission panes from showing a second time.
+    #[tokio::test]
+    async fn a_computer_unlinked_on_the_platform_links_again() {
+        for gone in [
+            ResponseTemplate::new(404)
+                .set_body_json(serde_json::json!({"reason": "computer_not_found"})),
+            ResponseTemplate::new(401)
+                .set_body_json(serde_json::json!({"reason": "delegation_revoked"})),
+            ResponseTemplate::new(403)
+                .set_body_json(serde_json::json!({"reason": "approver_not_admin"})),
+        ] {
+            let s = MockServer::start().await;
+            mount_platform(&s, me_ok()).await;
+            Mock::given(method("DELETE"))
+                .and(path("/api/v1/orgs/org-1/desktops/computers/me"))
+                .respond_with(ResponseTemplate::new(204))
+                .expect(0)
+                .mount(&s)
+                .await;
+            let h = Harness::new();
+            h.connect(&s, |_| {}).await.unwrap();
+            assert_eq!(h.opened.borrow().len(), 1);
+            mount_self(&s, gone).await;
+            h.connect(&s, |_| {}).await.unwrap();
+            assert_eq!(h.opened.borrow().len(), 2, "a fresh approval");
+            assert_eq!(*h.store.puts.lock().unwrap(), ["desktop", "desktop"]);
+            let said = h.said.borrow().join("\n");
+            assert!(
+                said.contains("This computer was unlinked on the platform; linking it again."),
+                "{said}"
+            );
+            assert_eq!(
+                said.matches(service::PANES_SAID).count(),
+                1,
+                "the panes are not shown again: {said}"
+            );
+        }
+    }
+
+    /// The case seen live: unlinked while its set-up was unfinished (no app). The
+    /// resume used to fail on the dead key; now it links again.
+    #[tokio::test]
+    async fn an_unfinished_setup_unlinked_on_the_platform_links_again() {
+        let s = MockServer::start().await;
+        mount_platform(&s, me_ok()).await;
+        let mut h = Harness::with_mac(FakeMac {
+            probe: r#"{"displays": 0, "main_display": null}"#.into(),
+            ..FakeMac::default()
+        });
+        assert!(h.connect(&s, |_| {}).await.is_err());
+        mount_self(
+            &s,
+            ResponseTemplate::new(401)
+                .set_body_json(serde_json::json!({"reason": "delegation_revoked"})),
+        )
+        .await;
+        h.runner = FakeMac::default().runner();
+        h.connect(&s, |_| {}).await.unwrap();
+        assert_eq!(h.opened.borrow().len(), 2, "a fresh approval, not a resume");
+    }
+
+    /// Not proof the link is gone (the platform unreachable, starting, a bare 404):
+    /// a linked computer still refuses a second link, as before.
+    #[tokio::test]
+    async fn a_platform_hiccup_is_not_an_unlink() {
+        for r in [
+            ResponseTemplate::new(503),
+            ResponseTemplate::new(404).set_body_json(serde_json::json!({"detail": "Not Found"})),
+        ] {
+            let s = MockServer::start().await;
+            mount_platform(&s, me_ok()).await;
+            let h = Harness::new();
+            h.connect(&s, |_| {}).await.unwrap();
+            mount_self(&s, r).await;
+            let e = h.connect(&s, |_| {}).await.unwrap_err().to_string();
+            assert!(e.starts_with("This computer is already linked."), "{e}");
+            assert_eq!(h.opened.borrow().len(), 1);
+        }
     }
 
     /// A models profile and key beside the desktop's, to see them left alone.
