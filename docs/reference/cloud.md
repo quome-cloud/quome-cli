@@ -34,7 +34,7 @@ $ quome cloud status
 Not connected to Quome Cloud — run `quome connect`
 ```
 
-Exit code `0` when the check passes. It exits `1` when you are not connected ("Not connected to Quome Cloud — run `quome connect`") or the check fails (for example `Check:   failed — This agent was disconnected from Quome Cloud …`). With `--json` the output has `connected`, `profile`, `agent_name`, `agent_principal`, `org_id`, `org_slug`, `expires_at`, `api_url` and `error`.
+Exit code `0` when the check passes. It exits `1` when you are not connected ("Not connected to Quome Cloud — run `quome connect`") or the check fails (for example `Check:   failed — This agent's Quome Cloud connection has expired or was revoked. Run `quome connect https://api.quome.cloud` in a terminal to reconnect.`; `quome mcp` gives the same sentence). With `--json` the output has `connected`, `profile`, `agent_name`, `agent_principal`, `org_id`, `org_slug`, `expires_at`, `api_url` and `error`.
 
 ## `quome cloud disconnect`
 

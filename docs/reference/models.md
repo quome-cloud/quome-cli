@@ -41,7 +41,7 @@ Pair this computer with an organization to serve its local models
 Usage: quome models connect [OPTIONS] [API_URL]
 
 Arguments:
-  [API_URL]  Quome Cloud API URL [default: https://api.quome.cloud]
+  [API_URL]  Quome Cloud API URL (default: the saved profile's API URL when reconnecting, else https://api.quome.cloud)
 
 Options:
       --org <ORG>

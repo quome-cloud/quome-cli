@@ -6,16 +6,11 @@ use thiserror::Error;
 /// Unset, the disconnected messages say plain `quome connect`.
 static RECONNECT: OnceLock<String> = OnceLock::new();
 
-/// The command that reconnects `profile` to `api_url`: the API URL and profile are named
-/// only when they differ from `quome connect`'s defaults, so a default connection reads
-/// `quome connect`.
+/// The command that reconnects `profile` to `api_url`: the API URL is always named (so
+/// the command works as written, wherever the connection points), the profile only when
+/// it is not `quome connect`'s default.
 pub fn reconnect_command(api_url: &str, profile: &str) -> String {
-    let mut cmd = String::from("quome connect");
-    let url = api_url.trim_end_matches('/');
-    if url != crate::commands::connect::DEFAULT_API_URL {
-        cmd.push(' ');
-        cmd.push_str(url);
-    }
+    let mut cmd = format!("quome connect {}", api_url.trim_end_matches('/'));
     if profile != crate::commands::connect::DEFAULT_PROFILE {
         cmd.push_str(" --profile ");
         cmd.push_str(profile);
@@ -30,6 +25,39 @@ pub fn set_reconnect_command(api_url: &str, profile: &str) {
 
 fn reconnect() -> &'static str {
     RECONNECT.get().map_or("quome connect", String::as_str)
+}
+
+/// What the MCP server adds to the reconnect advice: it cannot pick up a new
+/// connection by itself once its own reload found nothing new.
+pub const RESTART_MCP: &str = "then restart this MCP server";
+
+/// Added when the identity service refused the grant (a skewed clock is a common cause).
+pub const CLOCK_HINT: &str = "If you just reconnected, check this computer's clock is correct.";
+
+/// Why an agent's stored connection no longer works, with the command `cmd` that
+/// reconnects it; `restart` adds the MCP server's restart step. `quome cloud status`
+/// and `quome mcp` both say this.
+pub fn connection_lost(cmd: &str, restart: bool) -> String {
+    let then = if restart {
+        format!(", {RESTART_MCP}")
+    } else {
+        String::new()
+    };
+    format!(
+        "This agent's Quome Cloud connection has expired or was revoked. \
+         Run `{cmd}` in a terminal to reconnect{then}."
+    )
+}
+
+/// `connection_lost` for a session error `e` (`CloudDisconnected`, `CloudInvalidGrant`)
+/// with this process's reconnect command; `None` for any other error.
+pub fn session_lost_message(e: &QuomeError, restart: bool) -> Option<String> {
+    let m = connection_lost(reconnect(), restart);
+    match e {
+        QuomeError::CloudDisconnected => Some(m),
+        QuomeError::CloudInvalidGrant => Some(format!("{m} {CLOCK_HINT}")),
+        _ => None,
+    }
 }
 
 #[derive(Error, Debug)]
@@ -92,21 +120,20 @@ pub enum QuomeError {
     #[error("Quome Cloud key storage: {0}")]
     CloudKey(String),
 
-    /// The delegation was revoked (401 `delegation_revoked`).
-    #[error(
-        "This agent was disconnected from Quome Cloud — run `{}` again",
-        reconnect()
-    )]
+    /// The delegation was revoked (401 `delegation_revoked`), or a fresh token was
+    /// refused with a plain 401.
+    #[error("{}", connection_lost(reconnect(), false))]
     CloudDisconnected,
 
     /// The token exchange was refused with `invalid_grant`: the delegation was revoked or
     /// expired, the key no longer matches, or the local clock is off.
-    #[error(
-        "This agent was disconnected from Quome Cloud — run `{}` again. \
-         If you just reconnected, check this computer's clock is correct.",
-        reconnect()
-    )]
+    #[error("{} {CLOCK_HINT}", connection_lost(reconnect(), false))]
     CloudInvalidGrant,
+
+    /// The console's connect page refused the link (`refused` on the loopback
+    /// callback): the code when it is a plain one (`^[a-z_]{1,32}$`).
+    #[error("{}", crate::cloud::loopback::refusal_message(.0.as_deref(), None))]
+    ConsoleRefused(Option<String>),
 
     /// The user has not finished approving in the browser (401 `agent_not_connected`).
     #[error("Finish approving in the browser, then try again.")]
@@ -130,17 +157,28 @@ pub type Result<T> = std::result::Result<T, QuomeError>;
 
 #[cfg(test)]
 mod tests {
-    use super::reconnect_command;
+    use super::{connection_lost, reconnect_command};
 
     #[test]
-    fn reconnect_command_names_only_what_differs_from_the_defaults() {
+    fn connection_lost_says_why_and_how_to_reconnect() {
+        assert_eq!(
+            connection_lost("quome connect https://api.example.test", true),
+            "This agent's Quome Cloud connection has expired or was revoked. \
+             Run `quome connect https://api.example.test` in a terminal to reconnect, \
+             then restart this MCP server."
+        );
+        assert!(connection_lost("quome connect x", false).ends_with("to reconnect."));
+    }
+
+    #[test]
+    fn reconnect_command_always_names_the_api_url() {
         assert_eq!(
             reconnect_command("https://api.quome.cloud", "cloud"),
-            "quome connect"
+            "quome connect https://api.quome.cloud"
         );
         assert_eq!(
             reconnect_command("https://api.quome.cloud/", "cloud"),
-            "quome connect"
+            "quome connect https://api.quome.cloud"
         );
         assert_eq!(
             reconnect_command("https://api.example.test", "cloud"),
@@ -152,7 +190,7 @@ mod tests {
         );
         assert_eq!(
             reconnect_command("https://api.quome.cloud", "work"),
-            "quome connect --profile work"
+            "quome connect https://api.quome.cloud --profile work"
         );
     }
 }

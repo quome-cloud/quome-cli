@@ -12,7 +12,7 @@ Connect this computer to Quome Cloud
 Usage: quome connect [OPTIONS] [API_URL]
 
 Arguments:
-  [API_URL]  Quome Cloud API URL [default: https://api.quome.cloud]
+  [API_URL]  Quome Cloud API URL (default: the saved profile's API URL when reconnecting, else https://api.quome.cloud)
 
 Options:
       --name <NAME>        Name shown for this agent in the console (default: "Claude Code on <hostname>")
@@ -43,6 +43,22 @@ Connected to Quome Cloud as Claude Code on laptop (org acme), expires 2027-02-01
 ```
 
 If no browser can be opened, the CLI says so; open the printed URL yourself.
+
+### When the console refuses
+
+If the console will not make the link, the command stops waiting at once, prints why, and exits non-zero. Nothing is saved. The reasons are:
+
+| Code | Message |
+|------|---------|
+| `models_off` | The console refused: Models is not on for this organization. Quome turns it on per organization; ask your Quome contact. |
+| `machines_off` | The console refused: serving models from machines is not on for this organization. Quome turns it on per organization; ask your Quome contact. |
+| `computers_off` | The console refused: linking computers is not on for this organization. Quome turns it on per organization; ask your Quome contact. |
+| `not_admin` | The console refused: only an Owner or Admin of the organization can approve this. Ask one of them to run this command. |
+| `not_member` | The console refused: you are not a member of the organization this link names. Ask an Owner or Admin there to invite you, or run the command again with --org set to an organization you belong to. |
+
+With `--org <slug>` the message names the organization (`organization "acme"`). Any other code prints `The console refused this link (<code>)`; nothing else the page sends is printed. The same applies to `quome models connect` and `quome desktop connect`.
+
+The loopback contract: the console page sends a CORS preflight, then `POST http://127.0.0.1:<port>/callback` with `Content-Type: application/json` and the body `{"state":"<state>","refused":"<code>"}`. The listener allows the issuer's origin and the console's origin, and answers with the allow-origin the request's `Origin` header names (anything else gets the issuer's origin). A refusal with the wrong `state` is answered `403` and the wait goes on; with the right one, `200` with `{"state":"<state>"}`, and the command ends.
 
 ### The agent name
 
@@ -85,13 +101,13 @@ You see the dialog ("quome wants to use your confidential information stored in 
 - **Once, on the first signed release**, if your key was saved by an earlier unsigned release. Choose **Always Allow**; later upgrades stay quiet.
 - **With a binary you built yourself**, which is not signed with that identity. Each new build asks again.
 
-If you choose Deny, or the dialog goes unseen, Claude Code shows the quome MCP server as failed with "Quome Cloud key storage: …"; restart it (`/mcp` in Claude Code) and answer the dialog, or run `quome cloud status` in a terminal to trigger it there.
+If you choose Deny, or the dialog goes unseen, the quome MCP server's tools answer "This agent's Quome Cloud key could not be read (Quome Cloud key storage: …)"; restart it (`/mcp` in Claude Code) and answer the dialog, or run `quome cloud status` in a terminal to trigger it there.
 
 To check a binary: `codesign -dvv "$(which quome)"` prints `Identifier=cloud.quome.cli` and an `Authority=Developer ID Application: …` line.
 
 ### Profiles and reconnecting
 
-Run `quome connect` again at any time to reconnect, for example after the connection expires or you revoke it. A running `quome mcp` picks up the new connection on its next call after a disconnected error; you do not need to restart Claude Code (if it still reports the error, restart the MCP server). The new connection replaces the saved one; the old one stays valid until it expires or you revoke it on the console dashboard, and the CLI reminds you of that. `--profile <name>` saves a second connection under another name; without it the new connection becomes the default.
+Run `quome connect` again at any time to reconnect, for example after the connection expires or you revoke it. Without an API URL, the command reuses the API URL saved for the profile it connects (`--profile`, or `cloud`) and says so (`Reconnecting to https://api.example.com (profile cloud)`); with no saved profile it connects to `https://api.quome.cloud`. An API URL you give always wins. `quome models connect` and `quome desktop connect` do the same with their own profiles. A running `quome mcp` picks up the new connection on its next call after a disconnected error; you do not need to restart Claude Code (if it still reports the error, restart the MCP server). The new connection replaces the saved one; the old one stays valid until it expires or you revoke it on the console dashboard, and the CLI reminds you of that. `--profile <name>` saves a second connection under another name; without it the new connection becomes the default.
 
 `--json` prints a result object (`connected`, `profile`, `agent_name`, `org_id`, `org_slug`, `expires_at`, `mcp`) on stdout and sends progress lines to stderr.
 

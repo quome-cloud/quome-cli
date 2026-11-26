@@ -34,7 +34,7 @@ Link this Mac to an organization as a desktop its agents can use
 Usage: quome desktop connect [OPTIONS] [API_URL]
 
 Arguments:
-  [API_URL]  Quome Cloud API URL [default: https://api.quome.cloud]
+  [API_URL]  Quome Cloud API URL (default: the saved profile's API URL when reconnecting, else https://api.quome.cloud)
 
 Options:
       --org <ORG>     Organization (slug) this computer serves

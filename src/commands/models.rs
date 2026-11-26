@@ -46,9 +46,8 @@ pub enum ModelsCommands {
 
 #[derive(Args)]
 pub struct ConnectArgs {
-    /// Quome Cloud API URL
-    #[arg(default_value = connect::DEFAULT_API_URL)]
-    api_url: String,
+    #[arg(help = connect::API_URL_HELP)]
+    api_url: Option<String>,
     /// Organization (slug) this machine serves
     #[arg(long)]
     org: Option<String>,
@@ -827,9 +826,13 @@ async fn execute_connect(a: ConnectArgs) -> Result<()> {
         retry_interval: connect::RETRY_INTERVAL,
         retry_total: connect::RETRY_TOTAL,
     };
+    let (api_url, reconnecting) = connect::resolve_api_url(a.api_url, &deps.home, PROFILE)?;
+    if let Some(line) = reconnecting {
+        say(&line);
+    }
     let c = connect(
         ConnectOpts {
-            api_url: a.api_url,
+            api_url,
             org: a.org,
             name: a.name,
             server: a.server,

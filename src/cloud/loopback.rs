@@ -1,6 +1,11 @@
 //! The loopback listener `quome connect` opens for the console's connect page.
 //! Contract (the console's connect page): `OPTIONS /callback` preflight, then one
 //! `POST /callback` with the matching `state`, answered with a `state` echo.
+//! The body is the delegation (`Callback`), or a refusal: `{"state", "refused": "<code>"}`
+//! from the console when it will not make this link (see `refusal_message`).
+//! Requests may come from the issuer's or the console's origin; the CORS
+//! allow-origin names whichever allowed origin the request's `Origin` header
+//! names, and the first allowed origin (the issuer's) otherwise.
 use crate::errors::QuomeError;
 use serde::Deserialize;
 use std::io::Read;
@@ -42,6 +47,55 @@ fn expiry_rfc3339<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::E
 
 /// Longest a single request may take to arrive in full.
 pub const REQUEST_DEADLINE: Duration = Duration::from_secs(5);
+
+/// What ended a wait other than a delegation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Ended {
+    /// The approval page refused (`error`): its cleaned reason.
+    Page(String),
+    /// The console refused the link (`refused`): the code when it is a plain one.
+    Console(Option<String>),
+}
+
+/// A refusal code fit to print: `^[a-z_]{1,32}$`.
+fn plain_code(v: &serde_json::Value) -> Option<String> {
+    let c = v.as_str()?;
+    let ok = (1..=32).contains(&c.len()) && c.bytes().all(|b| b.is_ascii_lowercase() || b == b'_');
+    ok.then(|| c.to_string())
+}
+
+/// The plain message for a console refusal `code` (`None`: not a plain code).
+/// `org` is the organization slug the command named, when it named one. Nothing
+/// else the page sent is ever printed.
+pub fn refusal_message(code: Option<&str>, org: Option<&str>) -> String {
+    let named = |o: &str| format!("organization \"{o}\"");
+    let this_org = org.map_or("this organization".to_string(), named);
+    let turned_on = "Quome turns it on per organization; ask your Quome contact.";
+    match code {
+        Some("models_off") => {
+            format!("The console refused: Models is not on for {this_org}. {turned_on}")
+        }
+        Some("machines_off") => format!(
+            "The console refused: serving models from machines is not on for {this_org}. {turned_on}"
+        ),
+        Some("computers_off") => format!(
+            "The console refused: linking computers is not on for {this_org}. {turned_on}"
+        ),
+        Some("not_admin") => format!(
+            "The console refused: only an Owner or Admin of {} can approve this. \
+             Ask one of them to run this command.",
+            org.map_or("the organization".to_string(), named)
+        ),
+        Some("not_member") => format!(
+            "The console refused: you are not a member of {}. \
+             Ask an Owner or Admin there to invite you, or run the command again with \
+             --org set to an organization you belong to.",
+            org.map_or("the organization this link names".to_string(), named)
+        ),
+        Some(c) => format!("The console refused this link ({c})"),
+        None => "The console refused this link".to_string(),
+    }
+}
 
 pub struct Listener {
     server: Server,
@@ -98,18 +152,25 @@ impl Listener {
     /// requests are refused and the wait goes on. Each request is handled on
     /// its own thread with a read deadline, so a stalled client cannot block
     /// the others or the overall timeout. Blocking.
+    ///
+    /// `origins` are the allowed CORS origins, the default first (the issuer's,
+    /// then the console's). A console refusal ends the wait with
+    /// `QuomeError::ConsoleRefused`.
     pub fn wait(
         &self,
         state: &str,
-        issuer_origin: &str,
+        origins: &[String],
         timeout: Duration,
     ) -> Result<Callback, QuomeError> {
         let deadline = Instant::now() + timeout;
-        let (tx, rx) = std::sync::mpsc::channel::<Result<Callback, String>>();
+        let (tx, rx) = std::sync::mpsc::channel::<Result<Callback, Ended>>();
         loop {
             if let Ok(done) = rx.try_recv() {
-                return done.map_err(|m| {
-                    QuomeError::CloudState(format!("The approval page refused the request: {m}"))
+                return done.map_err(|e| match e {
+                    Ended::Page(m) => QuomeError::CloudState(format!(
+                        "The approval page refused the request: {m}"
+                    )),
+                    Ended::Console(code) => QuomeError::ConsoleRefused(code),
                 });
             }
             let left = deadline.saturating_duration_since(Instant::now());
@@ -121,8 +182,8 @@ impl Listener {
                 .recv_timeout(left.min(Duration::from_millis(50)))
             {
                 Ok(Some(req)) => {
-                    let (tx, state, origin) =
-                        (tx.clone(), state.to_string(), issuer_origin.to_string());
+                    let (tx, state) = (tx.clone(), state.to_string());
+                    let origin = allow_origin(&req, origins);
                     let limit = self.request_deadline;
                     std::thread::spawn(move || {
                         if let Some(done) = handle(req, &state, &origin, Instant::now() + limit) {
@@ -162,14 +223,27 @@ fn refusal_reason(v: &serde_json::Value) -> String {
         .unwrap_or_else(|| "no reason given".into())
 }
 
+/// The allow-origin for `req`: its `Origin` when that is one of `origins`,
+/// else the first of `origins`.
+fn allow_origin(req: &Request, origins: &[String]) -> String {
+    req.headers()
+        .iter()
+        .find(|h| h.field.equiv("Origin"))
+        .map(|h| h.value.as_str())
+        .and_then(|o| origins.iter().find(|a| a.as_str() == o))
+        .or_else(|| origins.first())
+        .cloned()
+        .unwrap_or_default()
+}
+
 /// Answer one request; `Some` only for the accepted callback (`Ok`) or a
-/// refusal carrying the expected state (`Err`, the cleaned reason).
+/// refusal carrying the expected state (`Err`).
 fn handle(
     mut req: Request,
     state: &str,
     origin: &str,
     by: Instant,
-) -> Option<Result<Callback, String>> {
+) -> Option<Result<Callback, Ended>> {
     let path = req.url().split('?').next().unwrap_or("").to_string();
     if path != "/callback" {
         reply(req, 404, origin, None);
@@ -231,6 +305,16 @@ fn handle(
                     return None;
                 }
             };
+            if let Some(code) = v.get("refused") {
+                if v["state"].as_str() != Some(state) {
+                    reply(req, 403, origin, None);
+                    return None;
+                }
+                let code = plain_code(code);
+                let echo = serde_json::json!({ "state": state }).to_string();
+                reply(req, 200, origin, Some(echo));
+                return Some(Err(Ended::Console(code)));
+            }
             if v.get("error").is_some() {
                 if v["state"].as_str() != Some(state) {
                     reply(req, 400, origin, None);
@@ -238,7 +322,7 @@ fn handle(
                 }
                 let echo = serde_json::json!({ "state": state }).to_string();
                 reply(req, 200, origin, Some(echo));
-                return Some(Err(refusal_reason(&v)));
+                return Some(Err(Ended::Page(refusal_reason(&v))));
             }
             if v["state"].as_str() != Some(state) {
                 reply(req, 403, origin, None);
@@ -268,12 +352,150 @@ mod tests {
     use super::*;
 
     const ORIGIN: &str = "https://auth.example.com";
+    const CONSOLE: &str = "https://console.example.com";
+
+    fn origins() -> Vec<String> {
+        vec![ORIGIN.to_string(), CONSOLE.to_string()]
+    }
 
     fn start(timeout: Duration) -> (u16, std::thread::JoinHandle<Result<Callback, QuomeError>>) {
         let l = Listener::bind().unwrap();
         let port = l.port();
-        let h = std::thread::spawn(move || l.wait("abc123", ORIGIN, timeout));
+        let h = std::thread::spawn(move || l.wait("abc123", &origins(), timeout));
         (port, h)
+    }
+
+    fn refused(state: &str, code: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"state": state, "refused": code})
+    }
+
+    #[tokio::test]
+    async fn preflight_from_the_console_echoes_the_console_origin() {
+        let (port, h) = start(Duration::from_secs(10));
+        let c = reqwest::Client::new();
+        let r = c
+            .request(reqwest::Method::OPTIONS, url(port))
+            .header("Origin", CONSOLE)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 204);
+        assert_eq!(r.headers()["access-control-allow-origin"], CONSOLE);
+        // An origin outside the allowed set gets the issuer's, as before.
+        let r = c
+            .request(reqwest::Method::OPTIONS, url(port))
+            .header("Origin", "https://elsewhere.example.com")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.headers()["access-control-allow-origin"], ORIGIN);
+        let r = c
+            .post(url(port))
+            .header("Origin", ORIGIN)
+            .json(&good())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.headers()["access-control-allow-origin"], ORIGIN);
+        h.join().unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_console_refusal_with_the_right_state_ends_the_wait() {
+        let (port, h) = start(Duration::from_secs(10));
+        let r = reqwest::Client::new()
+            .post(url(port))
+            .header("Origin", CONSOLE)
+            .json(&refused("abc123", "models_off".into()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        assert_eq!(r.headers()["access-control-allow-origin"], CONSOLE);
+        let v: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(v, serde_json::json!({"state":"abc123"}));
+        match h.join().unwrap().unwrap_err() {
+            QuomeError::ConsoleRefused(code) => assert_eq!(code.as_deref(), Some("models_off")),
+            e => panic!("expected ConsoleRefused, got {e:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_console_refusal_with_a_wrong_state_is_403_and_the_wait_goes_on() {
+        let (port, h) = start(Duration::from_secs(10));
+        let c = reqwest::Client::new();
+        for body in [
+            refused("nope", "models_off".into()),
+            serde_json::json!({"refused": "models_off"}),
+        ] {
+            let r = c
+                .post(url(port))
+                .header("Origin", CONSOLE)
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 403);
+        }
+        assert!(!h.is_finished());
+        c.post(url(port)).json(&good()).send().await.unwrap();
+        assert_eq!(h.join().unwrap().unwrap().delegation_id, "d1");
+    }
+
+    #[tokio::test]
+    async fn odd_refusal_codes_are_not_kept() {
+        for (code, want) in [
+            (serde_json::json!("brand_new_code"), Some("brand_new_code")),
+            (serde_json::json!("Models_Off"), None),
+            (serde_json::json!("x".repeat(33)), None),
+            (serde_json::json!("\u{1b}[31mred"), None),
+            (serde_json::json!(""), None),
+            (serde_json::json!(7), None),
+            (serde_json::json!({"text": "Click here"}), None),
+        ] {
+            let (port, h) = start(Duration::from_secs(10));
+            let r = reqwest::Client::new()
+                .post(url(port))
+                .json(&refused("abc123", code.clone()))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 200, "{code}");
+            match h.join().unwrap().unwrap_err() {
+                QuomeError::ConsoleRefused(c) => assert_eq!(c.as_deref(), want, "{code}"),
+                e => panic!("expected ConsoleRefused, got {e:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn refusal_messages_are_plain_and_name_the_org() {
+        let m = |c: &str| refusal_message(Some(c), None);
+        assert_eq!(
+            m("models_off"),
+            "The console refused: Models is not on for this organization. \
+             Quome turns it on per organization; ask your Quome contact."
+        );
+        assert_eq!(
+            m("not_admin"),
+            "The console refused: only an Owner or Admin of the organization can approve this. \
+             Ask one of them to run this command."
+        );
+        assert!(m("machines_off").contains("serving models from machines is not on"));
+        assert!(m("computers_off").contains("linking computers is not on"));
+        assert!(m("not_member").contains("not a member of the organization this link names"));
+        assert_eq!(m("brand_new"), "The console refused this link (brand_new)");
+        assert_eq!(refusal_message(None, None), "The console refused this link");
+        let acme = |c: &str| refusal_message(Some(c), Some("acme"));
+        for c in [
+            "models_off",
+            "machines_off",
+            "computers_off",
+            "not_admin",
+            "not_member",
+        ] {
+            assert!(acme(c).contains("organization \"acme\""), "{}", acme(c));
+        }
     }
 
     fn url(port: u16) -> String {
@@ -505,7 +727,7 @@ mod tests {
             .unwrap()
             .with_request_deadline(Duration::from_millis(300));
         let port = l.port();
-        let h = std::thread::spawn(move || l.wait("abc123", ORIGIN, Duration::from_secs(10)));
+        let h = std::thread::spawn(move || l.wait("abc123", &origins(), Duration::from_secs(10)));
         let late =
             serde_json::json!({"state":"abc123","vrc":"V".repeat(2000),"delegation_id":"late",
             "agent_principal":"p","expires_at":"e"})

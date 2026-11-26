@@ -67,9 +67,8 @@ pub struct ServeArgs {
 
 #[derive(Args)]
 pub struct ConnectArgs {
-    /// Quome Cloud API URL
-    #[arg(default_value = connect::DEFAULT_API_URL)]
-    api_url: String,
+    #[arg(help = connect::API_URL_HELP)]
+    api_url: Option<String>,
     /// Organization (slug) this computer serves
     #[arg(long)]
     org: Option<String>,
@@ -789,9 +788,13 @@ async fn execute_connect(a: ConnectArgs) -> Result<()> {
         retry_interval: connect::RETRY_INTERVAL,
         retry_total: connect::RETRY_TOTAL,
     };
+    let (api_url, reconnecting) = connect::resolve_api_url(a.api_url, &deps.home, PROFILE)?;
+    if let Some(line) = reconnecting {
+        say(&line);
+    }
     let c = connect(
         ConnectOpts {
-            api_url: a.api_url,
+            api_url,
             org: a.org,
             name: a.name,
             small_frames: a.small_frames,
@@ -1810,7 +1813,7 @@ mod tests {
         let DesktopCommands::Connect(a) = cli.c else {
             panic!()
         };
-        assert_eq!(a.api_url, "https://api.example.test");
+        assert_eq!(a.api_url.as_deref(), Some("https://api.example.test"));
         assert_eq!(a.org.as_deref(), Some("acme"));
         assert_eq!(a.name.as_deref(), Some("Studio"));
         assert!(a.small_frames && a.replace && a.json);
