@@ -446,11 +446,20 @@ pub async fn run(opts: Options, deps: &Deps<'_>) -> Result<Outcome> {
     }
     (deps.say)("Waiting for you to approve in the browser...");
 
-    let origin = loopback::origin_of(&issuer);
+    // The issuer's page and the console's own connect page both call back.
+    let origins = vec![loopback::origin_of(&issuer), loopback::origin_of(&console)];
     let timeout = deps.listen_timeout;
-    let cb: Callback = tokio::task::spawn_blocking(move || listener.wait(&state, &origin, timeout))
-        .await
-        .map_err(|e| QuomeError::CloudState(format!("listener failed: {e}")))??;
+    let cb: Callback =
+        tokio::task::spawn_blocking(move || listener.wait(&state, &origins, timeout))
+            .await
+            .map_err(|e| QuomeError::CloudState(format!("listener failed: {e}")))?
+            .map_err(|e| match e {
+                QuomeError::ConsoleRefused(code) => QuomeError::Usage(loopback::refusal_message(
+                    code.as_deref(),
+                    opts.org.as_deref(),
+                )),
+                e => e,
+            })?;
 
     let mut profile = Profile {
         edition: "cloud".into(),
@@ -1293,6 +1302,85 @@ mod tests {
             .profiles
             .is_empty());
         assert!(h.claude.calls.lock().unwrap().is_empty());
+    }
+
+    /// The console page refusing the link: preflight and POST from the console's origin.
+    fn refusing_page(url: &str, code: &'static str, log: PageLog) {
+        let parsed = reqwest::Url::parse(url).unwrap();
+        let q: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+        let cb = format!("http://127.0.0.1:{}/callback", q["port"]);
+        let state = q["state"].clone();
+        tokio::spawn(async move {
+            let c = reqwest::Client::new();
+            let pre = c
+                .request(reqwest::Method::OPTIONS, &cb)
+                .header("Origin", "https://console.example")
+                .send()
+                .await
+                .unwrap();
+            log.lock().unwrap().push(format!(
+                "options {} {}",
+                pre.status().as_u16(),
+                pre.headers()["access-control-allow-origin"]
+                    .to_str()
+                    .unwrap()
+            ));
+            let r = c
+                .post(&cb)
+                .header("Origin", "https://console.example")
+                .json(&serde_json::json!({"state": state, "refused": code}))
+                .send()
+                .await
+                .unwrap();
+            log.lock()
+                .unwrap()
+                .push(format!("refused {}", r.status().as_u16()));
+        });
+    }
+
+    #[tokio::test]
+    async fn a_console_refusal_ends_the_wait_with_a_plain_message() {
+        let s = MockServer::start().await;
+        let h = Harness::new(ran(true));
+        let store = FileStore {
+            dir: h.home.path().join(".quome"),
+        };
+        let say = |_: &str| {};
+        let open = |u: &str| {
+            refusing_page(u, "not_admin", h.log.clone());
+            Ok(())
+        };
+        let deps = Deps {
+            home: h.home.path().to_path_buf(),
+            store: &store,
+            open: &open,
+            claude: &h.claude,
+            runner: &h.runner,
+            on_path: &|_: &str| false,
+            env: &crate::cloud::clients::no_env,
+            say: &say,
+            hostname: "mac".into(),
+            // Far longer than the test may take: the refusal must end the wait.
+            listen_timeout: Duration::from_secs(300),
+            retry_interval: Duration::from_millis(20),
+            retry_total: Duration::from_millis(100),
+        };
+        let mut o = opts(&s, "models");
+        o.org = Some("acme".into());
+        let started = Instant::now();
+        let err = run(o, &deps).await.unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(20));
+        assert_eq!(
+            err.to_string(),
+            "The console refused: only an Owner or Admin of organization \"acme\" can approve \
+             this. Ask one of them to run this command."
+        );
+        assert_eq!(
+            *h.log.lock().unwrap(),
+            vec!["options 204 https://console.example", "refused 200"]
+        );
+        assert!(!h.home.path().join(".quome/cloud.json").exists());
+        assert!(s.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -44,6 +44,22 @@ Connected to Quome Cloud as Claude Code on laptop (org acme), expires 2027-02-01
 
 If no browser can be opened, the CLI says so; open the printed URL yourself.
 
+### When the console refuses
+
+If the console will not make the link, the command stops waiting at once, prints why, and exits non-zero. Nothing is saved. The reasons are:
+
+| Code | Message |
+|------|---------|
+| `models_off` | The console refused: Models is not on for this organization. Quome turns it on per organization; ask your Quome contact. |
+| `machines_off` | The console refused: serving models from machines is not on for this organization. Quome turns it on per organization; ask your Quome contact. |
+| `computers_off` | The console refused: linking computers is not on for this organization. Quome turns it on per organization; ask your Quome contact. |
+| `not_admin` | The console refused: only an Owner or Admin of the organization can approve this. Ask one of them to run this command. |
+| `not_member` | The console refused: you are not a member of the organization this link names. Ask an Owner or Admin there to invite you, or run the command again with --org set to an organization you belong to. |
+
+With `--org <slug>` the message names the organization (`organization "acme"`). Any other code prints `The console refused this link (<code>)`; nothing else the page sends is printed. The same applies to `quome models connect` and `quome desktop connect`.
+
+The loopback contract: the console page sends a CORS preflight, then `POST http://127.0.0.1:<port>/callback` with `Content-Type: application/json` and the body `{"state":"<state>","refused":"<code>"}`. The listener allows the issuer's origin and the console's origin, and answers with the allow-origin the request's `Origin` header names (anything else gets the issuer's origin). A refusal with the wrong `state` is answered `403` and the wait goes on; with the right one, `200` with `{"state":"<state>"}`, and the command ends.
+
 ### The agent name
 
 `--name` is what the console lists for this agent. Control and invisible formatting characters are removed, and the name is cut to **64 characters**. The default is `Claude Code on <hostname>`.

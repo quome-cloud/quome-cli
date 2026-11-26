@@ -108,6 +108,11 @@ pub enum QuomeError {
     )]
     CloudInvalidGrant,
 
+    /// The console's connect page refused the link (`refused` on the loopback
+    /// callback): the code when it is a plain one (`^[a-z_]{1,32}$`).
+    #[error("{}", crate::cloud::loopback::refusal_message(.0.as_deref(), None))]
+    ConsoleRefused(Option<String>),
+
     /// The user has not finished approving in the browser (401 `agent_not_connected`).
     #[error("Finish approving in the browser, then try again.")]
     CloudNotYetConnected,
