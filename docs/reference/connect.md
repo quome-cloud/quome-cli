@@ -101,7 +101,7 @@ You see the dialog ("quome wants to use your confidential information stored in 
 - **Once, on the first signed release**, if your key was saved by an earlier unsigned release. Choose **Always Allow**; later upgrades stay quiet.
 - **With a binary you built yourself**, which is not signed with that identity. Each new build asks again.
 
-If you choose Deny, or the dialog goes unseen, Claude Code shows the quome MCP server as failed with "Quome Cloud key storage: …"; restart it (`/mcp` in Claude Code) and answer the dialog, or run `quome cloud status` in a terminal to trigger it there.
+If you choose Deny, or the dialog goes unseen, the quome MCP server's tools answer "This agent's Quome Cloud key could not be read (Quome Cloud key storage: …)"; restart it (`/mcp` in Claude Code) and answer the dialog, or run `quome cloud status` in a terminal to trigger it there.
 
 To check a binary: `codesign -dvv "$(which quome)"` prints `Identifier=cloud.quome.cli` and an `Authority=Developer ID Application: …` line.
 

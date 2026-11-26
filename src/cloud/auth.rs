@@ -350,7 +350,7 @@ pub(crate) mod tests {
         let ts = TokenSource::new(&profile(&s.uri()), AgentKey::generate(), "v".into());
         let e = ts.access_token().await.unwrap_err();
         assert!(matches!(e, QuomeError::CloudInvalidGrant), "{e}");
-        assert!(e.to_string().contains("disconnected"), "{e}");
+        assert!(e.to_string().contains("expired or was revoked"), "{e}");
         assert!(
             e.to_string()
                 .contains("check this computer's clock is correct"),

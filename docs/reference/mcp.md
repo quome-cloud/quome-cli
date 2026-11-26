@@ -403,13 +403,13 @@ When a call fails, the tool says what to do:
 
 ## Messages
 
-When the connection is no longer valid (revoked on the dashboard, or expired), every tool returns the following (the `cache_*` tools put `Could not <action>: ` in front of it):
+When the connection is no longer valid (revoked on the dashboard, or expired), every tool returns an error result with the following (the `cache_*` tools put `Could not <action>: ` in front of it). The command names the profile's own API URL, and `--profile <name>` when the profile is not `cloud`; `quome cloud status` gives the same sentence without the restart step:
 
 ```
-This agent was disconnected from Quome Cloud — run `quome connect` again
+This agent's Quome Cloud connection has expired or was revoked. Run `quome connect https://api.quome.cloud` in a terminal to reconnect, then restart this MCP server.
 ```
 
-Run `quome connect`; the next tool call reloads the saved connection and carries on, with no restart. Only if the saved connection has not changed does the message continue with `, then restart the MCP server (or Claude Code) if this keeps happening`.
+This covers a token the API refuses mid-session (401) and a token refresh the identity service refuses. After you run `quome connect`, the next tool call reloads the saved connection and usually carries on without a restart; restart the MCP server (`/mcp` in Claude Code) if it does not.
 
 If you just reconnected and still see it, a wrong system clock is the usual cause, and the message adds `If you just reconnected, check this computer's clock is correct.`
 
@@ -419,4 +419,13 @@ If you start the flow but have not yet approved in the browser, tools return:
 Finish approving in the browser, then try again.
 ```
 
-If this computer was never connected, `quome mcp` cannot authenticate; run [`quome connect`](connect.md) first.
+### When there is no working connection at start-up
+
+`quome mcp` does not exit when the connection is missing or gone: it still answers the MCP handshake, so Claude Code shows why instead of "Connection closed". At start-up it checks the saved expiry and asks for a token (waiting at most 3 seconds; a network problem is not taken as a verdict). When the connection has expired or was revoked, was never made (no saved profile), or its key cannot be read, the server:
+
+- answers `initialize` with that reason as its `instructions` (for example the expired-or-revoked sentence above);
+- lists its usual tools, so the agent has something to call and the reason reaches the transcript (a client may hide a server with no tools);
+- answers every `tools/call` with an error result (`isError: true`) carrying the same text;
+- prints the same line on stderr (Claude Code's MCP log).
+
+Run the command it names, then restart the MCP server. A computer that was never connected reads `This agent is not connected to Quome Cloud. Run `quome connect` in a terminal to connect, then restart this MCP server.`

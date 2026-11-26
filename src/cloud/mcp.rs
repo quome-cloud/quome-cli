@@ -46,8 +46,7 @@ use std::time::{Duration, Instant};
 
 /// Appended to a session error the server could not recover from by reloading
 /// the stored connection.
-pub const RESTART_HINT: &str =
-    "then restart the MCP server (or Claude Code) if this keeps happening";
+pub const RESTART_HINT: &str = crate::errors::RESTART_MCP;
 /// `read_file` returns text up to this size.
 pub const MAX_READ: usize = 1 << 20;
 
@@ -218,15 +217,7 @@ pub(super) fn is_session_error(e: &QuomeError) -> bool {
 /// The message for a tool call that failed; session errors that a reload could
 /// not fix also say to restart.
 pub(super) fn fail(e: QuomeError) -> String {
-    let m = describe(&e);
-    if !is_session_error(&e) {
-        return m;
-    }
-    if m.ends_with('.') {
-        format!("{m} Then {RESTART_HINT}.")
-    } else {
-        format!("{m}, {RESTART_HINT}")
-    }
+    crate::errors::session_lost_message(&e, true).unwrap_or_else(|| describe(&e))
 }
 
 /// True if the request itself was wrong (unknown playbook, bad arguments), as
@@ -2253,12 +2244,23 @@ impl QuomeMcp {
             if stale {
                 let now = match self.door_override {
                     Some(m) => m,
-                    None => match self.conn().api.mcp_config().await {
+                    None => match self.read_front_door().await {
                         Ok(m) => m,
                         Err(ConfigError::Absent) => FrontDoor::Direct,
-                        // Later failures keep the last known mode.
-                        Err(ConfigError::Failed(_)) if prev.is_some() => {
+                        // Later failures keep the last known mode (a lost connection
+                        // then shows on the call itself, with the reconnect advice).
+                        Err(ConfigError::Failed(_) | ConfigError::Lost { .. })
+                            if prev.is_some() =>
+                        {
                             prev.unwrap_or(FrontDoor::Direct)
+                        }
+                        // The connection itself is gone: say how to reconnect.
+                        Err(ConfigError::Lost { invalid_grant }) => {
+                            return Serving::Unavailable(fail(if invalid_grant {
+                                QuomeError::CloudInvalidGrant
+                            } else {
+                                QuomeError::CloudDisconnected
+                            }));
                         }
                         // Never read yet: the org may have chosen the gateway, so
                         // serve nothing direct, and read again on the next call.
@@ -2298,9 +2300,22 @@ impl QuomeMcp {
                 d.hint_due = !d.hinted;
                 Serving::Direct
             }
+            Err(GatewayError::Platform(e)) if is_session_error(&e) => Serving::Unavailable(fail(e)),
             Err(e) => Serving::Unavailable(format!(
                 "The org's MCP gateway is starting or unreachable; try again shortly. ({e})"
             )),
+        }
+    }
+
+    /// Read the front door; on a lost connection, pick up a re-run of
+    /// `quome connect` (as `call!` does) and read once more.
+    async fn read_front_door(&self) -> Result<FrontDoor, ConfigError> {
+        let api = self.conn().api.clone();
+        match api.mcp_config().await {
+            Err(ConfigError::Lost { .. }) if self.refresh(&api).await => {
+                self.conn().api.mcp_config().await
+            }
+            other => other,
         }
     }
 
@@ -5452,6 +5467,67 @@ impl rmcp::ServerHandler for QuomeMcp {
     }
 }
 
+/// The `quome mcp` server when the agent has no working connection (expired,
+/// revoked, never made, or its key cannot be read). It still speaks MCP, so the
+/// client shows why instead of a closed connection: `initialize` carries
+/// `message` as its instructions, and every tool call returns it as an error.
+///
+/// `tools/list` is the usual tool set rather than an empty one: a client may
+/// hide a server with no tools, and the agent then has nothing to call that
+/// would tell it, or the person, what is wrong.
+pub struct Offline {
+    message: String,
+}
+
+impl Offline {
+    pub fn new(message: impl Into<String>) -> Offline {
+        Offline {
+            message: message.into(),
+        }
+    }
+
+    /// Serve MCP over any reader/writer pair until the client disconnects.
+    pub async fn serve_io<R, W>(self, r: R, w: W) -> Result<(), String>
+    where
+        R: tokio::io::AsyncRead + Send + Unpin + 'static,
+        W: tokio::io::AsyncWrite + Send + Unpin + 'static,
+    {
+        let svc = self.serve((r, w)).await.map_err(|e| e.to_string())?;
+        svc.waiting().await.map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub async fn serve_stdio(self) -> Result<(), String> {
+        self.serve_io(tokio::io::stdin(), tokio::io::stdout()).await
+    }
+}
+
+impl rmcp::ServerHandler for Offline {
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("quome", env!("CARGO_PKG_VERSION")))
+            .with_instructions(self.message.clone())
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        Ok(ListToolsResult::with_all_items(
+            QuomeMcp::tool_router().list_all(),
+        ))
+    }
+
+    async fn call_tool(
+        &self,
+        _request: CallToolRequestParams,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        Ok(error_result(self.message.clone()).into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::auth::tests::profile;
@@ -6079,9 +6155,161 @@ mod tests {
             .await;
         let (err, text) = c.call("list_sandboxes", json!({})).await;
         assert!(err);
+        // The same sentence `quome cloud status` gives, plus the restart step.
         let sentence = QuomeError::CloudDisconnected.to_string();
-        assert!(text.starts_with(&sentence), "{text}");
+        assert!(
+            text.starts_with(sentence.trim_end_matches('.')),
+            "{text} / {sentence}"
+        );
+        assert!(text.ends_with(", then restart this MCP server."), "{text}");
         assert!(text.contains(RESTART_HINT), "no reload possible: {text}");
+    }
+
+    /// A token endpoint that hands out one short-lived token, then refuses the grant.
+    async fn revoked_mid_session() -> MockServer {
+        let s = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"token_endpoint": format!("{}/oauth/token", s.uri())})),
+            )
+            .mount(&s)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    json!({"access_token":"AT","token_type":"Bearer","expires_in":0}),
+                ),
+            )
+            .up_to_n_times(1)
+            .mount(&s)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(
+                ResponseTemplate::new(400).set_body_json(json!({"error":"invalid_grant"})),
+            )
+            .mount(&s)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(api_path("/sandboxes")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&s)
+            .await;
+        s
+    }
+
+    #[tokio::test]
+    async fn a_refresh_refused_mid_session_gives_the_reconnect_text() {
+        let s = revoked_mid_session().await;
+        let p = profile(&s.uri());
+        let api = CloudApi::new(&p, TokenSource::new(&p, AgentKey::generate(), "vrc".into()));
+        let mut c = client_for(QuomeMcp::new(api, p)).await;
+        let (err, text) = c.call("list_sandboxes", json!({})).await;
+        assert!(!err, "{text}");
+        // The token ran out and the identity service refuses a new one.
+        let (err, text) = c.call("list_sandboxes", json!({})).await;
+        assert!(err);
+        assert!(
+            text.starts_with("This agent's Quome Cloud connection has expired or was revoked."),
+            "{text}"
+        );
+        assert!(
+            text.contains("to reconnect, then restart this MCP server."),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plain_401_on_a_fresh_token_gives_the_reconnect_text() {
+        let (s, mut c) = start().await;
+        Mock::given(method("GET"))
+            .and(path(api_path("/sandboxes")))
+            .respond_with(
+                ResponseTemplate::new(401).set_body_json(json!({"detail":"unauthorized"})),
+            )
+            .mount(&s)
+            .await;
+        let (err, text) = c.call("list_sandboxes", json!({})).await;
+        assert!(err);
+        assert!(text.contains("has expired or was revoked"), "{text}");
+        assert!(text.contains(RESTART_HINT), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_lost_connection_at_the_front_door_gives_the_reconnect_text() {
+        let s = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"token_endpoint": format!("{}/oauth/token", s.uri())})),
+            )
+            .mount(&s)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(
+                ResponseTemplate::new(400).set_body_json(json!({"error":"invalid_grant"})),
+            )
+            .mount(&s)
+            .await;
+        let p = profile(&s.uri());
+        let api = CloudApi::new(&p, TokenSource::new(&p, AgentKey::generate(), "vrc".into()));
+        let mut c = client_for(QuomeMcp::new(api, p).with_front_door(None)).await;
+        let (err, text) = c.call("list_sandboxes", json!({})).await;
+        assert!(err);
+        assert!(text.contains("has expired or was revoked"), "{text}");
+        assert!(!text.contains("could not be read"), "{text}");
+    }
+
+    async fn offline_client(message: &str) -> (Client, Value) {
+        let (cw, sr) = tokio::io::duplex(1 << 20);
+        let (sw, cr) = tokio::io::duplex(1 << 20);
+        tokio::spawn(Offline::new(message).serve_io(sr, sw));
+        let mut c = Client {
+            w: cw,
+            r: BufReader::new(cr),
+            id: 0,
+            notes: vec![],
+            roots: vec![],
+        };
+        let init = c
+            .rpc(
+                "initialize",
+                json!({"protocolVersion":"2025-06-18","capabilities":{},
+                       "clientInfo":{"name":"t","version":"0"}}),
+            )
+            .await;
+        c.w.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+            .await
+            .unwrap();
+        (c, init)
+    }
+
+    #[tokio::test]
+    async fn an_offline_server_speaks_mcp_and_says_why() {
+        let why = "This agent's Quome Cloud connection has expired or was revoked. \
+                   Run `quome connect https://api.example.com` in a terminal to reconnect, \
+                   then restart this MCP server.";
+        let (mut c, init) = offline_client(why).await;
+        assert_eq!(init["result"]["instructions"], why);
+        assert_eq!(init["result"]["serverInfo"]["name"], "quome");
+        let tools = c.rpc("tools/list", json!({})).await;
+        let names: Vec<&str> = tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert!(names.contains(&"list_sandboxes"), "{names:?}");
+        for tool in ["list_sandboxes", "guide", "sync_folder", "no_such_tool"] {
+            let (err, text) = c.call(tool, json!({})).await;
+            assert!(err, "{tool}");
+            assert_eq!(text, why, "{tool}");
+        }
     }
 
     fn cloud_home(

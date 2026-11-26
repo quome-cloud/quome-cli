@@ -242,6 +242,9 @@ pub enum ConfigError {
     Absent,
     /// The read failed (network, server error); it may work next time.
     Failed(String),
+    /// The agent's connection is no longer good (revoked or expired); true when
+    /// the identity service refused the grant (`CloudInvalidGrant`).
+    Lost { invalid_grant: bool },
 }
 
 /// Per-request timeout for Git routes; the platform may hold a request up to
@@ -1062,6 +1065,12 @@ impl CloudApi {
         }
     }
 
+    /// A valid access token for this connection (exchanged and cached as for any
+    /// request); `quome mcp` uses it to check the connection at start-up.
+    pub async fn access_token(&self) -> Result<String, QuomeError> {
+        self.tokens.access_token().await
+    }
+
     /// Change the slack added to each mail wait's HTTP timeout (tests).
     pub(crate) fn with_email_wait_slack(mut self, slack: Duration) -> CloudApi {
         self.email_wait_slack = slack;
@@ -1117,8 +1126,18 @@ impl CloudApi {
             }
             let text = resp.text().await.unwrap_or_default();
             let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
-            if retried || is_session_reason(v["reason"].as_str().unwrap_or("")) {
+            let reason = v["reason"].as_str().unwrap_or("");
+            if is_session_reason(reason) {
                 return Err(map_error(401, &text));
+            }
+            if retried {
+                // A freshly exchanged token refused too, with no other reason
+                // given: the connection itself is no longer good.
+                return Err(if reason.is_empty() {
+                    QuomeError::CloudDisconnected
+                } else {
+                    map_error(401, &text)
+                });
             }
             retried = true;
             self.tokens.invalidate(&token);
@@ -1788,6 +1807,12 @@ impl CloudApi {
             .await
             .map_err(|e| match e {
                 QuomeError::NotFound(_) => ConfigError::Absent,
+                QuomeError::CloudDisconnected => ConfigError::Lost {
+                    invalid_grant: false,
+                },
+                QuomeError::CloudInvalidGrant => ConfigError::Lost {
+                    invalid_grant: true,
+                },
                 e => ConfigError::Failed(e.to_string()),
             })?;
         match v["front_door"].as_str() {
