@@ -22,11 +22,39 @@ pub const MAX_NAME: usize = 64;
 pub(crate) const RETRY_INTERVAL: Duration = Duration::from_secs(2);
 pub(crate) const RETRY_TOTAL: Duration = Duration::from_secs(60);
 
+/// The API URL a connect command uses: the one given; else the saved profile's
+/// (`profile`, the one the connection is saved under), with the line to print;
+/// else `DEFAULT_API_URL`.
+pub fn resolve_api_url(
+    given: Option<String>,
+    home: &std::path::Path,
+    profile: &str,
+) -> Result<(String, Option<String>)> {
+    if let Some(url) = given {
+        return Ok((url, None));
+    }
+    let saved = CloudState::load_from(home)?
+        .profiles
+        .get(profile)
+        .map(|p| p.api_url.trim_end_matches('/').to_string())
+        .filter(|u| !u.is_empty());
+    Ok(match saved {
+        Some(url) => {
+            let line = format!("Reconnecting to {url} (profile {profile})");
+            (url, Some(line))
+        }
+        None => (DEFAULT_API_URL.to_string(), None),
+    })
+}
+
+/// `--help` text of the API URL argument of the connect commands.
+pub const API_URL_HELP: &str = "Quome Cloud API URL (default: the saved profile's API URL when \
+     reconnecting, else https://api.quome.cloud)";
+
 #[derive(Parser)]
 pub struct Args {
-    /// Quome Cloud API URL
-    #[arg(default_value = DEFAULT_API_URL)]
-    api_url: String,
+    #[arg(help = API_URL_HELP)]
+    api_url: Option<String>,
     /// Name shown for this agent in the console (default: "Claude Code on <hostname>")
     #[arg(long)]
     name: Option<String>,
@@ -798,11 +826,19 @@ pub async fn execute(args: Args) -> Result<()> {
         retry_interval: RETRY_INTERVAL,
         retry_total: RETRY_TOTAL,
     };
+    let profile = args
+        .profile
+        .clone()
+        .unwrap_or_else(|| DEFAULT_PROFILE.into());
+    let (api_url, reconnecting) = resolve_api_url(args.api_url, &deps.home, &profile)?;
+    if let Some(line) = reconnecting {
+        say(&line);
+    }
     let opts = Options {
-        api_url: args.api_url,
+        api_url,
         name: args.name,
         profile_given: args.profile.is_some(),
-        profile: args.profile.unwrap_or_else(|| DEFAULT_PROFILE.into()),
+        profile,
         console: args.console,
         issuer: args.issuer,
         no_mcp: args.no_mcp,
@@ -872,6 +908,74 @@ mod tests {
             issuer_url("https://api.x.y", Some("https://i.z")),
             "https://i.z"
         );
+    }
+
+    fn saved(home: &std::path::Path, name: &str, api_url: &str) {
+        let mut st = CloudState::load_from(home).unwrap();
+        let mut p = crate::cloud::auth::tests::profile(api_url);
+        p.api_url = api_url.into();
+        st.profiles.insert(name.into(), p);
+        st.save_to(home).unwrap();
+    }
+
+    #[test]
+    fn a_saved_profile_supplies_the_api_url() {
+        let d = tempfile::tempdir().unwrap();
+        saved(d.path(), "cloud", "https://api.staging.example.com/");
+        saved(d.path(), "work", "https://api.work.example.com");
+        assert_eq!(
+            resolve_api_url(None, d.path(), "cloud").unwrap(),
+            (
+                "https://api.staging.example.com".to_string(),
+                Some("Reconnecting to https://api.staging.example.com (profile cloud)".to_string())
+            )
+        );
+        let (url, line) = resolve_api_url(None, d.path(), "work").unwrap();
+        assert_eq!(url, "https://api.work.example.com");
+        assert_eq!(
+            line.as_deref(),
+            Some("Reconnecting to https://api.work.example.com (profile work)")
+        );
+        // The machine's own profile is looked up under its own name.
+        saved(d.path(), "models", "https://api.models.example.com");
+        assert_eq!(
+            resolve_api_url(None, d.path(), "models").unwrap().0,
+            "https://api.models.example.com"
+        );
+    }
+
+    #[test]
+    fn an_explicit_api_url_wins_over_the_saved_profile() {
+        let d = tempfile::tempdir().unwrap();
+        saved(d.path(), "cloud", "https://api.staging.example.com");
+        assert_eq!(
+            resolve_api_url(
+                Some("https://api.other.example.com".into()),
+                d.path(),
+                "cloud"
+            )
+            .unwrap(),
+            ("https://api.other.example.com".to_string(), None)
+        );
+        let a = Args::try_parse_from(["connect", "https://api.other.example.com"]).unwrap();
+        assert_eq!(a.api_url.as_deref(), Some("https://api.other.example.com"));
+    }
+
+    #[test]
+    fn no_saved_profile_means_production() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_api_url(None, d.path(), "cloud").unwrap(),
+            (DEFAULT_API_URL.to_string(), None)
+        );
+        // Another profile saved does not count: the one named is looked up.
+        saved(d.path(), "work", "https://api.work.example.com");
+        assert_eq!(
+            resolve_api_url(None, d.path(), "cloud").unwrap(),
+            (DEFAULT_API_URL.to_string(), None)
+        );
+        let a = Args::try_parse_from(["connect"]).unwrap();
+        assert_eq!(a.api_url, None);
     }
 
     #[test]
